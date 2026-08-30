@@ -52,6 +52,14 @@ possible if it runs anywhere, so:
 The last two points are one safety property stated twice: text that a peer or a
 plan may have influenced never becomes part of a command.
 
+A native package starts the bridge the same way it starts anything else — as a
+fixed argument vector, with no shell and no installed console script to depend
+on:
+
+```text
+python3 -m bridge <command> ...
+```
+
 ---
 
 ## 3. The five harnesses
@@ -98,8 +106,10 @@ or a visible failure. Supplying `--review-base` and `--review-head` — which ar
 required together — turns the turn into an external review and switches on the
 exact-commit safeguards described in section 8. `--timeout` is one deadline
 covering the whole turn: prechecks, generating review evidence, the peer call
-and capturing the response. Cleanup afterwards gets its own bounded grace
-period. There is no retry.
+and capturing the response. It defaults to 900 seconds. Cleanup afterwards is
+bounded separately from that deadline, and has to be: by the time cleanup
+matters the deadline has usually already run out, and a budget of nothing is no
+way to decide how long to wait for a process to die. There is no retry.
 
 **`record`** writes one local message into the session without calling anybody.
 It is described in the next section.
@@ -312,9 +322,40 @@ the peer exits the evidence is deleted and the repository, cleanliness and `HEAD
 checks are repeated. Any mismatch, or any failure to clean up, voids the verdict
 as a technical error.
 
-Git unlocks only when the call succeeded, the verdict is exactly `ACCEPT`, the
-response is bound to its request, the checks before and after both passed, and
-`HEAD` is still the head that was reviewed. A new commit invalidates the verdict.
+How the runner and the connector fit together at that moment is fixed, because
+one depends on the other. The runner is not handed a ready-made command. It
+writes the evidence first, and then calls the connector to compose the fixed
+argument vector for this one call, giving it the exact path of that evidence
+file — `None` when the turn is not a review — so that the connector can name
+that exact path among the paths its restriction switches let the peer read.
+Nothing coarser will do: the boundary is the project root and that one file, not
+the folder the file happens to sit in. Because the command is composed inside the
+turn, the connector's own inexpensive prechecks fall inside the one deadline,
+alongside the runner's checks, the evidence, the peer call and the response. If
+composing the command fails, the evidence is deleted as on any other way out,
+nothing is published, and Git stays locked.
+
+Git unlocks only when all five of these hold at once:
+
+1. the call succeeded — the peer was started, answered, and exited normally;
+2. the verdict is exactly `ACCEPT`;
+3. the response is bound to its request, and to the baseline and head sealed at
+   `implementation-start`;
+4. both rounds of repository checks passed, before the call and after it; and
+5. `HEAD` is still the head that was reviewed.
+
+A new commit invalidates the verdict.
+
+**What gets written down when the answer is not an acceptance** matters as much
+as when it is. `REJECT` and `ASK_USER` are published exactly like any other
+answer — they are decisions a reviewer really made — and they unlock nothing. A
+technical failure publishes no response message at all: an invalid verdict, an
+empty response, a peer that failed or ran out of time, a changed repository,
+baseline or head, a dirty worktree, or a failure to clean up. Nothing reading the
+session afterwards can mistake a failure for a reply. The request message that
+was already published stays where it is, because it truthfully records what was
+sent, and the workflow writes the failure down itself with
+`record --kind technical-error`.
 
 The one alternative path is a user waiver: after a `REJECT` or a technical error,
 a later direct message from the user may waive external review for that exact
