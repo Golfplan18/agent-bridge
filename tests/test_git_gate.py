@@ -15,10 +15,15 @@ reviewer really made, not failures.
 Every review here also proves the handover a reviewer depends on: the builder
 that stands in for a connector records the evidence path the runner gave it, and
 the checks confirm that path was a real file holding the `baseline..head` diff
-at the moment the command was composed, and is gone once the turn returned.
+at the moment the command was composed, and is gone once the turn returned. One
+check goes further and proves the peer really opened that file, by hiding a
+token in the reviewed change that can reach the peer no other way.
 
 Everything runs against a throwaway repository built for the purpose and deleted
-afterwards, and against the fake peer. No real harness is involved anywhere.
+afterwards, and against the fake peer. No real harness is involved anywhere. Two
+conditions cannot be produced on demand any other way - a temporary filesystem
+that will not take a file, and a step that outruns its deadline - and those are
+forced for the length of one call.
 
 SPDX-License-Identifier: Unlicense
 """
@@ -32,8 +37,11 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
+import uuid
 from typing import NamedTuple, Optional
+from unittest import mock
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if REPO_ROOT not in sys.path:
@@ -48,6 +56,10 @@ from tests import synthetic_repo  # noqa: E402
 FAKE_PEER = os.path.join(REPO_ROOT, "tests", "fake_peer.py")
 
 REVIEW_BODY = "Review the cumulative change against the approved plan.\n"
+
+#: The shape of token the fake peer looks for inside the evidence file. A fresh
+#: one is committed for the check that proves the peer really read the diff.
+EVIDENCE_TOKEN_PREFIX = "AGENT-BRIDGE-EVIDENCE-TOKEN-"
 
 
 class HandedEvidence(NamedTuple):
@@ -118,18 +130,25 @@ class GitFinishLine(unittest.TestCase):
         self.seal(self.repo.initial_commit)
         return self.repo.add_commit("Implementation work")
 
-    def builder(self, mode, *extra):
+    def builder(self, mode, *extra, **kwargs):
         """What the runner calls to compose the command for one turn.
 
         A real connector uses the evidence path it is given to name that exact
-        file among the paths it lets the peer read. Standing in for one, this
-        records what it was handed - the path, whether it was a real file at
-        that moment, and what it held - so a check can prove a reviewing peer
-        could actually be told where the diff is.
-        """
-        argv = (sys.executable, FAKE_PEER, mode) + tuple(extra)
+        file in the restrictions it applies, and then declares both that path
+        and the project root it granted. Standing in for one, this records
+        what it was handed - the path, whether it was a real file at that
+        moment, and what it held - so a check can prove a reviewing peer could
+        actually be told where the diff is, and it declares exactly what it was
+        given so the runner's own comparison passes.
 
-        def build(evidence_path):
+        With `pass_evidence`, the path is also put on the fake peer's command
+        line, which is how a peer that is meant to open the file is told where
+        it is.
+        """
+        project = kwargs.pop("project", None) or self.repo.project
+        pass_evidence = kwargs.pop("pass_evidence", False)
+
+        def build(evidence_path, deadline):
             existed = bool(evidence_path) and os.path.isfile(evidence_path)
             self.handed.append(
                 HandedEvidence(
@@ -138,13 +157,45 @@ class GitFinishLine(unittest.TestCase):
                     text=self.read(evidence_path) if existed else None,
                 )
             )
+            argv = (sys.executable, FAKE_PEER, mode) + tuple(extra)
+            if pass_evidence:
+                argv = argv + (evidence_path or "",)
             return PeerCommand(
                 argv=argv,
                 cwd=self.temp,
                 env=tuple(os.environ.items()),
+                project_root=project,
+                review_evidence=evidence_path,
             )
 
         return build
+
+    def misdeclaring_builder(self, named):
+        """A connector that grants the peer some other file, or names none.
+
+        Nothing else about it is wrong: the argument vector would have run a
+        peer that answers properly. What the runner has to notice is only that
+        what was granted is not what was written.
+        """
+
+        def build(evidence_path, deadline):
+            return PeerCommand(
+                argv=(sys.executable, FAKE_PEER, "accept"),
+                cwd=self.temp,
+                env=tuple(os.environ.items()),
+                project_root=self.repo.project,
+                review_evidence=named,
+            )
+
+        return build
+
+    def request_text(self):
+        """The most recently published request, read back off the disk."""
+        return self.read(
+            os.path.join(
+                session.messages_dir(self.session_dir), self.requests()[-1]
+            )
+        )
 
     def expected_diff(self, base, head):
         """The cumulative diff, produced without going through the bridge."""
@@ -207,7 +258,7 @@ class GitFinishLine(unittest.TestCase):
             self.session_dir,
             "claude",
             REVIEW_BODY,
-            self.builder(mode, *extra),
+            self.builder(mode, *extra, project=project, **kwargs),
             timeout,
             project=project,
             review_base=base,
@@ -479,6 +530,241 @@ class GitFinishLine(unittest.TestCase):
         self.assert_evidence_reached_the_builder(
             self.repo.initial_commit, head
         )
+
+    # -- the evidence a reviewer actually read ------------------------------
+
+    def test_the_peer_is_proved_to_have_read_the_evidence(self):
+        """A token that can reach the peer only through the diff comes back.
+
+        The reviewed change carries a fresh random token. It is nowhere in the
+        outgoing body, so a peer that merely pretended to look cannot produce
+        it. Quoting it back is the proof.
+        """
+        self.seal(self.repo.initial_commit)
+        token = EVIDENCE_TOKEN_PREFIX + uuid.uuid4().hex
+        head = self.repo.add_commit(
+            "Work carrying a token nothing else can supply",
+            filename="token.txt",
+            text=token + "\n",
+        )
+
+        result = self.review(
+            "read-evidence",
+            self.repo.initial_commit,
+            head,
+            pass_evidence=True,
+        )
+        self.assertEqual(result.verdict, ACCEPT)
+        self.assertTrue(result.git_unlocked)
+        self.assertIn(
+            token,
+            self.read(result.response_path),
+            "the peer did not quote what was inside the evidence",
+        )
+
+        request = self.request_text()
+        self.assertNotIn(
+            token, request, "the token was sent instead of being read"
+        )
+        self.assertEqual(
+            request.split("\n\n", 1)[0],
+            "# Message {0}\nFrom: codex\nTo: claude\n"
+            "Review-Evidence: {1}".format(
+                session.format_sequence(result.request_sequence),
+                self.handed[0].path,
+            ),
+        )
+        self.assert_evidence_reached_the_builder(
+            self.repo.initial_commit, head
+        )
+
+    def test_evidence_changed_while_the_peer_had_it_voids_the_turn(self):
+        """An answer about a file somebody rewrote is about nothing knowable."""
+        head = self.ready()
+        self.refuse(
+            Failure.REVIEW_EVIDENCE_NOT_DELIVERED,
+            "rewrite-evidence",
+            self.repo.initial_commit,
+            head,
+            pass_evidence=True,
+        )
+        self.assertEqual(len(self.requests()), 1)
+
+    def test_a_connector_that_grants_the_wrong_file_never_starts_a_peer(self):
+        """What was granted has to be what was written, or nothing is sent."""
+        head = self.ready()
+        elsewhere = os.path.join(self.temp, "not-the-evidence.diff")
+        for named in (elsewhere, None):
+            with self.subTest(named=named):
+                with self.assertRaises(BridgeError) as caught:
+                    runner.run_turn(
+                        self.session_dir,
+                        "claude",
+                        REVIEW_BODY,
+                        self.misdeclaring_builder(named),
+                        30.0,
+                        project=self.repo.project,
+                        review_base=self.repo.initial_commit,
+                        review_head=head,
+                    )
+                self.assertEqual(
+                    caught.exception.failure,
+                    Failure.REVIEW_EVIDENCE_NOT_DELIVERED,
+                )
+                self.assertEqual(
+                    self.requests(),
+                    [],
+                    "a request was published, so the peer was started",
+                )
+                self.assertEqual(self.responses(), [])
+
+    def test_evidence_that_cannot_be_written_is_a_named_failure(self):
+        """A full or unwritable temporary area is a defined, actionable stop."""
+        head = self.ready()
+        with mock.patch.object(
+            gitgate.tempfile, "mkstemp", side_effect=OSError("no space left")
+        ):
+            error = self.refuse(
+                Failure.REVIEW_EVIDENCE_UNAVAILABLE,
+                "accept",
+                self.repo.initial_commit,
+                head,
+            )
+        self.assertIn("Next action:", str(error))
+        self.assertIn("TMPDIR", str(error))
+        self.assertEqual(self.requests(), [])
+        self.assertEqual(self._evidence_files(), self.evidence_before)
+
+    def test_evidence_that_outruns_the_deadline_publishes_nothing(self):
+        """One deadline covers writing the difference, not just the peer call."""
+        head = self.ready()
+        real_git = gitgate._git
+
+        def slow_diff(project, args, deadline, *rest, **kwargs):
+            if "diff" in args:
+                time.sleep(max(0.0, deadline.remaining()) + 0.05)
+            return real_git(project, args, deadline, *rest, **kwargs)
+
+        with mock.patch.object(gitgate, "_git", slow_diff):
+            self.refuse(
+                Failure.TIMEOUT,
+                "accept",
+                self.repo.initial_commit,
+                head,
+                timeout=2.0,
+            )
+        self.assertEqual(self.requests(), [])
+        self.assertEqual(self._evidence_files(), self.evidence_before)
+
+    # -- what the repository is allowed to say about itself -----------------
+
+    def test_a_replaced_commit_cannot_change_what_the_reviewer_reads(self):
+        """Git may be told one commit stands for another. A review may not.
+
+        The repository is given a mapping from the reviewed head to a commit
+        with different contents on the same parent. Ordinary Git honours it,
+        which this check confirms first; the review must not, or the reviewer
+        would be judging code that `Review-Head` does not name.
+        """
+        true_line = "The contents that were really committed."
+        decoy_line = "AGENT-BRIDGE-REPLACED-CONTENTS must never be reviewed."
+        self.seal(self.repo.initial_commit)
+        head = self.repo.add_commit(
+            "The work that is really under review",
+            filename="work.txt",
+            text=true_line + "\n",
+        )
+        branch = self.repo._git("rev-parse", "--abbrev-ref", "HEAD").strip()
+        self.repo._git(
+            "checkout", "--quiet", "-b", "decoy", self.repo.initial_commit
+        )
+        decoy = self.repo.add_commit(
+            "Contents somebody would rather have reviewed",
+            filename="work.txt",
+            text=decoy_line + "\n",
+        )
+        self.repo._git("checkout", "--quiet", branch)
+        self.repo._git("replace", head, decoy)
+
+        misled = self.repo._git(
+            "diff", "{0}..{1}".format(self.repo.initial_commit, head)
+        )
+        self.assertIn(
+            decoy_line,
+            misled,
+            "the replacement was not in effect, so this check proves nothing",
+        )
+
+        result = self.review("accept", self.repo.initial_commit, head)
+        self.assertTrue(result.git_unlocked)
+        self.assertEqual(len(self.handed), 1)
+        evidence = self.handed[0].text
+        self.assertIn(
+            true_line, evidence, "the reviewer was not shown the real head"
+        )
+        self.assertNotIn(
+            "AGENT-BRIDGE-REPLACED-CONTENTS",
+            evidence,
+            "a replacement object decided what the reviewer read",
+        )
+        published = self.read(result.response_path)
+        self.assertIn("Review-Head: {0}\n".format(head), published)
+
+    def test_an_ignored_file_is_uncommitted_too_and_is_never_deleted(self):
+        """Ignoring a file says nothing about whether a peer can read it."""
+        self.seal(self.repo.initial_commit)
+        head = self.repo.add_commit(
+            "Ignore the scratch file",
+            filename=".gitignore",
+            text="scratch.txt\n",
+        )
+        ignored = os.path.join(self.repo.project, "scratch.txt")
+        with open(ignored, "w", encoding="utf-8") as stream:
+            stream.write("Something no commit contains.\n")
+
+        error = self.refuse(
+            Failure.DIRTY_WORKTREE, "accept", self.repo.initial_commit, head
+        )
+        self.assertIn("scratch.txt", str(error))
+        self.assertIn("ignored", str(error))
+        self.assertEqual(self.requests(), [])
+        self.assertTrue(
+            os.path.exists(ignored),
+            "an ignored file was deleted instead of being reported",
+        )
+
+    # -- the repository outranks a fumbled last line ------------------------
+
+    def test_a_commit_during_the_review_outranks_a_malformed_verdict(self):
+        """Keeping prose matters only if the code it describes is still there."""
+        head = self.ready()
+
+        def commit_now():
+            try:
+                self.repo.add_commit("Committed while the review was running")
+            except Exception as exc:  # surfaced in the assertion below
+                self.commit_error.append(exc)
+
+        self.timer = threading.Timer(0.5, commit_now)
+        self.timer.start()
+
+        with self.assertRaises(BridgeError) as caught:
+            self.review(
+                "slow-unknown-verdict",
+                self.repo.initial_commit,
+                head,
+                "2.0",
+                timeout=60.0,
+            )
+        self.timer.join()
+        self.assertEqual(self.commit_error, [])
+        self.assertEqual(caught.exception.failure, Failure.HEAD_CHANGED)
+        self.assertEqual(
+            self.responses(),
+            [],
+            "a malformed answer about a head that moved was kept anyway",
+        )
+        self.assertEqual(len(self.requests()), 1)
 
 
 if __name__ == "__main__":

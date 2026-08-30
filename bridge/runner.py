@@ -28,7 +28,7 @@ nothing is rewritten, re-read for an intention, or retried. Acceptance requires
 a fresh review call. The point is narrow: a reviewer that did good work and
 fumbled one line should not have that work thrown away.
 
-In every failing case the request message that was already published stays,
+Where a request was published at all, it stays put in every failing case,
 because it truthfully records what was sent; the failure itself is written down
 by the workflow with `record --kind technical-error`.
 
@@ -38,30 +38,47 @@ simply do not unlock anything.
 
 The peer command is built here rather than handed in ready-made. Composing the
 fixed argument vector for a harness is a connector's work, but it cannot be
-done before the turn starts: a connector confines a reviewing peer by naming
-the exact review-evidence file in the restrictions it applies, and that path
-does not exist until the diff has been written. So this function takes a
-builder, generates the evidence, and then calls the builder with that exact
-path - `None` when the turn is not a review. Two things follow. The connector
-can name the one file the peer may read outside the project, and the
-connector's own inexpensive prechecks happen inside this turn's single deadline
-rather than before it started.
+done before the turn starts: a connector tells a reviewing peer where the
+evidence is by naming the exact review-evidence file in the restrictions it
+applies, and that path does not exist until the diff has been written. So this
+function takes a builder, generates the evidence, and then calls the builder
+with that exact path - `None` when the turn is not a review - and with this
+turn's deadline. Two things follow. The connector can name the exact evidence
+file, which sits outside the project, and every inexpensive precheck it runs -
+a version, a sign-in, a restriction probe - happens inside this turn's single
+deadline rather than before it started. Those prechecks go through the same
+bounded process runner with the same deadline; there is no second way to start
+a program and no budget of its own for one.
 
 Running that vector once, safely, inside the deadline is still this function's
 work. Keeping those apart is why the runner never imports a connector.
+
+**A reviewer has to be shown to have read the evidence, not trusted to have.**
+Three things together do that. The connector states what it granted the peer
+read access to - the project root and the evidence file - and both statements
+have to match, exactly, what this turn made. The published request names the
+evidence file, so the record says what the reviewer was pointed at. And the
+exact bytes written are hashed and checked again the moment the peer finishes,
+so a file that was replaced, truncated or removed voids the turn rather than
+producing a verdict about something nobody can identify.
+
+That is also why nothing is published until the evidence exists, the command
+has been composed and the declared paths agree. Until all three are true nothing
+has been sent, and a request message on disk would be saying otherwise.
 
 SPDX-License-Identifier: Unlicense
 """
 
 from __future__ import annotations
 
+import os
 from typing import Callable, NamedTuple, Optional
 
 from . import gitgate, session as session_module
 from .connectors import PeerCommand
 from .errors import BridgeError, Failure
 from .locking import session_lock
-from .peer import Deadline, run_bounded
+from .peer import Deadline, run_bounded, stopped_by_signal
 from .verdict import ACCEPT, read_verdict
 
 
@@ -80,11 +97,52 @@ class TurnResult(NamedTuple):
     git_unlocked: bool
 
 
+def _canonical(path: Optional[str]) -> Optional[str]:
+    """One spelling of a path, so two names for one file compare equal."""
+    if not path:
+        return None
+    return os.path.realpath(path)
+
+
+def _require_declared_access(
+    command: PeerCommand,
+    project: Optional[str],
+    evidence: Optional["gitgate.ReviewEvidence"],
+) -> None:
+    """Refuse to start a peer unless the connector named these exact paths.
+
+    A connector says what it granted the peer read access to. Here that claim
+    is held against what this turn actually made, with both spellings resolved
+    through any symbolic links first so that two names for one file are seen as
+    one file. A review must name a real evidence file, an ordinary turn must
+    name none, and a turn with no project must be granted no project.
+
+    Disagreement is not a small tidiness problem. It means the peer would be
+    reading something other than the difference this turn wrote, so nothing is
+    sent and no request is published.
+    """
+    if _canonical(command.project_root) != _canonical(project):
+        raise BridgeError(
+            Failure.REVIEW_EVIDENCE_NOT_DELIVERED,
+            detail="the connector granted the project root {0}, not {1}".format(
+                command.project_root, project
+            ),
+        )
+    wanted = evidence.path if evidence is not None else None
+    if _canonical(command.review_evidence) != _canonical(wanted):
+        raise BridgeError(
+            Failure.REVIEW_EVIDENCE_NOT_DELIVERED,
+            detail="the connector granted the evidence file {0}, not {1}".format(
+                command.review_evidence, wanted
+            ),
+        )
+
+
 def run_turn(
     session_dir: str,
     peer_id: str,
     body: str,
-    build_command: Callable[[Optional[str]], PeerCommand],
+    build_command: Callable[[Optional[str], Deadline], PeerCommand],
     timeout_seconds: float,
     project: Optional[str] = None,
     review_base: Optional[str] = None,
@@ -94,21 +152,32 @@ def run_turn(
 
     `build_command` is the connector. It is called once, inside the deadline and
     after any review evidence has been written, with the exact path of that
-    evidence file - or `None` when this turn is not a review - and returns the
-    fixed argument vector to run.
+    evidence file - or `None` when this turn is not a review - and this turn's
+    deadline, and returns the fixed argument vector to run. Anything it starts
+    to answer that call must go through the shared bounded process runner with
+    that same deadline.
 
     Supplying `review_base` and `review_head` makes this an external review and
     switches on the commit safeguards: the repository, baseline, head and clean
     worktree are all checked before the peer is asked anything, and the
-    repository, cleanliness and head are checked again after it has answered.
+    repository, cleanliness and head are checked again after it has answered -
+    whatever the answer looked like.
 
-    Every failure raises and leaves the Git finish line locked. Almost every
-    failure also leaves no response message behind - including a failure to
-    build the command, where the evidence is deleted just the same and nothing
-    is published. The single exception is `INVALID_VERDICT`: a peer that exited
-    cleanly with real output whose final line is not a verdict has its text kept
-    as an ordinary message, published with no `Review-*` fields, which is why it
-    can hold no authority. The call fails all the same.
+    One review turn happens in this order, holding the session lock: check the
+    repository; write the evidence and record what it holds; compose the
+    command, with the deadline checked either side; require the connector's
+    declared paths to match; publish the request naming the evidence; run the
+    peer; confirm the evidence is unchanged, then delete it whatever happened;
+    check the repository again; and only then publish the answer.
+
+    Every failure raises and leaves the Git finish line locked. A failure
+    before the request is published leaves no request behind, because nothing
+    was sent. Almost every failure also leaves no response message - including
+    a failure to build the command, where the evidence is deleted just the same
+    and nothing is published. The single exception is `INVALID_VERDICT`: a peer
+    that exited cleanly with real output whose final line is not a verdict has
+    its text kept as an ordinary message, published with no `Review-*` fields,
+    which is why it can hold no authority. The call fails all the same.
     """
     deadline = Deadline(timeout_seconds)
     review = review_base is not None and review_head is not None
@@ -141,70 +210,102 @@ def run_turn(
                 project, sealed, review_base, review_head, deadline
             )
 
-        request_sequence = session_module.next_sequence(session_dir)
-        session_module.publish(
-            session_module.message_path(
-                session_dir,
-                request_sequence,
-                session_module.LOCAL_TO_PEER_SUFFIX,
-            ),
-            session_module.local_to_peer_text(
-                request_sequence, record.local, record.peer, body
-            ),
-        )
-
-        evidence_path = None
-        try:
-            if review:
-                evidence_path = gitgate.generate_review_evidence(
-                    project, base, head, deadline
+        evidence = None
+        # The evidence file exists for the whole of this block, and for
+        # stretches of it no program is running - composing the command,
+        # publishing the request, reading the answer. A termination or a hangup
+        # in one of those has to raise rather than end the process where it
+        # stands, or the `finally` below never gets to delete the file.
+        with stopped_by_signal():
+            try:
+                if review:
+                    evidence = gitgate.generate_review_evidence(
+                        project, base, head, deadline
+                    )
+                # The connector composes the argument vector now, knowing where
+                # the evidence is, so it can name that exact file among the
+                # paths the peer is allowed to read. Its own prechecks happen in
+                # here, which is why the deadline is read on both sides of the
+                # call.
+                deadline.check("composing the peer command")
+                command = build_command(
+                    evidence.path if evidence is not None else None, deadline
                 )
-            # The connector composes the argument vector now, knowing where the
-            # evidence is, so it can name that exact file among the paths the
-            # peer is allowed to read.
-            command = build_command(evidence_path)
-            call = run_bounded(
-                argv=command.argv,
-                cwd=command.cwd,
-                env=command.env,
-                stdin_text=body,
-                deadline=deadline,
-            )
-            if call.returncode != 0:
-                raise BridgeError(
-                    Failure.PEER_FAILURE,
-                    detail="exit {0}: {1}".format(
-                        call.returncode, call.stderr.strip()
+                deadline.check("composing the peer command")
+                _require_declared_access(command, project, evidence)
+
+                # Only now has anything been sent, so only now is there a
+                # request worth recording - and it names the file the reviewer
+                # was given.
+                request_sequence = session_module.next_sequence(session_dir)
+                session_module.publish(
+                    session_module.message_path(
+                        session_dir,
+                        request_sequence,
+                        session_module.LOCAL_TO_PEER_SUFFIX,
+                    ),
+                    session_module.local_to_peer_text(
+                        request_sequence,
+                        record.local,
+                        record.peer,
+                        body,
+                        review_evidence=(
+                            evidence.path if evidence is not None else None
+                        ),
                     ),
                 )
-            response = call.stdout
-            if not response.strip():
-                raise BridgeError(
-                    Failure.EMPTY_RESPONSE, detail=command.argv[0]
-                )
-            verdict = None
-            unusable_from = None
-            if review:
-                result = read_verdict(response)
-                if result.failure is Failure.INVALID_VERDICT:
-                    # The peer finished cleanly and wrote real prose; only its
-                    # last line is wrong. Keep the prose - published below with
-                    # every binding field withheld - and still fail.
-                    unusable_from = command.argv[0]
-                elif not result.ok:
-                    raise BridgeError(result.failure, detail=command.argv[0])
-                else:
-                    verdict = result.verdict
-        finally:
-            gitgate.delete_review_evidence(evidence_path)
 
-        # An answer that carries no verdict is bound to nothing, so the second
-        # round of repository checks has nothing left to protect. Running them
-        # anyway could only replace INVALID_VERDICT with a different and less
-        # accurate failure.
-        bound = review and unusable_from is None
-        if bound:
+                call = run_bounded(
+                    argv=command.argv,
+                    cwd=command.cwd,
+                    env=command.env,
+                    stdin_text=body,
+                    deadline=deadline,
+                )
+                if evidence is not None:
+                    # Before anything is read out of the answer: the reviewer
+                    # must have had the exact file this turn wrote, or there is
+                    # no saying what the answer is about.
+                    gitgate.verify_review_evidence(evidence)
+                if call.returncode != 0:
+                    raise BridgeError(
+                        Failure.PEER_FAILURE,
+                        detail="exit {0}: {1}".format(
+                            call.returncode, call.stderr.strip()
+                        ),
+                    )
+                response = call.stdout
+                if not response.strip():
+                    raise BridgeError(
+                        Failure.EMPTY_RESPONSE, detail=command.argv[0]
+                    )
+                verdict = None
+                unusable_from = None
+                if review:
+                    result = read_verdict(response)
+                    if result.failure is Failure.INVALID_VERDICT:
+                        # The peer finished cleanly and wrote real prose; only
+                        # its last line is wrong. Keep the prose - published
+                        # below with every binding field withheld - and still
+                        # fail.
+                        unusable_from = command.argv[0]
+                    elif not result.ok:
+                        raise BridgeError(
+                            result.failure, detail=command.argv[0]
+                        )
+                    else:
+                        verdict = result.verdict
+            finally:
+                gitgate.delete_review_evidence(evidence)
+
+        # These run whatever the answer looked like. A repository that moved
+        # while the review was being written is the more important fact, and
+        # keeping a malformed reviewer's prose is only worth doing once the
+        # code it describes is known to be still there.
+        if review:
             gitgate.after_review_checks(project, sealed, head, deadline)
+
+        bound = review and unusable_from is None
 
         response_sequence = session_module.next_sequence(session_dir)
         response_path = session_module.publish(

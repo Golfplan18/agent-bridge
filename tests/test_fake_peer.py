@@ -3,14 +3,16 @@
 None of this needs a real coding-agent harness, a subscription or a model. Every
 behavior worth proving here is about files, locks and processes: that a message
 is either whole or absent, that two turns cannot both hold a session, that a
-lock left behind by a process that was killed outright blocks nobody, and that
-nothing this turn started is still running when it returns.
+lock left behind by a process that was killed outright blocks nobody, that being
+told to stop cleans up what a turn started, and that nothing this turn started
+is still running when it returns.
 
 Everything below exercises the real thing. Real processes are started, real
-files are written, real locks are taken out in separate processes, and a real
-process is killed with no chance to tidy up. The one exception is the forced
-publication failure, which cannot be produced on demand any other way and is
-made to happen by breaking the rename for the length of one call.
+files are written, real locks are taken out in separate processes, real signals
+are sent, and a real process is killed with no chance to tidy up. The two
+exceptions are the forced publication failures, which cannot be produced on
+demand any other way and are made to happen by breaking the rename, and then
+the flush that follows it, for the length of one call.
 
 SPDX-License-Identifier: Unlicense
 """
@@ -58,6 +60,29 @@ LOCK_HOLDER = (
 
 GRANDCHILD_LINE = re.compile(r"^GRANDCHILD (\d+)$", re.MULTILINE)
 
+#: How the fake peer reports the two processes a stop signal has to reach.
+PID_LINE = re.compile(r"^(PEER|CHILD) (\d+)$", re.MULTILINE)
+
+#: One bounded call, in a process of its own, so a check can signal the thing
+#: doing the waiting rather than the check itself. It exits 3 when it is
+#: stopped, which is how a check tells "cleaned up after a signal" apart from
+#: "died some other way".
+SIGNAL_DRIVER = (
+    "import os, sys\n"
+    "sys.path.insert(0, sys.argv[1])\n"
+    "from bridge import peer\n"
+    "try:\n"
+    "    peer.run_bounded(\n"
+    "        argv=(sys.executable, sys.argv[2], sys.argv[3], sys.argv[4]),\n"
+    "        cwd=sys.argv[1],\n"
+    "        env=tuple(os.environ.items()),\n"
+    "        stdin_text='Start something and then stop answering.\\n',\n"
+    "        deadline=peer.Deadline(60.0),\n"
+    "    )\n"
+    "except peer.SignalStop:\n"
+    "    sys.exit(3)\n"
+)
+
 
 def _wait_for(condition, timeout=SHORT_WAIT):
     limit = time.monotonic() + timeout
@@ -103,6 +128,7 @@ class TurnBehavior(unittest.TestCase):
             workflow="planning",
         )
         self.holders = []
+        self.drivers = []
         self.evidence_before = self._evidence_files()
 
     def tearDown(self):
@@ -111,6 +137,13 @@ class TurnBehavior(unittest.TestCase):
                 holder.kill()
             holder.wait()
             for stream in (holder.stdin, holder.stdout):
+                if stream is not None:
+                    stream.close()
+        for driver in self.drivers:
+            if driver.poll() is None:
+                driver.kill()
+            driver.wait()
+            for stream in (driver.stdout, driver.stderr):
                 if stream is not None:
                     stream.close()
         self.assertEqual(
@@ -131,18 +164,79 @@ class TurnBehavior(unittest.TestCase):
     def _builder(self, mode, *extra):
         """What the runner calls to compose the command for one turn.
 
-        The runner hands a builder the review-evidence path when it has one.
-        None of the turns here are reviews, so what arrives is None, and the
-        fake peer is started the same way whatever it is.
+        The runner hands a builder the review-evidence path when it has one,
+        and this turn's deadline so that anything the builder starts is bounded
+        by it. None of the turns here are reviews, so what arrives is None, and
+        this builder declares that it granted the peer no project and no
+        evidence file - which is what the runner requires it to say.
         """
         argv = (sys.executable, FAKE_PEER, mode) + tuple(extra)
 
-        def build(evidence_path):
+        def build(evidence_path, deadline):
             return PeerCommand(
-                argv=argv, cwd=self.temp, env=tuple(os.environ.items())
+                argv=argv,
+                cwd=self.temp,
+                env=tuple(os.environ.items()),
+                project_root=None,
+                review_evidence=evidence_path,
             )
 
         return build
+
+    def _start_signal_driver(self, mode, pid_path):
+        """One bounded call waiting in its own process, ready to be signalled."""
+        driver = subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                SIGNAL_DRIVER,
+                REPO_ROOT,
+                FAKE_PEER,
+                mode,
+                pid_path,
+            ],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            shell=False,
+        )
+        self.drivers.append(driver)
+        return driver
+
+    def _await_reported_pids(self, pid_path):
+        """The peer's own process id and its child's, once both are running."""
+        reported = {}
+
+        def both_reported():
+            try:
+                with open(pid_path, encoding="utf-8") as stream:
+                    text = stream.read()
+            except OSError:
+                return False
+            found = dict(
+                (name, int(number))
+                for name, number in PID_LINE.findall(text)
+            )
+            if len(found) != 2:
+                return False
+            reported.update(found)
+            return True
+
+        self.assertTrue(
+            _wait_for(both_reported),
+            "the fake peer never reported the processes it started",
+        )
+        peer_pid = reported["PEER"]
+        child_pid = reported["CHILD"]
+        self.assertTrue(
+            _wait_for(lambda: not _process_gone(peer_pid)),
+            "the peer never started",
+        )
+        self.assertTrue(
+            _wait_for(lambda: not _process_gone(child_pid)),
+            "the process the peer started never ran",
+        )
+        return peer_pid, child_pid
 
     def _messages(self):
         return sorted(os.listdir(session.messages_dir(self.session_dir)))
@@ -286,6 +380,29 @@ class TurnBehavior(unittest.TestCase):
         self.assertEqual(self._messages(), [])
         self.assertEqual(self._leftover_temporaries(), [])
 
+    def test_a_rename_that_worked_is_never_reported_as_nothing_published(self):
+        """The message is there, so the failure has to say the file is there."""
+        target = session.message_path(
+            self.session_dir, 1, session.LOCAL_RECORD_SUFFIX
+        )
+        text = "# Message 0001\nRecord: user-correction\nFrom: codex\n"
+        with mock.patch.object(
+            session, "_fsync_directory", side_effect=OSError("forced failure")
+        ):
+            with self.assertRaises(BridgeError) as caught:
+                session.publish(target, text)
+
+        self.assertEqual(
+            caught.exception.failure, Failure.PUBLICATION_NOT_FLUSHED
+        )
+        self.assertIn(target, str(caught.exception))
+        self.assertTrue(
+            os.path.exists(target), "the published message is not there"
+        )
+        with open(target, encoding="utf-8") as stream:
+            self.assertEqual(stream.read(), text)
+        self.assertEqual(self._leftover_temporaries(), [])
+
     # -- the lock ----------------------------------------------------------
 
     def test_a_second_acquirer_is_busy_and_changes_nothing(self):
@@ -387,6 +504,67 @@ class TurnBehavior(unittest.TestCase):
         self.assertTrue(
             _wait_for(lambda: _group_gone(timeout.pid)),
             "the task-owned process group still has a member",
+        )
+
+    def test_being_told_to_stop_cleans_up_the_peer_and_its_child(self):
+        """Termination and hangup leave by the same door Ctrl-C already used."""
+        for number in (signal.SIGTERM, signal.SIGHUP):
+            with self.subTest(signal=number):
+                pid_path = os.path.join(
+                    self.temp, "pids-{0}.txt".format(number)
+                )
+                driver = self._start_signal_driver(
+                    "write-pids-then-hang", pid_path
+                )
+                peer_pid, child_pid = self._await_reported_pids(pid_path)
+
+                os.kill(driver.pid, number)
+                driver.wait(timeout=SHORT_WAIT)
+                self.assertEqual(
+                    driver.returncode,
+                    3,
+                    driver.stderr.read().decode("utf-8", "replace"),
+                )
+                self.assertTrue(
+                    _wait_for(lambda: _process_gone(peer_pid)),
+                    "the peer is still there",
+                )
+                self.assertTrue(
+                    _wait_for(lambda: _process_gone(child_pid)),
+                    "the process the peer started is still there",
+                )
+
+    def test_a_child_that_leaves_the_group_is_beyond_this_cleanup(self):
+        """The stated limit, measured rather than assumed.
+
+        A child that puts itself into a session of its own is no longer in the
+        process group this turn owns, so signalling that group cannot reach it.
+        This check proves the limit is real - which is why a harness program
+        that daemonizes during a turn must fail qualification - and then ends
+        the escaped process itself so nothing outlives the run.
+        """
+        pid_path = os.path.join(self.temp, "detached-pids.txt")
+        driver = self._start_signal_driver(
+            "detach-child-then-hang", pid_path
+        )
+        peer_pid, child_pid = self._await_reported_pids(pid_path)
+
+        os.kill(driver.pid, signal.SIGTERM)
+        driver.wait(timeout=SHORT_WAIT)
+        self.assertTrue(
+            _wait_for(lambda: _process_gone(peer_pid)),
+            "the peer is still there",
+        )
+        self.assertFalse(
+            _process_gone(child_pid),
+            "the detached child was reached after all, so this check no "
+            "longer measures the limitation it describes",
+        )
+
+        os.kill(child_pid, signal.SIGKILL)
+        self.assertTrue(
+            _wait_for(lambda: _process_gone(child_pid)),
+            "the detached child could not be ended by this check either",
         )
 
 

@@ -194,8 +194,7 @@ def _waive(
         )
     gitgate.check_identity(project_path, sealed, deadline)
     commit = gitgate.resolve_commit(project_path, revision, deadline)
-    if not gitgate.is_clean(project_path, deadline):
-        raise BridgeError(Failure.DIRTY_WORKTREE, detail=project_path)
+    gitgate.require_clean(project_path, deadline)
     here = gitgate.current_head(project_path, deadline)
     if here != commit:
         raise BridgeError(

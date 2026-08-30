@@ -15,14 +15,24 @@ Each mode exists because some check needs it: a good answer, a good answer that
 arrives slowly, an answer that ends wrongly, no answer, a crash, a program that
 will not stop, and a program that leaves a child behind.
 
+Four modes are about the review evidence and about being stopped. One opens the
+evidence file it is given and quotes the token hidden inside, which is the only
+way to tell a peer that really read the difference from one that was merely
+trusted to have. One rewrites that file behind the runner's back. Two report
+their own process id and their child's into a file the check names, so a check
+can watch those exact processes rather than guessing - one putting the child in
+this turn's process group, and one letting it escape into a session of its own.
+
 It imports nothing outside the standard library, touches nothing except the
-input it is given and the output streams it is handed, and never sleeps without
-a bound.
+input it is given, the evidence path it is handed, the file it is told to write
+its process ids into, and the output streams it is handed. It never sleeps
+without a bound.
 
 SPDX-License-Identifier: Unlicense
 """
 
 import os
+import re
 import subprocess
 import sys
 import time
@@ -45,9 +55,19 @@ MODES = (
     "hang",
     "spawn-child-then-hang",
     "slow-accept",
+    "slow-unknown-verdict",
+    "read-evidence",
+    "rewrite-evidence",
+    "write-pids-then-hang",
+    "detach-child-then-hang",
 )
 
 VERDICT_PREFIX = "Agent-Bridge-Verdict: "
+
+#: The shape of the canary a check hides inside the reviewed change. It reaches
+#: this program only through the evidence file, so quoting it is proof the file
+#: was opened and read rather than assumed.
+EVIDENCE_TOKEN = re.compile(r"AGENT-BRIDGE-EVIDENCE-TOKEN-[0-9a-f]+")
 
 #: Long enough to outlast any real deadline, short enough that a stray copy
 #: cannot survive the day. The sleep is a loop of short naps so a termination
@@ -86,19 +106,51 @@ def _sleep_bounded(seconds: float) -> None:
         time.sleep(NAP_SECONDS)
 
 
-def _spawn_grandchild() -> int:
-    """Start one child that sleeps, deliberately in this process group.
+def _spawn_grandchild(detached: bool = False, seconds: str = "") -> int:
+    """Start one child that sleeps, and say where it was put.
 
-    No new session and no new process group: the grandchild stays in the group
-    the runner created, so terminating that group must reach it. A runner that
-    kills only its direct child leaves this process behind, which is the thing
-    the orphan check is looking for.
+    By default there is no new session and no new process group: the grandchild
+    stays in the group the runner created, so terminating that group must reach
+    it. A runner that kills only its direct child leaves this process behind,
+    which is the thing the orphan check is looking for.
+
+    With `detached`, the child asks for a session of its own and so leaves the
+    group this turn owns. Nothing portable can reach it after that, which is
+    the honest limit one check exists to measure. Such a child is given a short
+    sleep so that even a check that failed to end it cannot leave it about.
     """
+    argv = [sys.executable, THIS_FILE, "hang"]
+    if seconds:
+        argv.append(seconds)
     child = subprocess.Popen(
-        [sys.executable, THIS_FILE, "hang"],
+        argv,
         stdin=subprocess.DEVNULL,
+        start_new_session=detached,
     )
     return child.pid
+
+
+def _write_pids(path: str, child_pid: int) -> None:
+    """Say which two processes now exist, and force it onto the disk.
+
+    A check outside cannot see either process id any other way: this program's
+    output is held in a pipe until the call ends, and by then the processes it
+    wants to watch are meant to be gone.
+    """
+    with open(path, "w", encoding="utf-8") as stream:
+        stream.write("PEER {0}\nCHILD {1}\n".format(os.getpid(), child_pid))
+        stream.flush()
+        os.fsync(stream.fileno())
+
+
+def _one_path(mode: str, extra: list) -> str:
+    """The single path argument a mode needs, or an empty string if missing."""
+    if len(extra) != 1 or not extra[0]:
+        sys.stderr.write(
+            "fake peer: {0} needs exactly one path\n".format(mode)
+        )
+        return ""
+    return extra[0]
 
 
 def _run(mode: str, extra: list) -> int:
@@ -164,7 +216,14 @@ def _run(mode: str, extra: list) -> int:
         return 3
 
     if mode == "hang":
-        _sleep_bounded(MAX_SLEEP_SECONDS)
+        seconds = MAX_SLEEP_SECONDS
+        if extra:
+            try:
+                seconds = float(extra[0])
+            except ValueError:
+                sys.stderr.write("fake peer: seconds must be a number\n")
+                return 2
+        _sleep_bounded(seconds)
         return 0
 
     if mode == "spawn-child-then-hang":
@@ -172,9 +231,11 @@ def _run(mode: str, extra: list) -> int:
         _sleep_bounded(MAX_SLEEP_SECONDS)
         return 0
 
-    if mode == "slow-accept":
+    if mode in ("slow-accept", "slow-unknown-verdict"):
         if len(extra) != 1:
-            sys.stderr.write("fake peer: slow-accept needs one seconds value\n")
+            sys.stderr.write(
+                "fake peer: {0} needs one seconds value\n".format(mode)
+            )
             return 2
         try:
             seconds = float(extra[0])
@@ -182,7 +243,56 @@ def _run(mode: str, extra: list) -> int:
             sys.stderr.write("fake peer: seconds must be a number\n")
             return 2
         _sleep_bounded(seconds)
+        decision = "ACCEPT" if mode == "slow-accept" else "MAYBE"
+        _emit(echoed + VERDICT_PREFIX + decision + "\n")
+        return 0
+
+    if mode == "read-evidence":
+        path = _one_path(mode, extra)
+        if not path:
+            return 2
+        try:
+            with open(path, "r", encoding="utf-8") as stream:
+                evidence = stream.read()
+        except OSError as exc:
+            sys.stderr.write(
+                "fake peer: cannot read the evidence: {0}\n".format(exc)
+            )
+            return 2
+        found = EVIDENCE_TOKEN.search(evidence)
+        if found is None:
+            sys.stderr.write("fake peer: the evidence held no token\n")
+            return 2
+        _emit(found.group(0) + "\n" + VERDICT_PREFIX + "ACCEPT\n")
+        return 0
+
+    if mode == "rewrite-evidence":
+        path = _one_path(mode, extra)
+        if not path:
+            return 2
+        try:
+            with open(path, "w", encoding="utf-8") as stream:
+                stream.write("This is not the difference the runner wrote.\n")
+        except OSError as exc:
+            sys.stderr.write(
+                "fake peer: cannot rewrite the evidence: {0}\n".format(exc)
+            )
+            return 2
         _emit(echoed + VERDICT_PREFIX + "ACCEPT\n")
+        return 0
+
+    if mode in ("write-pids-then-hang", "detach-child-then-hang"):
+        path = _one_path(mode, extra)
+        if not path:
+            return 2
+        detached = mode == "detach-child-then-hang"
+        _write_pids(
+            path,
+            _spawn_grandchild(
+                detached=detached, seconds="60" if detached else ""
+            ),
+        )
+        _sleep_bounded(MAX_SLEEP_SECONDS)
         return 0
 
     sys.stderr.write(

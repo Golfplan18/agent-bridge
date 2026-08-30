@@ -19,6 +19,23 @@ confirms that the group's number really is the child's own process id, which is
 the check that makes it impossible to signal the group Agent Bridge itself is
 running in.
 
+**What ends the waiting.** Three things can: the program answers, the deadline
+passes, or somebody stops Agent Bridge - with an interrupt from the keyboard, or
+with a termination or hangup signal. All three become exceptions, so all three
+leave by the same route and the same cleanup runs. The signal handlers are put
+back exactly as they were found on the way out, and where they cannot be
+installed at all - because this is not the main thread - the turn goes ahead
+without them, which is better than refusing to work.
+
+**What cannot be cleaned up, honestly.** Being killed outright with `SIGKILL`
+cannot be caught by any program, a machine that loses power runs no cleanup
+code, and a child that deliberately puts itself into its own session has left
+the group this turn owns and can no longer be reached by signalling that group.
+None of the three can be controlled portably, so none of them is pretended
+about. The consequence for connectors is concrete: a harness command-line
+program that daemonizes during a turn puts its work beyond this cleanup and must
+therefore fail qualification.
+
 The deadline covers the useful work: prechecks, evidence generation, the call
 and the answer. Cleanup afterwards gets its own separate bounded grace, because
 a deadline that has already run out cannot be used to decide how long to wait
@@ -29,11 +46,12 @@ SPDX-License-Identifier: Unlicense
 
 from __future__ import annotations
 
+import contextlib
 import os
 import signal
 import subprocess
 import time
-from typing import Iterable, NamedTuple, Optional, Sequence, Tuple
+from typing import Iterable, Iterator, NamedTuple, Optional, Sequence, Tuple
 
 from .errors import BridgeError, Failure
 
@@ -80,6 +98,58 @@ class CompletedCall(NamedTuple):
     returncode: int
     stdout: str
     stderr: str
+
+
+class SignalStop(Exception):
+    """Somebody asked this turn to stop while it was under way.
+
+    Raised from inside a signal handler so that a termination or a hangup
+    leaves by the ordinary route - through the cleanup that terminates the
+    process group, deletes the review evidence and releases the session lock -
+    instead of ending the process where it stands. It is deliberately not one
+    of the internal failures: nothing went wrong with the turn, it was stopped.
+    """
+
+    def __init__(self, number: int) -> None:
+        super().__init__(
+            "Agent Bridge was stopped by signal {0}, so the turn did not "
+            "finish and the Git finish line stays locked.".format(number)
+        )
+        self.number = number
+
+
+#: The two signals a turn turns into `SignalStop`. An interrupt from the
+#: keyboard already arrives as `KeyboardInterrupt` and needs nothing added.
+STOP_SIGNALS: Tuple[int, ...] = (signal.SIGTERM, signal.SIGHUP)
+
+
+@contextlib.contextmanager
+def stopped_by_signal() -> Iterator[None]:
+    """Make termination and hangup raise, and put the handlers back after.
+
+    Installing a handler is only possible on the main thread. Somewhere else it
+    is impossible rather than wrong, so the block runs without them: losing a
+    tidy exit is a smaller harm than refusing to do the work at all.
+    """
+
+    def stop(number, frame):
+        """Leave by raising, so the cleanup around the caller still runs."""
+        raise SignalStop(number)
+
+    installed = []
+    try:
+        for number in STOP_SIGNALS:
+            installed.append((number, signal.signal(number, stop)))
+    except (OSError, ValueError):
+        pass
+    try:
+        yield
+    finally:
+        for number, previous in reversed(installed):
+            try:
+                signal.signal(number, previous)
+            except (OSError, ValueError):
+                pass
 
 
 class PeerTimeout(BridgeError):
@@ -233,53 +303,59 @@ def run_bounded(
 
     Raises `PeerTimeout` (a `TIMEOUT`) when the deadline passes first, the given
     `spawn_failure` when the program could not be started at all, and
-    `CLEANUP_FAILURE` when something this turn started outlived it. Cleanup runs
-    on every exit path, success included.
+    `CLEANUP_FAILURE` when something this turn started outlived it. Raises
+    `SignalStop` when somebody terminates or hangs up Agent Bridge while the
+    program is running. Cleanup runs on every one of those exit paths, and on
+    success too.
     """
     remaining = deadline.remaining()
     if remaining <= 0.0:
         raise BridgeError(Failure.TIMEOUT, detail=" ".join(argv[:2]))
     payload = stdin_text.encode("utf-8")
-    try:
-        process = subprocess.Popen(
-            list(argv),
-            cwd=cwd,
-            env=dict(env),
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            shell=False,
-            close_fds=True,
-            start_new_session=True,
-        )
-    except OSError as exc:
-        raise BridgeError(spawn_failure, detail=str(exc))
-
-    pgid = _own_group(process)
     timed_out = False
     stdout = b""
     stderr = b""
-    try:
+    # The handlers go on before the child does, so there is no moment where a
+    # process exists that a signal could leave behind.
+    with stopped_by_signal():
         try:
-            stdout, stderr = process.communicate(
-                input=payload, timeout=remaining
+            process = subprocess.Popen(
+                list(argv),
+                cwd=cwd,
+                env=dict(env),
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                shell=False,
+                close_fds=True,
+                start_new_session=True,
             )
-        except subprocess.TimeoutExpired:
-            timed_out = True
-    finally:
+        except OSError as exc:
+            raise BridgeError(spawn_failure, detail=str(exc))
+
+        pgid = _own_group(process)
         try:
-            _cleanup_group(process, pgid)
+            try:
+                stdout, stderr = process.communicate(
+                    input=payload, timeout=remaining
+                )
+            except subprocess.TimeoutExpired:
+                timed_out = True
         finally:
-            if timed_out:
-                # The group is gone, so the pipes are at end-of-file and this
-                # returns at once with everything the program managed to say.
-                try:
-                    stdout, stderr = process.communicate(
-                        timeout=ESCALATION_GRACE_SECONDS
-                    )
-                except (subprocess.TimeoutExpired, ValueError, OSError):
-                    stdout, stderr = b"", b""
-            _close_streams(process)
+            try:
+                _cleanup_group(process, pgid)
+            finally:
+                if timed_out:
+                    # The group is gone, so the pipes are at end-of-file and
+                    # this returns at once with everything the program managed
+                    # to say.
+                    try:
+                        stdout, stderr = process.communicate(
+                            timeout=ESCALATION_GRACE_SECONDS
+                        )
+                    except (subprocess.TimeoutExpired, ValueError, OSError):
+                        stdout, stderr = b"", b""
+                _close_streams(process)
 
     out_text = stdout.decode("utf-8", "replace") if stdout else ""
     err_text = stderr.decode("utf-8", "replace") if stderr else ""

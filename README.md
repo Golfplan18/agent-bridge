@@ -8,7 +8,10 @@ What the bridge owns is deliberately small: one bounded call to a peer harness,
 an ordered exchange of Markdown files on disk, an explicit least-authority
 invocation, one lock per session, publication that either completes or does not
 happen at all, cleanup of everything the turn started, and the written
-instructions that coordinate planning and review.
+instructions that coordinate planning and review. Agent Bridge treats a peer's
+command-line program as a trusted program running under the user's own account,
+and makes no claim to stop it reading other files that account can already read,
+so invoke only harnesses you trust.
 
 Everything else stays where it already lives. Each harness keeps its own
 authentication, subscription, providers, models, tools, agents and native

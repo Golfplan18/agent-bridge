@@ -22,7 +22,10 @@ What the bridge owns is deliberately small: one bounded call to a peer harness,
 an ordered exchange of Markdown files on disk, an explicit least-authority
 invocation, one lock per session, publication that either completes or does not
 happen at all, cleanup of everything the turn started, and the written
-instructions that coordinate planning and review.
+instructions that coordinate planning and review. Agent Bridge treats a peer's
+command-line program as a trusted program running under the user's own account,
+and makes no claim to stop it reading other files that account can already read,
+so invoke only harnesses you trust.
 
 Everything else stays where it already lives. Each harness keeps its own
 authentication, subscription, providers, models, tools, agents and native
@@ -110,6 +113,18 @@ and capturing the response. It defaults to 900 seconds. Cleanup afterwards is
 bounded separately from that deadline, and has to be: by the time cleanup
 matters the deadline has usually already run out, and a budget of nothing is no
 way to decide how long to wait for a process to die. There is no retry.
+
+A turn that is stopped rather than finished cleans up the same way. An interrupt
+from the keyboard, a termination signal and a hangup signal all take the same
+route out: the process group the turn owns is emptied, the review evidence is
+deleted, and the session lock is released. After a termination or a hangup the
+command then says in one plain sentence that it was stopped, and exits nonzero.
+Three things stay outside anybody's control and are not pretended about: being
+killed outright with `SIGKILL`, a machine that loses power, and a child that
+deliberately puts itself into a session of its own and so leaves the group the
+turn owns. The last of those has an exact consequence for connectors: a harness
+command-line program that daemonizes during a turn puts its work beyond this
+cleanup, and must therefore fail qualification.
 
 **`record`** writes one local message into the session without calling anybody.
 It is described in the next section.
@@ -231,6 +246,24 @@ To: codex
 <peer output copied verbatim>
 ```
 
+A review request, which adds one runner-owned line naming the exact file the
+reviewing peer was given to read:
+
+```markdown
+# Message 0011
+From: codex
+To: claude
+Review-Evidence: /tmp/agent-bridge-review-evidence-xxxxxxxx.diff
+
+## Body
+
+<the review instruction copied verbatim>
+```
+
+An ordinary request never carries that line. No request of either kind ever
+carries `Review-Request`, `Review-Base` or `Review-Head`: those three bind an
+answer, and at the moment a request is written no answer exists.
+
 An external-review response, which adds only facts the runner already held
 before it made the call:
 
@@ -310,30 +343,63 @@ reading the report: `EMPTY_RESPONSE` when the peer produced no text at all, and
 `INVALID_VERDICT` when it produced text that does not end correctly.
 
 A verdict is only worth anything if it describes the exact code that was
-reviewed, so `run` binds it to commits. Before the call: resolve both commits,
-require the review baseline to equal the baseline sealed at
-`implementation-start`, require it to be an ancestor of a distinct task head,
-confirm the sealed repository, a clean worktree and the exact expected `HEAD`.
-The runner then generates the `baseline..head` diff once, with a fixed argument
-vector and external diff and text-conversion hooks disabled, into one temporary
-file it owns, outside both the project and the session record. The reviewing peer
-gets read access to the project and that one file, and no shell and no Git. After
-the peer exits the evidence is deleted and the repository, cleanliness and `HEAD`
-checks are repeated. Any mismatch, or any failure to clean up, voids the verdict
-as a technical error.
+reviewed, so `run` binds it to commits. Every Git command it runs to do that has
+replacement objects disabled, because Git lets a repository say "wherever you see
+this commit, read that one instead" and a review that honoured such a mapping
+would show a reviewer contents the `Review-Head` line does not name. A worktree
+counts as clean only when Git reports nothing at all — no uncommitted change, no
+untracked file, and no ignored file either, since being ignored by Git says
+nothing about whether a reviewing peer can read something no commit contains.
+Ignored files are reported, never deleted: they are the user's own files.
+
+The reviewing peer is given the project and one file to read, and no shell and
+no Git. That file is the `baseline..head` diff, generated once, with a fixed
+argument vector and external diff and text-conversion hooks disabled, into one
+temporary file the runner owns, outside both the project and the session record.
 
 How the runner and the connector fit together at that moment is fixed, because
 one depends on the other. The runner is not handed a ready-made command. It
 writes the evidence first, and then calls the connector to compose the fixed
-argument vector for this one call, giving it the exact path of that evidence
-file — `None` when the turn is not a review — so that the connector can name
-that exact path among the paths its restriction switches let the peer read.
-Nothing coarser will do: the boundary is the project root and that one file, not
-the folder the file happens to sit in. Because the command is composed inside the
-turn, the connector's own inexpensive prechecks fall inside the one deadline,
-alongside the runner's checks, the evidence, the peer call and the response. If
-composing the command fails, the evidence is deleted as on any other way out,
-nothing is published, and Git stays locked.
+argument vector for this one call, giving it the exact path of that evidence file
+— `None` when the turn is not a review — and this turn's deadline. The connector
+names that exact path in the restrictions it applies, so the peer is told
+precisely where the evidence is and the runner can afterwards check that what
+was granted is what it wrote. Every version, authentication and restriction
+subprocess the connector runs to answer that call goes through the shared
+bounded process runner with that same deadline; there is no second way to start
+a program and no separate budget for one.
+
+The connector also states, as part of the command it returns, what it granted the
+peer read access to: the project root, and the review-evidence file. Neither has
+a default. The runner resolves both statements and both of its own paths to real
+paths and requires exact agreement — a review must name a real evidence file, an
+ordinary turn must name none, and a turn with no project must be granted none.
+It also records a digest of the exact bytes it wrote as evidence and checks the
+file again the moment the peer finishes. A reviewer therefore cannot be merely
+trusted to have read the right thing: a mismatched grant stops the turn before
+the peer is started, and a file that was replaced, truncated or removed voids the
+turn afterwards.
+
+One review turn therefore runs in this order, holding the session lock:
+
+1. the before-review repository checks — resolve both commits, require the review
+   baseline to equal the baseline sealed at `implementation-start`, require it to
+   be an ancestor of a distinct task head, confirm the sealed repository, a clean
+   worktree and the exact expected `HEAD`;
+2. generate the evidence and record what it holds;
+3. check the deadline, compose the command, check the deadline again;
+4. require the connector's declared project and evidence paths to match exactly;
+5. publish the request, which names the evidence file in a `Review-Evidence:`
+   line the runner owns;
+6. run the peer inside the deadline;
+7. confirm the evidence is unchanged, then delete it on every way out;
+8. repeat the repository, cleanliness and `HEAD` checks;
+9. publish the response, carrying the binding fields only when the verdict is
+   valid.
+
+A failure before step 5 publishes no request, because nothing was sent. Any
+mismatch at any step, or any failure to clean up, voids the verdict as a
+technical error.
 
 Git unlocks only when all five of these hold at once:
 
@@ -362,7 +428,10 @@ cleanly with real output, and got only its final line wrong, has that output
 published as an **ordinary message** — the same shape any non-review answer
 takes, carrying none of the `Review-*` fields that bind an answer to a request
 and to two commits. It therefore holds no external-review authority and unlocks
-nothing. The call still fails, Git stays locked, and the text is never rewritten,
+nothing. The repository checks at step 8 come first, whatever the last line
+looked like, because prose is only worth keeping once the code it describes is
+known to be still there: a repository that moved during the review reports the
+movement and publishes nothing at all. The call still fails, Git stays locked, and the text is never rewritten,
 read for an intention, or retried; acceptance requires a fresh review call. A
 reviewer that did good work and fumbled one line should not lose the work.
 
@@ -400,7 +469,7 @@ code needs it.
 | `UNREPORTABLE_VERSION` | The program printed no readable version | Run its version command by hand; if it stays unreadable the harness cannot be qualified |
 | `UNQUALIFIED_VERSION` | The installed version is outside the tested set | Install a tested version, or requalify and update the connector's declaration |
 | `UNQUALIFIED_PLATFORM` | This operating system or major version is outside the tested coverage | Use a tested platform, or requalify there and update the declaration |
-| `RESTRICTIONS_UNAVAILABLE` | The harness lacks the switches needed to deny writes and outside reads | Do not give it real project access; report the missing restriction |
+| `RESTRICTIONS_UNAVAILABLE` | The harness lacks the switches needed to deny project writes and to take away its shell, Git and network access | Do not give it real project access; report the missing restriction |
 | `QUALIFICATION_UNSAFE_OR_INCONCLUSIVE` | The disposable probe did not clearly prove the boundary held | Read the reported synthetic path, work out what happened, requalify |
 | `BUSY_SESSION` | Another turn holds this session's lock | Wait for it to finish and run again; nothing was changed |
 | `TIMEOUT` | The deadline passed before an answer arrived | Run again with a longer `--timeout`, or check the peer by hand |
@@ -410,6 +479,8 @@ code needs it.
 | `REPOSITORY_CHANGED` | The repository is not the one sealed at implementation start | Point at the sealed repository, or start a new session |
 | `BASELINE_CHANGED` | The review baseline is not the sealed baseline | Run the review again with the sealed baseline |
 | `HEAD_CHANGED` | The branch moved, so the review no longer describes the code | Run a fresh review against the current head |
+| `REVIEW_EVIDENCE_UNAVAILABLE` | The file holding the difference could not be created or written | Free space on the temporary filesystem, or point `TMPDIR` somewhere writable |
+| `REVIEW_EVIDENCE_NOT_DELIVERED` | The peer was granted a different file from the one written, or that file changed while the peer had it | Make the connector grant exactly the paths it was handed, check nothing else writes there |
 | `CLEANUP_FAILURE` | Something the turn created could not be removed | Remove the reported path or process by hand and confirm nothing is left |
 | `USAGE_ERROR` | Missing, conflicting or empty arguments, including empty input | Correct the command line and the input, then run again |
 | `UNKNOWN_HARNESS` | The named harness is not one of the five | Name one of the five identifiers |
@@ -422,8 +493,9 @@ code needs it.
 | `IMPLEMENTATION_ALREADY_SEALED` | This session already sealed a repository and baseline | Continue against them, or start a new session |
 | `NO_IMPLEMENTATION_BASELINE` | Nothing has been sealed, so a review or waiver has nothing to bind to | Record `implementation-start` first |
 | `PUBLICATION_FAILURE` | The message could not be written and moved into place, so nothing was published | Check the session directory is writable, then run again |
+| `PUBLICATION_NOT_FLUSHED` | The message is written and in place, but the folder entry could not be forced to disk, so a machine failure could lose it | Confirm the reported file is there, and treat the turn as unfinished until the disk is behaving |
 | `REPOSITORY_UNREADABLE` | The project directory is not a readable Git repository | Correct `--project` |
-| `DIRTY_WORKTREE` | Uncommitted changes mean there is no exact head to review | Commit or set the changes aside, then review |
+| `DIRTY_WORKTREE` | Something no commit contains is in the worktree — an uncommitted change, an untracked file, or an ignored file — so there is no exact head to review | Commit or set the changes aside, and move the ignored files out yourself; Agent Bridge never deletes one |
 | `BASELINE_NOT_ANCESTOR` | The baseline does not come before a distinct head on the same history | Check `--review-base` and `--review-head` |
 
 Every failure leaves Git locked, publishes no false success, removes what the

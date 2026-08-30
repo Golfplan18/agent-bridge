@@ -14,6 +14,14 @@ into its canonical name. A rename within a directory is atomic, so a reader sees
 either no file or a complete one. A half-written message never appears under a
 name anything would trust.
 
+The rename is the moment of publication, and the report afterwards says which
+side of it something went wrong on. Anything before it means nothing was
+published. The one thing that can still fail after it is forcing the folder
+entry itself out to the disk, and that is a different fact: the message is
+there and complete, but a machine failure could still lose the name. It is
+reported as its own failure, naming the file, rather than as "nothing was
+published", which would be untrue.
+
 **Numbering is derived, not remembered.** The next sequence number is whatever is
 one higher than the highest number already on disk. Nothing counts on behalf of
 the directory, so nothing can disagree with it.
@@ -128,10 +136,17 @@ def _fsync_directory(directory: str) -> None:
 def publish(path: str, text: str) -> str:
     """Write one canonical file so that it is either whole or absent.
 
-    The text goes into a task-owned temporary file beside the destination,
-    is flushed and forced to disk, and only then renamed onto the canonical
-    name. Any failure removes the temporary file and reports
-    `PUBLICATION_FAILURE`, leaving the session exactly as it was.
+    The text goes into a task-owned temporary file beside the destination, is
+    flushed and forced to disk, and only then renamed onto the canonical name.
+    Any failure up to and including that rename removes the temporary file and
+    reports `PUBLICATION_FAILURE`, leaving the session exactly as it was.
+
+    The rename is the moment of publication. After it the message is in place
+    and complete, and the only thing left to do is force the folder entry
+    naming it out to the disk. If that fails, saying nothing was published
+    would be a lie, so it is reported as `PUBLICATION_NOT_FLUSHED` instead: the
+    message is there, and a machine failure could still lose it. The turn fails
+    either way.
     """
     directory = os.path.dirname(os.path.abspath(path))
     try:
@@ -144,7 +159,6 @@ def publish(path: str, text: str) -> str:
             stream.flush()
             os.fsync(stream.fileno())
         os.replace(temp_path, path)
-        _fsync_directory(directory)
     except BaseException as exc:
         try:
             if os.path.exists(temp_path):
@@ -153,6 +167,13 @@ def publish(path: str, text: str) -> str:
             pass
         raise BridgeError(
             Failure.PUBLICATION_FAILURE, detail="{0}: {1}".format(path, exc)
+        )
+    try:
+        _fsync_directory(directory)
+    except OSError as exc:
+        raise BridgeError(
+            Failure.PUBLICATION_NOT_FLUSHED,
+            detail="{0}: {1}".format(path, exc),
         )
     return path
 
@@ -194,12 +215,30 @@ def session_text(
     return "# Session\n" + _compose("", header_lines, body)
 
 
-def local_to_peer_text(sequence: int, local: str, peer: str, body: str) -> str:
-    """A request going out to the peer. It never carries a `Review-` field."""
+def local_to_peer_text(
+    sequence: int,
+    local: str,
+    peer: str,
+    body: str,
+    review_evidence: Optional[str] = None,
+) -> str:
+    """A request going out to the peer, and where its evidence was.
+
+    An ordinary request carries nothing but who it is from and who it is for.
+    A review request carries one more runner-owned line, `Review-Evidence:`,
+    naming the exact file the reviewing peer was given to read. It is written
+    here so the record says what the reviewer was pointed at, and it is a fact
+    the runner already held: the peer supplies none of it.
+
+    None of the `Review-Request`, `Review-Base` or `Review-Head` fields ever
+    appear on a request. Those bind an answer, and no answer has been given
+    yet.
+    """
+    header_lines = ["From: {0}".format(local), "To: {0}".format(peer)]
+    if review_evidence:
+        header_lines.append("Review-Evidence: {0}".format(review_evidence))
     return _compose(
-        "# Message {0}".format(format_sequence(sequence)),
-        ["From: {0}".format(local), "To: {0}".format(peer)],
-        body,
+        "# Message {0}".format(format_sequence(sequence)), header_lines, body
     )
 
 

@@ -43,6 +43,8 @@ class Failure(enum.Enum):
     REPOSITORY_CHANGED = "REPOSITORY_CHANGED"
     BASELINE_CHANGED = "BASELINE_CHANGED"
     HEAD_CHANGED = "HEAD_CHANGED"
+    REVIEW_EVIDENCE_UNAVAILABLE = "REVIEW_EVIDENCE_UNAVAILABLE"
+    REVIEW_EVIDENCE_NOT_DELIVERED = "REVIEW_EVIDENCE_NOT_DELIVERED"
     CLEANUP_FAILURE = "CLEANUP_FAILURE"
 
     # Calling the commands correctly.
@@ -59,6 +61,7 @@ class Failure(enum.Enum):
     IMPLEMENTATION_ALREADY_SEALED = "IMPLEMENTATION_ALREADY_SEALED"
     NO_IMPLEMENTATION_BASELINE = "NO_IMPLEMENTATION_BASELINE"
     PUBLICATION_FAILURE = "PUBLICATION_FAILURE"
+    PUBLICATION_NOT_FLUSHED = "PUBLICATION_NOT_FLUSHED"
 
     # Reading the project repository.
     REPOSITORY_UNREADABLE = "REPOSITORY_UNREADABLE"
@@ -101,7 +104,8 @@ _GUIDANCE: Dict[Failure, Tuple[str, str]] = {
     ),
     Failure.RESTRICTIONS_UNAVAILABLE: (
         "The peer harness does not offer the exact switches Agent Bridge needs "
-        "to deny project writes and outside reads.",
+        "to deny project writes and to take away its shell, Git and network "
+        "access.",
         "Do not give this harness real project access; report the missing "
         "restriction so the connector's declaration can be corrected.",
     ),
@@ -156,6 +160,20 @@ _GUIDANCE: Dict[Failure, Tuple[str, str]] = {
         "is actually there.",
         "Run a fresh review against the current head; the earlier verdict no "
         "longer applies to it.",
+    ),
+    Failure.REVIEW_EVIDENCE_UNAVAILABLE: (
+        "The file holding the difference a reviewer has to read could not be "
+        "created or written, so there is nothing to give the reviewer.",
+        "Free space on the temporary filesystem, or point TMPDIR at a "
+        "directory this account can write to, then run the review again.",
+    ),
+    Failure.REVIEW_EVIDENCE_NOT_DELIVERED: (
+        "The review evidence did not reach the peer intact: either the "
+        "connector granted it something other than the exact file this turn "
+        "wrote, or that file was changed while the peer had it.",
+        "Make the connector grant the peer exactly the project root and the "
+        "evidence path it was handed, make sure nothing else writes to that "
+        "file, then run the review again.",
     ),
     Failure.CLEANUP_FAILURE: (
         "A file or process this turn created could not be removed, so the turn "
@@ -223,16 +241,26 @@ _GUIDANCE: Dict[Failure, Tuple[str, str]] = {
         "Check that the session directory is writable and has free space, then "
         "run the command again.",
     ),
+    Failure.PUBLICATION_NOT_FLUSHED: (
+        "The message was written and moved into place, so it is published, but "
+        "the folder entry naming it could not be forced onto the disk, so a "
+        "machine failure could still lose it.",
+        "Confirm the reported file is there and readable, and treat this turn "
+        "as unfinished until the session directory's disk is behaving.",
+    ),
     Failure.REPOSITORY_UNREADABLE: (
         "The given project directory could not be read as a Git repository.",
         "Correct the --project path so it points at a Git repository you can "
         "read.",
     ),
     Failure.DIRTY_WORKTREE: (
-        "The task worktree has uncommitted changes, so there is no exact "
-        "committed head for a reviewer to judge.",
-        "Commit or set aside the outstanding changes, then run the review "
-        "again.",
+        "The task worktree holds something no commit contains - an "
+        "uncommitted change, an untracked file, or a file Git has been told "
+        "to ignore - so there is no exact committed head for a reviewer to "
+        "judge.",
+        "Commit or set aside the outstanding changes, and move the ignored "
+        "files out of the worktree yourself - Agent Bridge never deletes one - "
+        "then run the review again.",
     ),
     Failure.BASELINE_NOT_ANCESTOR: (
         "The baseline commit does not come before a different task head on the "
