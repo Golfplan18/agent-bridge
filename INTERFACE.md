@@ -348,14 +348,27 @@ A new commit invalidates the verdict.
 
 **What gets written down when the answer is not an acceptance** matters as much
 as when it is. `REJECT` and `ASK_USER` are published exactly like any other
-answer — they are decisions a reviewer really made — and they unlock nothing. A
-technical failure publishes no response message at all: an invalid verdict, an
+answer — they are decisions a reviewer really made — and they unlock nothing.
+
+The rule for failures is that **no failed call ever publishes an authoritative
+verdict.** Where the call did not finish cleanly, nothing is published at all: an
 empty response, a peer that failed or ran out of time, a changed repository,
-baseline or head, a dirty worktree, or a failure to clean up. Nothing reading the
-session afterwards can mistake a failure for a reply. The request message that
-was already published stays where it is, because it truthfully records what was
-sent, and the workflow writes the failure down itself with
-`record --kind technical-error`.
+baseline or head, a dirty worktree, or a failure to clean up. Captured text in
+those cases may be a fragment of an answer the peer never finished, and a
+fragment must not stand in for a reply.
+
+`INVALID_VERDICT` is the one failure that keeps the text. A peer that exited
+cleanly with real output, and got only its final line wrong, has that output
+published as an **ordinary message** — the same shape any non-review answer
+takes, carrying none of the `Review-*` fields that bind an answer to a request
+and to two commits. It therefore holds no external-review authority and unlocks
+nothing. The call still fails, Git stays locked, and the text is never rewritten,
+read for an intention, or retried; acceptance requires a fresh review call. A
+reviewer that did good work and fumbled one line should not lose the work.
+
+In every failing case the request message that was already published stays where
+it is, because it truthfully records what was sent, and the workflow writes the
+failure down itself with `record --kind technical-error`.
 
 The one alternative path is a user waiver: after a `REJECT` or a technical error,
 a later direct message from the user may waive external review for that exact
@@ -393,7 +406,7 @@ code needs it.
 | `TIMEOUT` | The deadline passed before an answer arrived | Run again with a longer `--timeout`, or check the peer by hand |
 | `PEER_FAILURE` | The peer's program exited with a failure | Read its own error output and fix it inside that harness |
 | `EMPTY_RESPONSE` | The peer produced no text at all | Check the peer by hand and run again; Git stays locked |
-| `INVALID_VERDICT` | A review response did not end with one of the three exact lines | Run the review again; this is never an acceptance |
+| `INVALID_VERDICT` | A review response did not end with one of the three exact lines; the text was kept as an ordinary message with no review authority | Read the kept message if useful, then run the review again; this is never an acceptance |
 | `REPOSITORY_CHANGED` | The repository is not the one sealed at implementation start | Point at the sealed repository, or start a new session |
 | `BASELINE_CHANGED` | The review baseline is not the sealed baseline | Run the review again with the sealed baseline |
 | `HEAD_CHANGED` | The branch moved, so the review no longer describes the code | Run a fresh review against the current head |
@@ -414,7 +427,8 @@ code needs it.
 | `BASELINE_NOT_ANCESTOR` | The baseline does not come before a distinct head on the same history | Check `--review-base` and `--review-head` |
 
 Every failure leaves Git locked, publishes no false success, removes what the
-turn started, and gives one next action.
+turn started, and gives one next action. `INVALID_VERDICT` alone keeps the
+peer's text, as an ordinary message that carries no review authority.
 
 ---
 

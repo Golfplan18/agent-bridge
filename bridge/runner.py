@@ -8,14 +8,29 @@ and nothing that carries on after the function returns.
 
 The rule that matters most is what gets written down when something goes wrong.
 
-A **failed or ambiguous call publishes no response at all.** A peer that exited
-badly, said nothing, ran past the deadline, ended its review with something that
-is not one of the three exact verdict lines, or reviewed a repository that
-changed underneath it, leaves no answer in the record. Nothing that later reads
-the session can mistake a failure for a reply. The request message that was
-already published stays, because it truthfully records what was sent; the
-failure itself is written down by the workflow with
-`record --kind technical-error`.
+**No failed call ever publishes an authoritative verdict.** That is the rule,
+and everything below is what it means in the two situations it covers.
+
+Where the call itself did not finish cleanly - the peer exited badly, said
+nothing, or ran past the deadline - nothing at all is published. Whatever text
+was captured may be a fragment of an answer the peer never finished writing, and
+a fragment must not be mistaken for the peer's reply. The same holds when the
+repository changed underneath a review: the answer describes a state that no
+longer exists.
+
+Where the peer finished cleanly, exit zero with real output, and only its final
+line is wrong, the prose is kept. It is published as an **ordinary message**,
+the same shape any non-review answer takes, and it carries none of the
+`Review-*` fields that bind an answer to a request and to two commits. So it
+holds no external-review authority, unlocks nothing, and cannot be mistaken for
+a decision. The call still fails with `INVALID_VERDICT`, Git stays locked, and
+nothing is rewritten, re-read for an intention, or retried. Acceptance requires
+a fresh review call. The point is narrow: a reviewer that did good work and
+fumbled one line should not have that work thrown away.
+
+In every failing case the request message that was already published stays,
+because it truthfully records what was sent; the failure itself is written down
+by the workflow with `record --kind technical-error`.
 
 `REJECT` and `ASK_USER` are not failures. They are real decisions, made by a
 reviewer that did its job, and they are published like any other answer - they
@@ -87,9 +102,13 @@ def run_turn(
     worktree are all checked before the peer is asked anything, and the
     repository, cleanliness and head are checked again after it has answered.
 
-    Every failure raises, leaving the Git finish line locked and no response
-    message behind. That includes a failure to build the command: the evidence
-    is deleted just the same, and nothing is published.
+    Every failure raises and leaves the Git finish line locked. Almost every
+    failure also leaves no response message behind - including a failure to
+    build the command, where the evidence is deleted just the same and nothing
+    is published. The single exception is `INVALID_VERDICT`: a peer that exited
+    cleanly with real output whose final line is not a verdict has its text kept
+    as an ordinary message, published with no `Review-*` fields, which is why it
+    can hold no authority. The call fails all the same.
     """
     deadline = Deadline(timeout_seconds)
     review = review_base is not None and review_head is not None
@@ -164,15 +183,27 @@ def run_turn(
                     Failure.EMPTY_RESPONSE, detail=command.argv[0]
                 )
             verdict = None
+            unusable_from = None
             if review:
                 result = read_verdict(response)
-                if not result.ok:
+                if result.failure is Failure.INVALID_VERDICT:
+                    # The peer finished cleanly and wrote real prose; only its
+                    # last line is wrong. Keep the prose - published below with
+                    # every binding field withheld - and still fail.
+                    unusable_from = command.argv[0]
+                elif not result.ok:
                     raise BridgeError(result.failure, detail=command.argv[0])
-                verdict = result.verdict
+                else:
+                    verdict = result.verdict
         finally:
             gitgate.delete_review_evidence(evidence_path)
 
-        if review:
+        # An answer that carries no verdict is bound to nothing, so the second
+        # round of repository checks has nothing left to protect. Running them
+        # anyway could only replace INVALID_VERDICT with a different and less
+        # accurate failure.
+        bound = review and unusable_from is None
+        if bound:
             gitgate.after_review_checks(project, sealed, head, deadline)
 
         response_sequence = session_module.next_sequence(session_dir)
@@ -187,11 +218,21 @@ def run_turn(
                 record.peer,
                 record.local,
                 response,
-                review_request=request_sequence if review else None,
-                review_base=base,
-                review_head=head,
+                review_request=request_sequence if bound else None,
+                review_base=base if bound else None,
+                review_head=head if bound else None,
             ),
         )
+
+        if unusable_from is not None:
+            # Published, but as an ordinary message with no Review-* fields: it
+            # holds no authority, unlocks nothing, and the call still fails.
+            raise BridgeError(
+                Failure.INVALID_VERDICT,
+                detail="{0}; the response was kept as {1}".format(
+                    unusable_from, response_path
+                ),
+            )
 
     return TurnResult(
         request_sequence=request_sequence,

@@ -134,9 +134,11 @@ _GUIDANCE: Dict[Failure, Tuple[str, str]] = {
     ),
     Failure.INVALID_VERDICT: (
         "The review response did not end with one of the three exact verdict "
-        "lines, so it is not a decision Agent Bridge can act on.",
-        "Run the review again; this is a technical error, never an acceptance, "
-        "and Git stays locked.",
+        "lines, so it is not a decision Agent Bridge can act on. The peer's "
+        "text was kept as an ordinary message carrying no review authority.",
+        "Read the kept message if it is useful, then run the review again; "
+        "this is a technical error, never an acceptance, and Git stays locked "
+        "until a fresh review returns an exact ACCEPT.",
     ),
     Failure.REPOSITORY_CHANGED: (
         "The repository in play is not the one sealed when implementation "
