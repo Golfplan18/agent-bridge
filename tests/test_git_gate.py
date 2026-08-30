@@ -42,7 +42,7 @@ if REPO_ROOT not in sys.path:
 from bridge import gitgate, record, runner, session  # noqa: E402
 from bridge.connectors import PeerCommand  # noqa: E402
 from bridge.errors import BridgeError, Failure  # noqa: E402
-from bridge.verdict import ACCEPT, ASK_USER, REJECT  # noqa: E402
+from bridge.verdict import ACCEPT, ASK_USER, REJECT, read_verdict  # noqa: E402
 from tests import synthetic_repo  # noqa: E402
 
 FAKE_PEER = os.path.join(REPO_ROOT, "tests", "fake_peer.py")
@@ -242,6 +242,31 @@ class GitFinishLine(unittest.TestCase):
         with open(path, encoding="utf-8") as stream:
             return stream.read()
 
+    def refuse_but_keep(self, mode, base, head, *extra, **kwargs):
+        """An invalid verdict fails, and the peer's prose survives anyway.
+
+        The opposite expectation to `refuse`: this peer exited cleanly and wrote
+        real text, so one more response message exists afterwards. What it must
+        not have is any binding - which the checks below prove separately.
+        """
+        before = len(self.responses())
+        with self.assertRaises(BridgeError) as caught:
+            self.review(mode, base, head, *extra, **kwargs)
+        self.assertEqual(caught.exception.failure, Failure.INVALID_VERDICT)
+        self.assertEqual(
+            len(self.responses()),
+            before + 1,
+            "the peer's text was thrown away instead of kept",
+        )
+        return caught.exception
+
+    def latest_response_text(self):
+        return self.read(
+            os.path.join(
+                session.messages_dir(self.session_dir), self.responses()[-1]
+            )
+        )
+
     # -- controls ----------------------------------------------------------
 
     def test_a_bound_accept_opens_the_finish_line(self):
@@ -293,24 +318,65 @@ class GitFinishLine(unittest.TestCase):
     # -- an answer that is not a verdict -----------------------------------
 
     def test_an_answer_that_is_not_a_verdict_opens_nothing(self):
+        modes = (
+            "unknown-verdict",
+            "trailing-space",
+            "lowercase",
+            "fenced",
+            "marker-early",
+            "plain",
+        )
         head = self.ready()
-        cases = (
-            ("unknown-verdict", Failure.INVALID_VERDICT),
-            ("trailing-space", Failure.INVALID_VERDICT),
-            ("lowercase", Failure.INVALID_VERDICT),
-            ("fenced", Failure.INVALID_VERDICT),
-            ("marker-early", Failure.INVALID_VERDICT),
-            ("plain", Failure.INVALID_VERDICT),
-            ("empty", Failure.EMPTY_RESPONSE),
-        )
-        for mode, failure in cases:
+        for mode in modes:
             with self.subTest(mode=mode):
-                self.refuse(failure, mode, self.repo.initial_commit, head)
-        self.assertEqual(len(self.requests()), len(cases))
-        self.assertEqual(self.responses(), [])
+                self.refuse_but_keep(mode, self.repo.initial_commit, head)
+        self.assertEqual(len(self.requests()), len(modes))
+        self.assertEqual(len(self.responses()), len(modes))
         self.assert_evidence_reached_the_builder(
-            self.repo.initial_commit, head, calls=len(cases)
+            self.repo.initial_commit, head, calls=len(modes)
         )
+
+    def test_an_unfinished_call_keeps_nothing(self):
+        """Text from a call that did not finish cleanly may be a fragment."""
+        head = self.ready()
+        self.refuse(
+            Failure.EMPTY_RESPONSE, "empty", self.repo.initial_commit, head
+        )
+        self.refuse(
+            Failure.PEER_FAILURE, "fail", self.repo.initial_commit, head
+        )
+        self.assertEqual(len(self.requests()), 2)
+        self.assertEqual(self.responses(), [])
+
+    def test_a_kept_invalid_verdict_carries_no_review_authority(self):
+        """The prose survives; every field that could bind it does not."""
+        head = self.ready()
+        error = self.refuse_but_keep(
+            "unknown-verdict", self.repo.initial_commit, head
+        )
+
+        kept = self.latest_response_text()
+        header = kept.split("\n\n", 1)[0]
+        for field in ("Review-Request:", "Review-Base:", "Review-Head:"):
+            self.assertNotIn(
+                field,
+                header,
+                "a kept invalid verdict must bind to nothing",
+            )
+        for commit in (self.repo.initial_commit, head):
+            self.assertNotIn(
+                commit, header, "a kept invalid verdict named a commit"
+            )
+
+        # The peer's own words survived, including the line it got wrong.
+        self.assertIn(REVIEW_BODY.strip(), kept)
+        self.assertIn("Agent-Bridge-Verdict: MAYBE", kept)
+
+        # And the failure says where the text went.
+        self.assertIn(self.responses()[-1], error.detail or "")
+
+        # A kept response is not a decision, so nothing may read one out of it.
+        self.assertEqual(read_verdict(kept).failure, Failure.INVALID_VERDICT)
 
     # -- the wrong commits --------------------------------------------------
 
