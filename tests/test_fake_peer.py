@@ -7,13 +7,15 @@ lock left behind by a process that was killed outright blocks nobody, that being
 told to stop cleans up what a turn started, and that nothing this turn started
 is still running when it returns.
 
-Three of the checks are about exactly *when* a stop arrives, because the awkward
+Four of the checks are about exactly *when* a stop arrives, because the awkward
 moments are short ones. A stop while the child is being created, before anything
 knows which process group to end. A second stop while that group is being
-emptied. And a stop in the instant after a message has been renamed into place,
-which must never be reported as though nothing had been published. Each is made
-to happen at the exact moment rather than waited for, by standing in front of
-the one step it has to land on.
+emptied. A stop in the instant after a message has been renamed into place,
+which must never be reported as though nothing had been published. And a stop
+inside the removal of the temporary file a failed publication leaves behind,
+which must not become a way of leaving that file on the disk. Each is made to
+happen at the exact moment rather than waited for, by standing in front of the
+one step it has to land on.
 
 Two more are about publication going wrong in ways that are easy to report
 untruthfully. A temporary file that will not be removed has to be named, because
@@ -688,6 +690,57 @@ class TurnBehavior(unittest.TestCase):
                 session.publish(target, "# Message 0001\nnever arrives\n")
 
         self.assertFalse(os.path.exists(target))
+        self.assertEqual(self._messages(), [])
+        self.assertEqual(self._leftover_temporaries(), [])
+
+    def test_a_stop_while_the_temporary_file_goes_still_removes_it(self):
+        """Being stopped must not be a way to leave a temporary file behind.
+
+        Publication fails before the rename, so the temporary file has to go,
+        and the awkward moment is the removal itself. A stop raised where it
+        landed would abandon `os.unlink` half done and leave a
+        `.agent-bridge-publish-` file in the session folder with nothing saying
+        it is there - which is the exact thing the report above it exists to
+        prevent.
+
+        The stop is delivered from inside the removal rather than aimed at it
+        from outside, which is the only way to be sure it lands there, and it is
+        an interrupt because that is how a person ordinarily stops a program.
+        Stops are now written down for the length of the removal and raised once
+        it is done, so the call still ends as the interrupt it was - and the
+        file is gone. Before that change this same check leaves the file behind,
+        which is what makes it discriminate rather than merely pass.
+        """
+        target = session.message_path(
+            self.session_dir, 1, session.LOCAL_RECORD_SUFFIX
+        )
+        real_unlink = os.unlink
+        removed = []
+
+        def unlink_after_a_stop(path, *args, **kwargs):
+            name = os.path.basename(str(path))
+            if name.startswith(session.TEMP_PREFIX) and not removed:
+                removed.append(path)
+                os.kill(os.getpid(), signal.SIGINT)
+            return real_unlink(path, *args, **kwargs)
+
+        with mock.patch(
+            "os.replace", side_effect=OSError("forced rename failure")
+        ):
+            with mock.patch("os.unlink", unlink_after_a_stop):
+                with self.assertRaises(KeyboardInterrupt):
+                    session.publish(target, "# Message 0001\nnever arrives\n")
+
+        self.assertEqual(
+            len(removed), 1, "the temporary file was never put up for removal"
+        )
+        self.assertFalse(
+            os.path.exists(removed[0]),
+            "a stop during the removal left the temporary file on the disk",
+        )
+        self.assertFalse(
+            os.path.exists(target), "nothing should have been published"
+        )
         self.assertEqual(self._messages(), [])
         self.assertEqual(self._leftover_temporaries(), [])
 

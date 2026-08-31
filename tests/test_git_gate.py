@@ -1007,6 +1007,55 @@ class GitFinishLine(unittest.TestCase):
         self.assertEqual(self.requests(), [])
         self.assertEqual(self.responses(), [])
 
+    def test_a_stop_before_the_evidence_is_owned_still_deletes_it(self):
+        """The other narrow window: the file exists, nothing yet owns it.
+
+        Writing the evidence and taking responsibility for it are two different
+        moments, and there is a short stretch between them - the last
+        instructions of the generator, the return, and the assignment that
+        receives it - in which the file is on the disk and nothing knows what it
+        is called. A stop raised in there used to leave it behind: the cleanup
+        that deletes the evidence would be handed nothing, look for nothing and
+        delete nothing, while the turn reported only that it had been stopped.
+
+        The signal is delivered from inside that stretch rather than aimed at it
+        from outside, which is the only way to be sure it lands there. The real
+        generator runs, its path is noted here, and the stop is sent before the
+        runner is allowed to receive what it produced. Stops are now written
+        down across the whole of that stretch and raised the instant the runner
+        holds the path, so the turn still ends as a stop - and the file is gone.
+        Before that change this same check leaves the evidence on the disk and
+        the teardown assertion catches it too, which is what makes it
+        discriminate rather than merely pass.
+        """
+        head = self.ready()
+        real_generate = gitgate.generate_review_evidence
+        made = []
+
+        def generate_then_stop(*args, **kwargs):
+            evidence = real_generate(*args, **kwargs)
+            made.append(evidence.path)
+            os.kill(os.getpid(), signal.SIGTERM)
+            return evidence
+
+        with mock.patch.object(
+            gitgate, "generate_review_evidence", generate_then_stop
+        ):
+            with self.assertRaises(peer.SignalStop):
+                self.review("accept", self.repo.initial_commit, head)
+
+        self.assertEqual(len(made), 1, "no evidence file was ever made")
+        self.assertFalse(
+            os.path.exists(made[0]),
+            "a stop before the runner held the path left the evidence behind",
+        )
+        self.assertEqual(
+            self.requests(),
+            [],
+            "a turn that was stopped published a request anyway",
+        )
+        self.assertEqual(self.responses(), [])
+
     def test_a_connector_precheck_runs_inside_the_turn_deadline(self):
         """A connector's own programs are bounded by the turn, not extra to it.
 

@@ -566,6 +566,19 @@ def generate_review_evidence(
     handed to an encoder twice: the digest has to describe the file on disk
     exactly, or checking it afterwards would prove nothing.
 
+    **The caller has a part in this, and it is not optional.** The file exists
+    from the moment its name is made, and from then until the caller holds that
+    name there is a short stretch - the last few instructions here, the return,
+    and the caller's own assignment - in which the file is on the disk and
+    nothing is yet able to delete it, because nothing else knows what it is
+    called. A stop raised in the middle of that stretch leaves the file behind
+    with nobody able to name it. No arrangement inside this function can close
+    that, because the moment responsibility passes is the caller's assignment
+    and that instruction is not in here. So a caller must defer stops across the
+    whole call and raise any that arrived once it holds the path, inside
+    whatever region already deletes the file. `run_turn` does exactly that, and
+    it is the only caller.
+
     A temporary area that is full, unwritable or missing is an ordinary thing to
     run into, so it is reported as `REVIEW_EVIDENCE_UNAVAILABLE` with something
     to do about it. A write that fails part way through takes its half-written

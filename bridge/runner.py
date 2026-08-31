@@ -273,19 +273,33 @@ def run_turn(
         # in one of those has to raise rather than end the process where it
         # stands, or the `finally` below never gets to delete the file.
         #
-        # The deletion itself is the exception, and it is arranged the way
-        # `run_bounded` already arranges its own cleanup: a stop arriving while
-        # the file is being removed is written down instead of raised, so it
-        # cannot abandon the removal and leave the evidence on the disk with
-        # nothing reporting it. `raise_if_stopped` then comes after the whole
-        # try/finally, so a genuine failure already on its way out wins, and a
-        # stop that arrived only during cleanup is raised once the file is gone.
+        # Two stretches are the exception, and both are arranged the way
+        # `run_bounded` already arranges its own cleanup: a stop arriving in one
+        # of them is written down instead of raised, and raised once there is
+        # nothing left to abandon. The first is taking ownership of the
+        # evidence, immediately below. The second is the deletion, where a stop
+        # that raised where it landed could abandon the removal and leave the
+        # evidence on the disk with nothing reporting it. Its `raise_if_stopped`
+        # comes after the whole try/finally, so a genuine failure already on its
+        # way out wins, and a stop that arrived only during cleanup is raised
+        # once the file is gone.
         with stopped_by_signal() as watch:
             try:
                 if review:
-                    evidence = gitgate.generate_review_evidence(
-                        project, base, head, deadline
-                    )
+                    # The file exists from the moment its name is made, but
+                    # until `evidence` holds that name nothing here can delete
+                    # it: the `finally` below would be handed nothing and would
+                    # tidy nothing away. So stops are written down across
+                    # exactly that stretch. The deferral opens before the call
+                    # and closes only once the assignment has finished - the
+                    # instant ownership passes - and anything written down is
+                    # raised on the very next line, inside the block whose
+                    # `finally` deletes the file.
+                    with watch.deferring():
+                        evidence = gitgate.generate_review_evidence(
+                            project, base, head, deadline
+                        )
+                    watch.raise_if_stopped()
                 # The connector composes the argument vector now, knowing where
                 # the evidence is, so it can name that exact file among the
                 # paths the peer is allowed to read. Its own prechecks happen in

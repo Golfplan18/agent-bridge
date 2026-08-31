@@ -45,13 +45,16 @@ the file and asks the person to look.
 Being stopped is not a publication failure and is never dressed up as one. An
 interrupt or a termination signal is passed straight on, after the temporary
 file has been cleared away if there is one, so that what the person reads is
-that they stopped it. Two things outrank saying so, in that order. A temporary
-file that could not be removed is reported as `CLEANUP_FAILURE` even when what
-went wrong was the person pressing a key, because the leftover file is the
-thing they actually have to go and deal with and nothing else would tell them
-it is there. And not knowing whether the rename happened is reported as
-`PUBLICATION_UNCERTAIN`, because "you stopped it" would be read as "so nothing
-happened", which is exactly the untruth that failure exists to avoid.
+that they stopped it. A stop that arrives while that file is being cleared away
+is written down rather than raised where it lands, and raised once the file is
+gone: being stopped must not become a way to leave a file behind. Two things
+outrank saying so, in that order. A temporary file that could not be removed is
+reported as `CLEANUP_FAILURE` even when what went wrong was the person pressing
+a key, because the leftover file is the thing they actually have to go and deal
+with and nothing else would tell them it is there. And not knowing whether the
+rename happened is reported as `PUBLICATION_UNCERTAIN`, because "you stopped
+it" would be read as "so nothing happened", which is exactly the untruth that
+failure exists to avoid.
 
 **Numbering is derived, not remembered.** The next sequence number is whatever is
 one higher than the highest number already on disk. Nothing counts on behalf of
@@ -80,7 +83,7 @@ from typing import Dict, List, NamedTuple, Optional, Sequence, Tuple
 
 from . import BRIDGE_FORMAT
 from .errors import BridgeError, Failure
-from .peer import SignalStop
+from .peer import SignalStop, stopped_by_signal
 
 SESSION_FILENAME = "SESSION.md"
 MESSAGES_DIRNAME = "messages"
@@ -246,6 +249,12 @@ def publish(path: str, text: str) -> str:
     stop - because a leftover file is the thing a person actually has to go and
     deal with, and nothing else would tell them it is there.
 
+    The removal itself runs with stops written down instead of raised, so a
+    termination or an interrupt landing in the middle of it cannot abandon it
+    and leave the file behind. Such a stop is raised further down, in the same
+    place as one that interrupted the writing, so being stopped never becomes a
+    way to leave a file nobody was told about.
+
     Then, if the canonical name could not be examined, the report is
     `PUBLICATION_UNCERTAIN`: there is no telling whether the message arrived, so
     the person is asked to look. This one outranks re-raising a stop too, and
@@ -253,10 +262,11 @@ def publish(path: str, text: str) -> str:
     happened", and not knowing whether anything happened is precisely what is
     being reported.
 
-    Only then is an interrupt or a stop signal raised on unchanged, so that
-    nothing calls a person's own decision to stop a fault of this function; and
-    only then, in the ordinary case, is `PUBLICATION_FAILURE` raised, which
-    truthfully says nothing was published.
+    Only then is an interrupt or a stop signal raised on unchanged - whether it
+    interrupted the writing or arrived while the temporary file was being
+    removed - so that nothing calls a person's own decision to stop a fault of
+    this function; and only then, in the ordinary case, is
+    `PUBLICATION_FAILURE` raised, which truthfully says nothing was published.
     """
     directory = os.path.dirname(os.path.abspath(path))
     try:
@@ -286,11 +296,24 @@ def publish(path: str, text: str) -> str:
         # Not published, or not knowably published. Either way the temporary
         # file must not be left behind, and a removal that fails is the loudest
         # thing here: nothing else would tell anybody the file exists.
-        try:
-            os.unlink(temp_path)
-        except FileNotFoundError:
-            pass
-        except OSError as removal:
+        #
+        # Stops are written down rather than raised for the length of the
+        # removal, exactly as the review evidence is removed in `gitgate`, so a
+        # termination or an interrupt landing inside `os.unlink` cannot abandon
+        # it half done and leave the file on the disk with nothing saying so.
+        # Anything written down is raised further below, once there is nothing
+        # left to abandon and the two reports that outrank it have had their
+        # turn.
+        removal = None  # type: Optional[OSError]
+        with stopped_by_signal() as watch:
+            with watch.deferring():
+                try:
+                    os.unlink(temp_path)
+                except FileNotFoundError:
+                    pass
+                except OSError as failed:
+                    removal = failed
+        if removal is not None:
             raise BridgeError(
                 Failure.CLEANUP_FAILURE,
                 detail=(
@@ -307,6 +330,12 @@ def publish(path: str, text: str) -> str:
                 Failure.PUBLICATION_UNCERTAIN,
                 detail="{0}: {1}".format(path, exc),
             )
+        # A stop that arrived while the temporary file was being removed is
+        # raised here, in the same place and at the same rank as one that
+        # interrupted the writing: after the two reports a person has to act on,
+        # and before anything that would call their own decision to stop a fault
+        # of this function.
+        watch.raise_if_stopped()
         if isinstance(exc, (SignalStop, KeyboardInterrupt)):
             raise
         raise BridgeError(
