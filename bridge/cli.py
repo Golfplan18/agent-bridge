@@ -4,14 +4,20 @@
 bounded turn against one. `record` writes one local message into the session
 without calling anybody.
 
-Two things about this file are worth knowing before reading it.
+Three things about this file are worth knowing before reading it.
 
-**Both `check` and `run` go through the same five-way switch**, and in this build
-every one of the five branches reports that no connector ships yet. That is the
-honest state of the work: the runner, the record and the safeguards are here, and
-the five connectors are not. Nothing pretends otherwise, and there is no
-fallback, no stub that answers as though a harness had, and no undocumented way
-to reach a program anyway.
+**Both `check` and `run` go through the same five-way switch.** Two of the five
+branches lead to a real connector, Codex and Claude Code; the other three
+truthfully report that no connector for them ships. There is no fallback, no
+stub that answers as though a harness had, and no undocumented way to reach a
+program anyway.
+
+**The working directory is decided here, and nowhere else.** A peer runs in the
+directory `--project` names, or, when there is none, in a neutral empty
+directory made for the command and taken away again on every way out - including
+a failure and being stopped. That is the only source of the fact. Nothing under
+a message's `## Body` heading is read anywhere in Agent Bridge, so no text a peer
+or a plan wrote can put a directory in front of a harness.
 
 **Every failure looks the same.** One plain sentence saying what happened, then
 one thing to do next, on the error stream, with a nonzero exit. That includes the
@@ -29,14 +35,22 @@ SPDX-License-Identifier: Unlicense
 from __future__ import annotations
 
 import argparse
+import contextlib
+import os
+import shutil
 import sys
-from typing import Optional, Sequence
+import tempfile
+from typing import Iterator, Optional, Sequence
 
-from . import connectors, record as record_module
+from . import connectors, record as record_module, runner
 from .errors import BridgeError, Failure
-from .peer import DEFAULT_TIMEOUT_SECONDS, SignalStop
+from .peer import DEFAULT_TIMEOUT_SECONDS, Deadline, SignalStop
 
 PROGRAM = "agent-bridge"
+
+#: How a neutral working directory is named, so that one left behind by a
+#: machine failure is recognisable for what it was.
+NEUTRAL_PREFIX = "agent-bridge-neutral-"
 
 
 class _Parser(argparse.ArgumentParser):
@@ -89,13 +103,82 @@ def _read_body() -> str:
     return sys.stdin.read()
 
 
+def _remove_neutral(path: str, during: Optional[BaseException]) -> None:
+    """Take the neutral working directory away, and be loud if it will not go.
+
+    A directory left behind is the thing a person actually has to deal with, and
+    nothing else would tell them it is there, so a removal that fails outranks
+    whatever else went wrong and names both.
+    """
+    try:
+        shutil.rmtree(path)
+    except OSError as failed:
+        if during is not None:
+            raise BridgeError(
+                Failure.CLEANUP_FAILURE,
+                detail=(
+                    "the neutral working directory {0} could not be removed "
+                    "after the command failed ({1}): {2}".format(
+                        path, during, failed
+                    )
+                ),
+            )
+        raise BridgeError(
+            Failure.CLEANUP_FAILURE,
+            detail="the neutral working directory {0} could not be removed: "
+            "{1}".format(path, failed),
+        )
+
+
+@contextlib.contextmanager
+def _peer_directory(project: Optional[str]) -> Iterator[str]:
+    """The directory a peer runs in, and the exact point a made-up one goes.
+
+    `--project` names the one real directory a peer may read, and it becomes the
+    directory the peer's program is started in. Without it the peer gets a
+    neutral empty directory, made for this command and removed when it ends - on
+    every way out, including a failure and being stopped - so a turn with no
+    project has nothing to read and leaves nothing behind.
+
+    A directory that was named but is not there is a mistake on the command
+    line, and is reported as one before anything is started.
+    """
+    if project is not None:
+        directory = os.path.abspath(project)
+        if not os.path.isdir(directory):
+            raise BridgeError(
+                Failure.USAGE_ERROR,
+                detail="--project is not a directory: {0}".format(directory),
+            )
+        yield directory
+        return
+    try:
+        neutral = tempfile.mkdtemp(prefix=NEUTRAL_PREFIX)
+    except OSError as exc:
+        raise BridgeError(
+            Failure.USAGE_ERROR,
+            detail="no neutral working directory could be made ({0}); name a "
+            "readable one with --project instead".format(exc),
+        )
+    try:
+        yield neutral
+    except BaseException as exc:
+        _remove_neutral(neutral, exc)
+        raise
+    _remove_neutral(neutral, None)
+
+
 def _check(args: argparse.Namespace) -> str:
-    # Resolving the identifier is the whole of `check` in this build: the switch
-    # knows all five names and ships no connector for any of them. The raise
-    # afterwards is not decoration - it guarantees this command can never report
-    # readiness for a harness nothing here is able to call.
-    connectors.resolve(args.peer)
-    raise BridgeError(Failure.CONNECTOR_UNAVAILABLE, detail=args.peer)
+    # Readiness is the connector's own answer, and it costs nothing: finding the
+    # program, its version, this computer, the harness's own sign-in question,
+    # and its own listing of the switches this connector passes. No model turn,
+    # and no real project - the questions are asked in a neutral directory made
+    # for this command and taken away again afterwards. The whole deadline is
+    # available to them, which is a ceiling rather than a wait: four short
+    # programs do not use it, and one that hangs is a broken machine.
+    connector = connectors.resolve(args.peer)
+    with _peer_directory(None) as cwd:
+        return connector.check(Deadline(DEFAULT_TIMEOUT_SECONDS), cwd)
 
 
 def _run(args: argparse.Namespace) -> str:
@@ -104,14 +187,31 @@ def _run(args: argparse.Namespace) -> str:
             Failure.USAGE_ERROR,
             detail="--review-base and --review-head are required together",
         )
-    # The connector resolved here is what the runner is given as its command
-    # builder: the runner calls it with the turn's deadline, so it can run any
-    # precheck of its own inside that deadline and compose the fixed argument
-    # vector, and the runner then runs that vector. This build ships no
-    # connector, so the turn stops here - there is nothing to hand over -
-    # rather than inventing a peer.
-    connectors.resolve(args.peer)
-    raise BridgeError(Failure.CONNECTOR_UNAVAILABLE, detail=args.peer)
+    connector = connectors.resolve(args.peer)
+    body = _read_body()
+    if not body.strip():
+        raise BridgeError(
+            Failure.USAGE_ERROR,
+            detail="there was no message to send on standard input",
+        )
+    with _peer_directory(args.project) as cwd:
+        # The connector is what the runner is given as its command builder. The
+        # runner calls it with the turn's deadline, so the connector's own
+        # prechecks run inside that deadline, and takes back the fixed argument
+        # vector to run. The working directory is bound here, where it was
+        # decided, and the runner never sees a connector at all.
+        def build(deadline: Deadline) -> connectors.PeerCommand:
+            return connector.build_command(deadline, cwd)
+
+        return runner.run_turn(
+            session_dir=args.session,
+            peer_id=args.peer,
+            body=body,
+            build_command=build,
+            timeout_seconds=args.timeout,
+            review_base=args.review_base,
+            review_head=args.review_head,
+        ).response_path
 
 
 def _record(args: argparse.Namespace) -> str:

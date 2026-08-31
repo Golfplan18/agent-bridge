@@ -33,6 +33,12 @@ the harness its version, whether it is signed in, whether the restriction
 switches are there - is bounded by the turn's own deadline, and a builder that
 outruns that deadline never gets a peer started and never publishes a request.
 
+The last group is about the other way something gets into a session: `record`,
+which writes one local message without calling anybody. There are five kinds it
+may write, each with its own envelope, and the list is closed - the point of
+checking all five together with a made-up sixth is that no amount of asking gets
+a sixth kind written.
+
 Everything below exercises the real thing. Real processes are started, real
 files are written, real locks are taken out in separate processes, real signals
 are sent, and a real process is killed with no chance to tidy up. The exceptions
@@ -1107,6 +1113,186 @@ class TurnBehavior(unittest.TestCase):
             _wait_for(lambda: _process_gone(child_pid)),
             "the detached child could not be ended by this check either",
         )
+
+
+class LocalRecordKinds(unittest.TestCase):
+    """The five things `record` may write into a session, and the sixth it may not.
+
+    `record` is how the part of Agent Bridge that lives inside a harness puts
+    something into the session without calling anybody: the session itself, a
+    correction from the user, an approved plan, a technical failure, and where
+    implementation started. Each kind writes a particular envelope, and each one
+    is checked here against the exact text it must produce, because the envelope
+    is what a later reader - a person, or a fresh task picking the work up - has
+    to be able to trust.
+
+    The sixth is the point of doing all five together. The list of kinds is
+    closed, and a name that is not on it is refused outright rather than being
+    written under some near-enough heading.
+    """
+
+    def setUp(self):
+        self.temp = tempfile.mkdtemp(prefix="agent-bridge-records-")
+        self.session_dir = os.path.join(self.temp, "session")
+
+    def tearDown(self):
+        shutil.rmtree(self.temp, ignore_errors=True)
+
+    def _create(self, project=None):
+        return record.record(
+            self.session_dir,
+            "session-create",
+            "Work out what to build, then build it.\n",
+            local="codex",
+            peer="claude",
+            workflow="programming-loop",
+            project=project,
+        )
+
+    def _read(self, path):
+        with open(path, encoding="utf-8") as stream:
+            return stream.read()
+
+    def _numbered(self, sequence):
+        return self._read(
+            session.message_path(
+                self.session_dir, sequence, session.LOCAL_RECORD_SUFFIX
+            )
+        )
+
+    def _message_names(self):
+        return sorted(os.listdir(session.messages_dir(self.session_dir)))
+
+    def test_session_create_writes_the_session_file_and_no_message(self):
+        """The one kind that takes no number, because it is not a message."""
+        path = self._create(project=self.temp)
+
+        self.assertEqual(path, session.session_file(self.session_dir))
+        self.assertEqual(
+            self._read(path),
+            "# Session\n\nBridge-Format: 1\nLocal: codex\nPeer: claude\n"
+            "Workflow: programming-loop\nProject: {0}\n\n## Body\n\n"
+            "Work out what to build, then build it.\n".format(
+                os.path.abspath(self.temp)
+            ),
+        )
+        self.assertEqual(self._message_names(), [])
+
+        with self.assertRaises(BridgeError) as caught:
+            self._create()
+        self.assertEqual(caught.exception.failure, Failure.SESSION_EXISTS)
+
+    def test_a_user_correction_is_one_numbered_local_record(self):
+        self._create()
+        path = record.record(
+            self.session_dir, "user-correction", "Use the other approach.\n"
+        )
+
+        self.assertEqual(os.path.basename(path), "0001-local-record.md")
+        self.assertEqual(
+            self._read(path),
+            "# Message 0001\nRecord: user-correction\nFrom: codex\n\n"
+            "## Body\n\nUse the other approach.\n",
+        )
+
+    def test_a_technical_error_is_one_numbered_local_record(self):
+        self._create()
+        path = record.record(
+            self.session_dir, "technical-error", "The peer never answered.\n"
+        )
+
+        self.assertEqual(os.path.basename(path), "0001-local-record.md")
+        self.assertEqual(
+            self._read(path),
+            "# Message 0001\nRecord: technical-error\nFrom: codex\n\n"
+            "## Body\n\nThe peer never answered.\n",
+        )
+
+    def test_implementation_start_carries_the_repository_and_the_baseline(self):
+        """Written down as given, and conditioning nothing that follows."""
+        self._create()
+        path = record.record(
+            self.session_dir,
+            "implementation-start",
+            "The first milestone begins.\n",
+            project=self.temp,
+            baseline="e5f69d273ac5a4f34bf7a068963c6f36f592f0a9",
+        )
+
+        self.assertEqual(
+            self._read(path),
+            "# Message 0001\nRecord: implementation-start\nFrom: codex\n"
+            "Repository-Path: {0}\n"
+            "Baseline: e5f69d273ac5a4f34bf7a068963c6f36f592f0a9\n\n"
+            "## Body\n\nThe first milestone begins.\n".format(
+                os.path.abspath(self.temp)
+            ),
+        )
+
+    def test_plan_approval_seals_the_plan_and_replacing_it_must_be_asked_for(
+        self,
+    ):
+        """An approved plan is not overwritten by accident, or lost on purpose.
+
+        Sealing writes the numbered record first and `PLAN.md` second, so the
+        approved text is in the ordered account of the session either way. A
+        second approval over a sealed plan is refused unless the command says
+        `--replace`, and when it does, the plan it replaced stays readable in
+        the message it was written into.
+        """
+        self._create()
+        first = record.record(
+            self.session_dir, "plan-approval", "The approved plan.\n"
+        )
+
+        self.assertEqual(first, session.plan_file(self.session_dir))
+        self.assertEqual(self._read(first), "The approved plan.\n")
+        self.assertEqual(
+            self._numbered(1),
+            "# Message 0001\nRecord: plan-approval\nFrom: codex\n"
+            "Plan: SEALED\n\n## Body\n\nThe approved plan.\n",
+        )
+
+        with self.assertRaises(BridgeError) as caught:
+            record.record(
+                self.session_dir, "plan-approval", "A different plan.\n"
+            )
+        self.assertEqual(caught.exception.failure, Failure.PLAN_SEALED)
+        self.assertEqual(self._read(first), "The approved plan.\n")
+        self.assertEqual(self._message_names(), ["0001-local-record.md"])
+
+        second = record.record(
+            self.session_dir,
+            "plan-approval",
+            "A different plan.\n",
+            replace=True,
+        )
+
+        self.assertEqual(self._read(second), "A different plan.\n")
+        self.assertEqual(
+            self._numbered(2),
+            "# Message 0002\nRecord: plan-approval\nFrom: codex\n"
+            "Plan: REPLACED\n\n## Body\n\nA different plan.\n",
+        )
+        self.assertIn("The approved plan.", self._numbered(1))
+
+    def test_a_sixth_kind_is_refused_and_writes_nothing(self):
+        """The list of kinds is closed, so a plausible name is still not one."""
+        self._create()
+
+        with self.assertRaises(BridgeError) as caught:
+            record.record(
+                self.session_dir,
+                "implementation-finish",
+                "Anything at all.\n",
+            )
+
+        self.assertEqual(
+            caught.exception.failure, Failure.UNKNOWN_RECORD_KIND
+        )
+        self.assertIn("implementation-finish", str(caught.exception))
+        self.assertEqual(self._message_names(), [])
+        self.assertFalse(os.path.exists(session.plan_file(self.session_dir)))
 
 
 if __name__ == "__main__":
