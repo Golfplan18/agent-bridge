@@ -62,6 +62,7 @@ class Failure(enum.Enum):
     NO_IMPLEMENTATION_BASELINE = "NO_IMPLEMENTATION_BASELINE"
     PUBLICATION_FAILURE = "PUBLICATION_FAILURE"
     PUBLICATION_NOT_FLUSHED = "PUBLICATION_NOT_FLUSHED"
+    PUBLICATION_UNCERTAIN = "PUBLICATION_UNCERTAIN"
 
     # Reading the project repository.
     REPOSITORY_UNREADABLE = "REPOSITORY_UNREADABLE"
@@ -104,8 +105,10 @@ _GUIDANCE: Dict[Failure, Tuple[str, str]] = {
     ),
     Failure.RESTRICTIONS_UNAVAILABLE: (
         "The peer harness does not offer the exact switches Agent Bridge needs "
-        "to deny project writes and to take away its shell, Git and network "
-        "access.",
+        "to make it unable to write project files, change Git state, or reach "
+        "a browser, the web, MCP, messaging, credentials, publication or "
+        "deployment - whether by removing those tools or by confining them in "
+        "an enforced sandbox.",
         "Do not give this harness real project access; report the missing "
         "restriction so the connector's declaration can be corrected.",
     ),
@@ -254,19 +257,34 @@ _GUIDANCE: Dict[Failure, Tuple[str, str]] = {
         "Confirm the reported file is there and readable, and treat this turn "
         "as unfinished until the session directory's disk is behaving.",
     ),
+    Failure.PUBLICATION_UNCERTAIN: (
+        "Something went wrong while the message was being moved into place, "
+        "and the canonical name could not then be examined, so there is no "
+        "telling whether the message reached it.",
+        "Look in the session's messages folder for the reported file before "
+        "you do anything else: if it is there, the message is complete and "
+        "the writing is finished; if it is absent, the message never arrived. "
+        "Do not run the command again until you know which of the two it is.",
+    ),
     Failure.REPOSITORY_UNREADABLE: (
         "The given project directory could not be read as a Git repository.",
         "Correct the --project path so it points at a Git repository you can "
         "read.",
     ),
     Failure.DIRTY_WORKTREE: (
-        "The task worktree holds something no commit contains - an "
-        "uncommitted change, an untracked file, or a file Git has been told "
-        "to ignore - so there is no exact committed head for a reviewer to "
-        "judge.",
+        "The worktree cannot be shown to be the exact committed head a "
+        "reviewer would judge. Either it holds something no commit contains - "
+        "an uncommitted change, an untracked file, or a file Git has been told "
+        "to ignore - or it holds a tracked file Git has been told not to look "
+        "at, which means Git cannot say whether that file matches the commit "
+        "or not.",
         "Commit or set aside the outstanding changes, and move the ignored "
-        "files out of the worktree yourself - Agent Bridge never deletes one - "
-        "then run the review again.",
+        "files out of the worktree yourself - Agent Bridge never deletes one. "
+        "For a tracked file Git is not looking at, clear the bit with "
+        "git update-index --no-assume-unchanged <path> or git update-index "
+        "--no-skip-worktree <path>, and review outside a sparse checkout, "
+        "which sets skip-worktree on everything it leaves out. Then run the "
+        "review again.",
     ),
     Failure.BASELINE_NOT_ANCESTOR: (
         "The baseline commit does not come before a different task head on the "

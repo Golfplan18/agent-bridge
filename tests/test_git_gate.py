@@ -26,17 +26,33 @@ stays shut. One further check hides a canary inside the reviewed change itself,
 which proves the difference reached the peer rather than only the line the
 runner appended to it.
 
-Two checks are about what a repository is allowed to say about itself: that it
-cannot hide an untracked file from the cleanliness check, and that the
-filesystem-monitor helper it names is not run while the gate reads it. The
-second proves that one setting and is named for it - a content filter a
-repository names still runs, which `gitgate` and INTERFACE.md both state.
+Several checks are about what a repository is allowed to say about itself. Three
+of them are about hiding: an untracked file, a whole tracked submodule, and a
+tracked file the index says not to look at. One is about the filesystem-monitor
+helper a repository names, which the gate must not run. And one is about a
+partial clone, which must not be allowed to reach its remote for a missing
+object while the gate reads it.
+
+The filesystem-monitor check proves that one setting and is named for it. It is
+not a claim that nothing a repository says can make the gate run a program: a
+configured `clean` or `process` content filter still runs while `git status`
+works out whether the worktree is clean. The repository selects the filter
+through its committed attributes, but the command itself has to be in the user's
+own effective Git configuration, which does not travel with a clone. Smudge
+filters are not part of that - the gate never checks anything out - and
+text-conversion filters are switched off. It is an accepted residual of the
+cooperative same-user trust boundary, stated in `gitgate` and INTERFACE.md:
+use Agent Bridge only with repositories and Git configuration you trust. Nothing
+here isolates a hostile repository.
 
 Everything runs against a throwaway repository built for the purpose and deleted
-afterwards, and against the fake peer. No real harness is involved anywhere.
-Three conditions cannot be produced on demand any other way - a temporary
-filesystem that will not take a file, one that will not then remove it, and a
-step that outruns its deadline - and those are forced for the length of one call.
+afterwards, and against the fake peer. No real harness is involved anywhere, and
+nothing reaches the network: the one check that needs a remote makes a bare
+clone of the throwaway repository in a directory it owns and deletes. Four
+conditions cannot be produced on demand any other way - a temporary filesystem
+that will not take a file, one that will not then remove it, a step that outruns
+its deadline, and a stop signal arriving at one exact instant - and those are
+forced for the length of one call.
 
 SPDX-License-Identifier: Unlicense
 """
@@ -47,6 +63,7 @@ import glob
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -274,6 +291,33 @@ class GitFinishLine(unittest.TestCase):
             os.path.join(
                 session.messages_dir(self.session_dir), self.requests()[-1]
             )
+        )
+
+    def plain_git(self, *args, **kwargs):
+        """Ordinary Git, run the way Git ordinarily runs, for a control.
+
+        None of the gate's overrides are applied - in particular not
+        `GIT_NO_LAZY_FETCH`, which is explicitly removed in case the machine
+        running these checks has it set. That is what makes a control worth
+        having: if the same command behaves differently here and through the
+        gate, the difference is the override doing something.
+
+        Personal Git configuration is still pointed at an empty device, exactly
+        as the synthetic-repository fixture does, so that a setting on this
+        machine cannot decide what a check observes.
+        """
+        env = synthetic_repo._git_env()
+        env.pop("GIT_NO_LAZY_FETCH", None)
+        env.update(kwargs.pop("env", None) or {})
+        cwd = kwargs.pop("cwd", None) or self.repo.project
+        return subprocess.run(
+            ["git"] + list(args),
+            cwd=cwd,
+            env=env,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            shell=False,
         )
 
     def expected_diff(self, base, head):
@@ -878,6 +922,91 @@ class GitFinishLine(unittest.TestCase):
         # removes it - and the teardown then confirms none survived.
         real_unlink(left)
 
+    def test_a_stop_while_the_evidence_is_being_deleted_still_deletes_it(self):
+        """Being stopped must not be a way to leave the evidence behind.
+
+        The evidence file has to be gone whatever happens, and the awkward
+        moment is the removal itself. A termination arriving while `os.unlink`
+        is running used to raise where it landed: the turn reported that it had
+        been stopped, the lock was released, and the file stayed on the disk
+        with nothing saying so.
+
+        The signal is delivered from inside the removal rather than aimed at it
+        from outside, which is the only way to be sure it lands there. Stops are
+        now written down for the length of the removal and raised once it is
+        done, so the turn still ends as a stop - and the file is gone. Before
+        that change, this same check leaves the file behind and the teardown
+        assertion catches it, which is what makes the check discriminate rather
+        than merely pass.
+        """
+        head = self.ready()
+        real_unlink = os.unlink
+        removed = []
+
+        def unlink_after_a_stop(path, *args, **kwargs):
+            name = os.path.basename(str(path))
+            if name.startswith(gitgate.REVIEW_EVIDENCE_PREFIX) and not removed:
+                removed.append(path)
+                os.kill(os.getpid(), signal.SIGTERM)
+            return real_unlink(path, *args, **kwargs)
+
+        with mock.patch("os.unlink", unlink_after_a_stop):
+            with self.assertRaises(peer.SignalStop):
+                self.review("accept", self.repo.initial_commit, head)
+
+        self.assertEqual(
+            len(removed), 1, "the evidence was never put up for removal"
+        )
+        self.assertFalse(
+            os.path.exists(removed[0]),
+            "a stop during the removal left the evidence on the disk",
+        )
+        self.assertEqual(len(self.requests()), 1)
+        self.assertEqual(
+            self.responses(),
+            [],
+            "a turn that was stopped published an answer anyway",
+        )
+
+    def test_a_stop_while_the_evidence_is_being_written_stays_a_stop(self):
+        """Stopped is stopped, and is never reported as a missing file.
+
+        A termination arriving mid-write used to be turned into
+        `REVIEW_EVIDENCE_UNAVAILABLE`, which told a person to go and free up
+        disk space over a key they had pressed themselves. The partly written
+        file is still cleared away - that part was always right - but what
+        comes out afterwards is the stop, as itself.
+        """
+        head = self.ready()
+        made = {}
+        real_mkstemp = gitgate.tempfile.mkstemp
+        real_fsync = os.fsync
+
+        def mkstemp(*args, **kwargs):
+            handle, path = real_mkstemp(*args, **kwargs)
+            if kwargs.get("prefix") == gitgate.REVIEW_EVIDENCE_PREFIX:
+                made["handle"] = handle
+                made["path"] = path
+            return handle, path
+
+        def fsync_is_interrupted(handle):
+            if handle == made.get("handle"):
+                raise peer.SignalStop(signal.SIGTERM)
+            return real_fsync(handle)
+
+        with mock.patch.object(gitgate.tempfile, "mkstemp", mkstemp):
+            with mock.patch("os.fsync", fsync_is_interrupted):
+                with self.assertRaises(peer.SignalStop):
+                    self.review("accept", self.repo.initial_commit, head)
+
+        self.assertIn("path", made, "no evidence file was ever made")
+        self.assertFalse(
+            os.path.exists(made["path"]),
+            "the partly written evidence survived being stopped",
+        )
+        self.assertEqual(self.requests(), [])
+        self.assertEqual(self.responses(), [])
+
     def test_a_connector_precheck_runs_inside_the_turn_deadline(self):
         """A connector's own programs are bounded by the turn, not extra to it.
 
@@ -1046,6 +1175,263 @@ class GitFinishLine(unittest.TestCase):
             "an untracked file was deleted instead of being reported",
         )
 
+    def test_a_repository_cannot_hide_a_submodule_it_told_git_to_ignore(self):
+        """A whole subdirectory can be made to vanish from the answer.
+
+        A tracked submodule can be marked `ignore = all`, and then modified and
+        untracked files inside it stop appearing in `git status` at all - not
+        as a changed submodule, not as anything. This check sets that up and
+        confirms first that ordinary Git really does report nothing, so what
+        follows is not passing for free.
+
+        The gate asks Git to look into submodules regardless of what the
+        repository asked for, because a reviewer reading the project would see
+        those files and no commit would contain them.
+
+        The submodule's source is a second throwaway repository this check owns
+        and deletes with the rest of its fixtures. Nothing reaches the network:
+        `protocol.file.allow` is what lets Git clone from a local path at all.
+        """
+        self.seal(self.repo.initial_commit)
+        source = self.new_repository()
+        self.repo._git(
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "add",
+            "--quiet",
+            "--",
+            source.project,
+            "vendor",
+        )
+        self.repo._git("commit", "--quiet", "-m", "Vendor a second repository")
+        head = self.repo.head()
+
+        self.repo._git("config", "submodule.vendor.ignore", "all")
+        inside = os.path.join(self.repo.project, "vendor", "smuggled.txt")
+        with open(inside, "w", encoding="utf-8") as stream:
+            stream.write("Something no commit of either repository holds.\n")
+
+        hidden = self.repo._git(
+            "status", "--porcelain", "--untracked-files=all", "--ignored"
+        )
+        self.assertEqual(
+            hidden.strip(),
+            "",
+            "the submodule is not being hidden, so this check proves nothing",
+        )
+
+        error = self.refuse(
+            Failure.DIRTY_WORKTREE, "accept", self.repo.initial_commit, head
+        )
+        self.assertIn("vendor", str(error))
+        self.assertEqual(self.requests(), [])
+        self.assertTrue(
+            os.path.exists(inside),
+            "a file inside the submodule was deleted instead of reported",
+        )
+
+    def test_a_tracked_file_git_was_told_not_to_look_at_is_refused(self):
+        """Two index bits make a changed file invisible. Both are refused.
+
+        `assume-unchanged` and `skip-worktree` both tell Git to stop comparing a
+        tracked file with the worktree. Set either one and then change the file,
+        and `git status` reports a clean worktree - which this check confirms
+        first for each bit in turn, with every switch the gate itself uses, so
+        the refusal that follows can only be coming from somewhere else.
+
+        There is no status switch that defeats these, and clearing them would
+        mean writing to the index, which a read-only gate must not do. So the
+        index is read out instead and the bit is refused wherever it is found.
+        The refusal is for the bit being present, not for the file happening to
+        differ, because the whole effect of the bit is that Git will not say
+        whether it differs.
+
+        Both bits are tried twice: once with the review pointed at the top of
+        the repository, and once with it pointed at a subdirectory while the
+        concealed file stays at the top. A subdirectory is allowed, because
+        identity is settled by resolving the repository's top level, and the
+        second half is what proves the index is read from the top: `ls-files`
+        reports only what lies below the directory Git was run in unless it is
+        told otherwise, so without the `-- :/` pathspec the concealed file is
+        outside the answer and the gate opens over a worktree that is not the
+        reviewed commit. The control matters more there than anywhere: `git
+        status` run in that subdirectory would report an ordinary untracked
+        file at the top of the repository, and this one file it cannot see. The
+        refusal also has to name the file from the top of the repository rather
+        than from wherever the review was pointed, which is what `--full-name`
+        is for.
+        """
+        self.seal(self.repo.initial_commit)
+        self.repo.add_commit("Ordinary committed work")
+        tracked = synthetic_repo.WRITE_CANARY
+        path = os.path.join(self.repo.project, tracked)
+        below = os.path.join(self.repo.project, "component")
+        os.mkdir(below)
+        head = self.repo.add_commit(
+            "Committed work in a subdirectory",
+            filename=os.path.join("component", "inner.txt"),
+        )
+
+        for bit in ("assume-unchanged", "skip-worktree"):
+            for pointed_at in (self.repo.project, below):
+                with self.subTest(bit=bit, project=pointed_at):
+                    self.repo._git("update-index", "--" + bit, "--", tracked)
+                    with open(path, "a", encoding="utf-8") as stream:
+                        stream.write("A change nothing is meant to notice.\n")
+
+                    hidden = self.plain_git(
+                        "status",
+                        "--porcelain",
+                        "--untracked-files=all",
+                        "--ignored",
+                        "--ignore-submodules=none",
+                        cwd=pointed_at,
+                    )
+                    self.assertEqual(
+                        hidden.returncode,
+                        0,
+                        hidden.stderr.decode("utf-8", "replace"),
+                    )
+                    self.assertEqual(
+                        hidden.stdout.decode("utf-8", "replace").strip(),
+                        "",
+                        "the change is not being hidden, so this check proves "
+                        "nothing",
+                    )
+
+                    error = self.refuse(
+                        Failure.DIRTY_WORKTREE,
+                        "accept",
+                        self.repo.initial_commit,
+                        head,
+                        project=pointed_at,
+                    )
+                    self.assertIn(tracked, str(error))
+                    self.assertIn(bit, str(error))
+                    self.assertIn(
+                        ": {0} carries {1}".format(tracked, bit),
+                        error.detail,
+                        "the concealed file was not named from the top of the "
+                        "repository: {0}".format(error.detail),
+                    )
+                    self.assertEqual(self.requests(), [])
+
+                    self.repo._git(
+                        "update-index", "--no-" + bit, "--", tracked
+                    )
+                    self.repo._git("checkout", "--", tracked)
+
+    def test_the_gate_does_not_fetch_a_missing_object_from_a_remote(self):
+        """A partial clone must not make the gate call out to a remote.
+
+        A partial clone keeps only some of its objects and quietly fetches the
+        rest from its remote as they are needed - starting an SSH, HTTP,
+        remote-helper or credential-helper program to do it. That is an
+        external effect, caused by the gate itself, before the peer has even
+        been started, so lazy fetching is switched off for every Git command
+        the gate runs.
+
+        The order here matters. The gate runs first, against a repository whose
+        one interesting object has been deleted: it must fail, and the object
+        must still be missing afterwards - which is checked with a probe that
+        itself has lazy fetching off, because a probe without it would fetch
+        the object and destroy the evidence it was looking for.
+
+        The control comes second, and it is the half that makes the first half
+        mean something: the same difference, run as ordinary Git, succeeds and
+        leaves the object present. So the remote really was reachable and
+        ordinary Git really would have gone to it. The control repairs the
+        repository, which is why it cannot come first.
+
+        Nothing reaches the network. The remote is a bare clone of the
+        throwaway repository, made inside the directory this check owns.
+        """
+        self.seal(self.repo.initial_commit)
+        head = self.repo.add_commit(
+            "Work whose contents this clone will not hold",
+            filename="lazy.txt",
+            text="The contents that have to be fetched to be diffed.\n",
+        )
+
+        source = os.path.join(self.temp, "promisor-source.git")
+        cloned = self.plain_git(
+            "clone",
+            "--bare",
+            "--no-hardlinks",
+            "--",
+            self.repo.project,
+            source,
+            cwd=self.temp,
+        )
+        self.assertEqual(
+            cloned.returncode, 0, cloned.stderr.decode("utf-8", "replace")
+        )
+        for name, value in (
+            ("uploadpack.allowFilter", "true"),
+            ("uploadpack.allowAnySHA1InWant", "true"),
+        ):
+            configured = self.plain_git(
+                "config", name, value, cwd=source
+            )
+            self.assertEqual(configured.returncode, 0, configured.stderr)
+
+        for name, value in (
+            ("core.repositoryformatversion", "1"),
+            ("extensions.partialClone", "origin"),
+            ("remote.origin.url", source),
+            ("remote.origin.promisor", "true"),
+            ("remote.origin.partialclonefilter", "blob:none"),
+        ):
+            self.repo._git("config", name, value)
+
+        blob = self.repo._git("rev-parse", "HEAD:lazy.txt").strip()
+        loose = os.path.join(
+            self.repo.project, ".git", "objects", blob[:2], blob[2:]
+        )
+        self.assertTrue(
+            os.path.exists(loose),
+            "the object is not a loose one, so deleting it proves nothing",
+        )
+        os.unlink(loose)
+
+        self.refuse(
+            Failure.REPOSITORY_UNREADABLE,
+            "accept",
+            self.repo.initial_commit,
+            head,
+        )
+        self.assertEqual(self.requests(), [])
+        still_missing = self.plain_git(
+            "cat-file", "-e", blob, env={"GIT_NO_LAZY_FETCH": "1"}
+        )
+        self.assertNotEqual(
+            still_missing.returncode,
+            0,
+            "the gate fetched the object from the remote",
+        )
+
+        control = self.plain_git(
+            "--no-pager",
+            "diff",
+            "{0}..{1}".format(self.repo.initial_commit, head),
+        )
+        self.assertEqual(
+            control.returncode,
+            0,
+            "ordinary Git could not fetch either, so this check proves "
+            "nothing: " + control.stderr.decode("utf-8", "replace"),
+        )
+        fetched = self.plain_git(
+            "cat-file", "-e", blob, env={"GIT_NO_LAZY_FETCH": "1"}
+        )
+        self.assertEqual(
+            fetched.returncode,
+            0,
+            "ordinary Git did not fetch the object, so this check proves "
+            "nothing",
+        )
+
     def test_the_gate_does_not_run_the_repositorys_filesystem_monitor(self):
         """One named way a repository can have its program run, and it cannot.
 
@@ -1058,7 +1444,11 @@ class GitFinishLine(unittest.TestCase):
 
         This proves that one setting, and is named for it. It is not a claim
         that nothing a repository says can make the gate run a program: a
-        content filter still can, which INTERFACE.md and `gitgate` both state.
+        configured `clean` or `process` content filter still runs during
+        `git status`. The repository picks which filter applies through its
+        committed attributes, but the command has to be in the user's own
+        effective Git configuration already, and does not arrive with a clone.
+        That residual is accepted, and INTERFACE.md and `gitgate` both say so.
         """
         head = self.ready()
         marker = os.path.join(self.temp, "the-helper-ran")

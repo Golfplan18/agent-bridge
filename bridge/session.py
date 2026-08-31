@@ -32,10 +32,26 @@ only when the canonical name now holds that very file. A temporary file that has
 merely gone - because the folder it was in went with it - proves nothing and is
 not taken for a rename.
 
+**And that question has three answers, not two.** Yes, the canonical name holds
+the very file that was written. No, it does not - it is absent, or it holds
+something else, or nothing was ever written. Or the filesystem would not answer
+at all, which is neither: something went wrong while the message was being moved
+into place and the name could not then be examined, so there is genuinely no
+telling. That third answer used to be folded into "no", which meant a message
+that really was in place could be reported as never sent, with advice to run the
+command again. It is now its own failure, `PUBLICATION_UNCERTAIN`, which names
+the file and asks the person to look.
+
 Being stopped is not a publication failure and is never dressed up as one. An
 interrupt or a termination signal is passed straight on, after the temporary
 file has been cleared away if there is one, so that what the person reads is
-that they stopped it.
+that they stopped it. Two things outrank saying so, in that order. A temporary
+file that could not be removed is reported as `CLEANUP_FAILURE` even when what
+went wrong was the person pressing a key, because the leftover file is the
+thing they actually have to go and deal with and nothing else would tell them
+it is there. And not knowing whether the rename happened is reported as
+`PUBLICATION_UNCERTAIN`, because "you stopped it" would be read as "so nothing
+happened", which is exactly the untruth that failure exists to avoid.
 
 **Numbering is derived, not remembered.** The next sequence number is whatever is
 one higher than the highest number already on disk. Nothing counts on behalf of
@@ -45,6 +61,12 @@ the directory, so nothing can disagree with it.
 between the title line and the first blank line. The text under `## Body` is
 never looked at by any parser here. That is not a promise about intent; it is
 where the code stops reading. Prose that looks like a header stays prose.
+
+That claim is about this module and stays exactly true of it. One thing outside
+it does look inside a response body: the runner searches a reviewer's answer for
+the evidence token, which is the sole non-authoritative exception to the inert
+body and is described in `runner`. It can only withhold acceptance, never grant
+it, and nothing in a body can grant authority anywhere.
 
 SPDX-License-Identifier: Unlicense
 """
@@ -149,7 +171,9 @@ def _fsync_directory(directory: str) -> None:
         os.close(handle)
 
 
-def _rename_happened(path: str, written: Optional[Tuple[int, int]]) -> bool:
+def _rename_outcome(
+    path: str, written: Optional[Tuple[int, int]]
+) -> Optional[bool]:
     """Did the rename go through? Ask the filesystem, not a variable.
 
     `written` identifies the temporary file that was filled in - which device
@@ -162,17 +186,30 @@ def _rename_happened(path: str, written: Optional[Tuple[int, int]]) -> bool:
     there. The temporary file merely being gone proves nothing either, because
     the folder it was in could have gone with it while the rename failed.
 
-    `None` means nothing was ever written, so nothing can have been renamed. A
-    filesystem that will not answer is read as "not published", which is the
-    cautious way round: the caller is then told to look for a message, rather
-    than told to trust one that may not be there.
+    There are three answers, and the third one is the point of this shape:
+
+    - `True` - the canonical name holds the very file that was written, so the
+      message is published.
+    - `False` - nothing was ever written, or the canonical name does not exist,
+      or it holds some other file. Not published.
+    - `None` - the canonical name could not be examined at all. There is no
+      telling either way, and saying "not published" about it would be a guess
+      dressed up as a fact.
+
+    **Test this result with `is True`, `is None` and `is False`, never for
+    truthiness.** `None` is falsey, so `if not outcome` quietly folds "there is
+    no telling" into "it did not happen" - which is the exact mistake this
+    return type exists to prevent, and the reason it is worth the awkwardness of
+    a three-valued answer.
     """
     if written is None:
         return False
     try:
         found = os.stat(path)
-    except OSError:
+    except FileNotFoundError:
         return False
+    except OSError:
+        return None
     return (found.st_dev, found.st_ino) == written
 
 
@@ -181,8 +218,10 @@ def publish(path: str, text: str) -> str:
 
     The text goes into a task-owned temporary file beside the destination, is
     flushed and forced to disk, and only then renamed onto the canonical name.
-    Any failure up to and including that rename removes the temporary file and
-    reports `PUBLICATION_FAILURE`, leaving the session exactly as it was.
+    In the ordinary case a failure before that rename removes the temporary
+    file and reports `PUBLICATION_FAILURE`, leaving the session exactly as it
+    was - but that is only the ordinary case, and the exact ordering, including
+    where it does not hold, is set out below.
 
     The rename is the moment of publication, and which side of it something
     happened on is decided by asking whether the canonical name now holds the
@@ -193,11 +232,31 @@ def publish(path: str, text: str) -> str:
     so it is reported as `PUBLICATION_NOT_FLUSHED` instead: the message is
     there, and a machine failure could still lose it. The turn fails either way.
 
-    An interrupt or a stop signal is not a publication failure. It is raised on
-    unchanged - after the temporary file is cleared away, when the rename had
-    not happened - so that nothing reports "nothing was published" about a
-    message that is on the disk, and nothing calls a person's own decision to
-    stop a fault of this function.
+    When something goes wrong, four things are decided in this order, and the
+    order is what makes each report true.
+
+    First, if the message is in place, that is the report - the failure happened
+    after publication and is never dressed up as nothing having been sent. A
+    stop arriving there is raised as itself.
+
+    Otherwise the temporary file has to go, whether or not the rename is
+    knowable. A file that is already gone is the wanted state and passes in
+    silence; a removal that fails any other way is `CLEANUP_FAILURE`, naming the
+    leftover file, and it outranks everything else here - including re-raising a
+    stop - because a leftover file is the thing a person actually has to go and
+    deal with, and nothing else would tell them it is there.
+
+    Then, if the canonical name could not be examined, the report is
+    `PUBLICATION_UNCERTAIN`: there is no telling whether the message arrived, so
+    the person is asked to look. This one outranks re-raising a stop too, and
+    for a sharper reason: "you stopped it" would be read as "so nothing
+    happened", and not knowing whether anything happened is precisely what is
+    being reported.
+
+    Only then is an interrupt or a stop signal raised on unchanged, so that
+    nothing calls a person's own decision to stop a fault of this function; and
+    only then, in the ordinary case, is `PUBLICATION_FAILURE` raised, which
+    truthfully says nothing was published.
     """
     directory = os.path.dirname(os.path.abspath(path))
     try:
@@ -214,7 +273,8 @@ def publish(path: str, text: str) -> str:
             written = (marks.st_dev, marks.st_ino)
         os.replace(temp_path, path)
     except BaseException as exc:
-        if _rename_happened(path, written):
+        outcome = _rename_outcome(path, written)
+        if outcome is True:
             # The message is in place. Whatever went wrong went wrong after
             # publication, so it is never reported as though nothing was sent.
             if isinstance(exc, (SignalStop, KeyboardInterrupt)):
@@ -223,10 +283,30 @@ def publish(path: str, text: str) -> str:
                 Failure.PUBLICATION_NOT_FLUSHED,
                 detail="{0}: {1}".format(path, exc),
             )
+        # Not published, or not knowably published. Either way the temporary
+        # file must not be left behind, and a removal that fails is the loudest
+        # thing here: nothing else would tell anybody the file exists.
         try:
             os.unlink(temp_path)
-        except OSError:
+        except FileNotFoundError:
             pass
+        except OSError as removal:
+            raise BridgeError(
+                Failure.CLEANUP_FAILURE,
+                detail=(
+                    "the temporary file {0} could not be removed after "
+                    "publishing {1} failed ({2}): {3}".format(
+                        temp_path, path, exc, removal
+                    )
+                ),
+            )
+        if outcome is None:
+            # The rename may have happened. Reporting a stop, or reporting that
+            # nothing was published, would both be claims nobody can make.
+            raise BridgeError(
+                Failure.PUBLICATION_UNCERTAIN,
+                detail="{0}: {1}".format(path, exc),
+            )
         if isinstance(exc, (SignalStop, KeyboardInterrupt)):
             raise
         raise BridgeError(

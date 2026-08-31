@@ -13,6 +13,26 @@ command-line program as a trusted program running under the user's own account,
 and makes no claim to stop it reading other files that account can already read,
 so invoke only harnesses you trust.
 
+Two further boundaries follow from that same account, and both are stated rather
+than papered over.
+
+**Reviewer context.** An executor and a reviewer are separate contexts that
+inherit no conversation from each other, and what makes a reviewer independent is
+the packet it is handed: the plan and the evidence, never the executor's claims,
+hidden reasoning or prior conversation. That is a property of how the context is
+built, not of the disk. Every harness writes plaintext session transcripts the
+same account can read, and Agent Bridge does not stop a reviewer that goes
+looking from finding one. It adds no transcript deletion, no search prevention
+and no isolation subsystem.
+
+**Repository instructions.** A peer given a project root is given that project's
+`AGENTS.md` or `CLAUDE.md` with it. Agent Bridge does not prevent that and adds
+no suppression wrapper. Such instructions may govern how a repository is
+inspected; they cannot expand the approved plan, create user authority, permit
+mutation, or authorise a prohibited external effect. This repository carries no
+agent instruction file of its own, so an external reviewer of Agent Bridge takes
+its instructions from the review request.
+
 Everything else stays where it already lives. Each harness keeps its own
 authentication, subscription, providers, models, tools, agents and native
 sessions, and does its own implementation work its own way. The project

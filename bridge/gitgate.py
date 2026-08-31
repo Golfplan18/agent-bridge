@@ -30,34 +30,47 @@ and automatic housekeeping are switched off because a supposedly read-only check
 that runs somebody else's program has already had an effect before the peer was
 even started.
 
-**One way in is left open, and it is left open knowingly.** A repository can
-name a content filter - `filter=<name>` in its own `.gitattributes`, and
-`filter.<name>.clean` in its local configuration - and Git runs that program
-while working out whether the worktree is clean. Agent Bridge does not switch
-that off, because there is no fixed switch that does: filters are named one at a
-time and cannot be turned off as a class, and the one mechanism that would
-suppress them needs a Git new enough to take `--attr-source`, a per-repository
-lookup to name an empty tree, and would change what the evidence file itself
-shows. So it is stated rather than pretended about. The exposure needs the local
-`.git/config` of the repository under review to define such a filter, which
-under the same-user trust boundary is the user's own configuration; a person who
-does not want it should not point a review at a repository whose local
-configuration they did not write.
+**One way in is left open, and it is left open knowingly.** While `git status`
+works out whether the worktree is clean, it may run a configured `clean` filter
+or a long-running `process` filter. The repository selects which filter applies
+to which file through its committed attributes, but the executable command
+itself must already exist in the user's effective Git configuration, which is
+not part of the repository tree and does not travel with a clone. Two related
+mechanisms are *not* part of this: smudge filters, which run on checkout, and
+the gate never performs a checkout; and text-conversion filters, which are
+switched off below. This is a residual of Agent Bridge's cooperative same-user
+trust boundary and is stated rather than pretended about: use Agent Bridge only
+with repositories and Git configuration you trust. Nothing here isolates a
+hostile repository, and no claim to do so is made.
 
-Cleanliness is asked for in full. Untracked files are requested explicitly
-rather than left to the repository's own preference, because a repository may
-ask Git to stop mentioning them; ignored entries are asked for as well. Anything
-at all means the worktree holds something no commit contains.
+Cleanliness is asked for in full, and in two separate ways, because Git has two
+separate ways of being told not to mention something. Untracked files are
+requested explicitly rather than left to the repository's own preference, and
+ignored entries are asked for as well; submodules are looked into whatever a
+configured `ignore` setting says. Then, separately, the index is read for the
+two bits that make Git skip a tracked file altogether - and it is read for the
+whole repository, which has to be spelled out because `ls-files` would
+otherwise report only what lies below the directory Git was run in, while a
+review may be pointed at a subdirectory and every other check here is
+repository-wide. Anything found by either route means the worktree cannot be
+shown to be the reviewed commit.
 
-The reviewer gets no shell and no Git. What it gets instead is one file: the
-cumulative difference between the two commits, generated here, once, and then
-one more line - a fresh unpredictable token, written by this turn and reachable
-no other way. That token is what turns "the peer was told where the evidence is"
-into "the peer read it": the runner asks for it back and refuses to open the Git
-finish line without it. The file lives outside both the project and the session
-record, is derived evidence rather than a second source of truth, and is deleted
-on every way out. The exact bytes written are hashed at the same moment, so the
-file the peer had can be shown afterwards to be the file this turn wrote.
+What the reviewer gets from this module is one file: the cumulative difference
+between the two commits, generated here, once, and then one more line - a fresh
+unpredictable token, written by this turn and reachable no other way. That token
+is what turns "the peer was told where the evidence is" into "the peer read it":
+the runner asks for it back and refuses to open the Git finish line without it.
+The file lives outside both the project and the session record, is derived
+evidence rather than a second source of truth, and is deleted on every way out.
+The exact bytes written are hashed at the same moment, so the file the peer had
+can be shown afterwards to be the file this turn wrote.
+
+The review path does not depend on the peer having a shell or Git of its own.
+What a connector must prove is a property, not an inventory: the peer cannot
+write project files, cannot alter Git state, and cannot cause a prohibited
+external effect - achieved by removing those tools, by an enforced sandbox that
+makes their effects impossible, or by both. Harmless availability is allowed;
+mutation and prohibited external effects are not.
 
 SPDX-License-Identifier: Unlicense
 """
@@ -143,19 +156,28 @@ def _git_env() -> Tuple[Tuple[str, str], ...]:
     the repository named on the command line. Git is told never to prompt for
     anything, and never to take an optional lock, so reading the repository
     cannot change it.
+
+    Lazy fetching is switched off as well. A partial clone holds only some of
+    its objects and goes to the configured remote for the rest as it needs
+    them, so a difference that touches a missing blob would quietly start an
+    SSH, HTTP, remote-helper or credential-helper program - an external effect
+    the gate would be causing itself, before the peer had even been started.
+    With this set, Git says the object is unavailable and stops, which is a
+    failure somebody can see and act on rather than a call nobody asked for.
     """
     env = dict(os.environ)
     for inherited in ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE"):
         env.pop(inherited, None)
     env["GIT_TERMINAL_PROMPT"] = "0"
     env["GIT_OPTIONAL_LOCKS"] = "0"
+    env["GIT_NO_LAZY_FETCH"] = "1"
     return tuple(sorted(env.items()))
 
 
 #: The settings every gate command overrides, and why each one is here. This is
-#: the complete list, not a summary of one: a content filter named through the
-#: repository's own `.gitattributes` is not on it and still runs, for the
-#: reasons given at the top of this file.
+#: the complete list, not a summary of one: a `clean` or `process` content
+#: filter is not on it and still runs, and the top of this file says why that
+#: residual is accepted rather than closed.
 #:
 #: - `core.fsmonitor` names a filesystem-monitor helper that Git starts while
 #:   reading the worktree. A repository could point it at any program at all, so
@@ -203,8 +225,8 @@ def _git(
     commit read as a different commit; without it, the contents a reviewer judged
     could differ from the commit written into `Review-Head`. And the settings
     listed above, which would otherwise let the repository choose a program for
-    Git to run, are switched off. That list is exact and does not cover content
-    filters, which the top of this file explains.
+    Git to run, are switched off. That list is exact and does not cover `clean`
+    or `process` content filters, which the top of this file explains.
     """
     argv = ["git", "-C", project, "--no-pager", "--no-replace-objects"]
     argv.extend(_NO_REPOSITORY_PROGRAMS)
@@ -288,8 +310,69 @@ def is_ancestor(
     return result.returncode == 0
 
 
+def _first_of(entries: Sequence[str]) -> str:
+    """One entry to show a person, and how many others there were."""
+    if len(entries) == 1:
+        return entries[0]
+    return "{0} and {1} more".format(entries[0], len(entries) - 1)
+
+
+def _hidden_by_index_bits(
+    project: str, deadline: "peer_module.Deadline"
+) -> Sequence[str]:
+    """Tracked files Git has been told not to look at, and which bit each has.
+
+    Two bits in the index do this. `assume-unchanged` is a promise the user
+    makes to Git that a file will not change, offered as a way to skip
+    expensive checks; `skip-worktree` says the file is deliberately not present
+    in this checkout in the shape the commit describes, and is what a sparse
+    checkout sets on everything it leaves out. Either one makes `git status`
+    pass the file over, so its worktree content can differ from the commit and
+    nothing will say so.
+
+    Unlike untracked and ignored files, there is no status switch that defeats
+    these, and clearing them would mean writing to the index - which this gate
+    must never do, because it is meant to read a repository and leave it
+    exactly as it found it. So they are found here instead, by reading the
+    index out.
+
+    `git ls-files -v -z --full-name -- :/` prints one `<tag><space><path>`
+    record per tracked file, separated by null bytes so a newline in a filename
+    cannot be mistaken for the end of a record. The tag `S` means skip-worktree;
+    a lowercase tag means assume-unchanged, and `s` means both at once.
+
+    The whole repository is read, and asking for that takes two more arguments
+    than it looks like it should. `ls-files` is the one command in this module
+    that answers only for the directory Git was run in, and `--project` is
+    deliberately allowed to name a subdirectory of the repository, because
+    identity is settled by resolving the top level. So without the pathspec
+    `-- :/`, which means "from the top of the repository", a review pointed at a
+    subdirectory would never see a concealed file above it - while every other
+    check the gate makes is repository-wide, and a `git status` run in that same
+    subdirectory would have reported an ordinary untracked file at the root.
+    `--full-name` then makes each path read from the top of the repository
+    rather than from wherever the review happened to be pointed, so the path
+    named in the refusal means the same thing either way.
+    """
+    result = _git(
+        project,
+        ["ls-files", "-v", "-z", "--full-name", "--", ":/"],
+        deadline,
+    )
+    found = []
+    for entry in result.stdout.split("\0"):
+        if len(entry) < 3 or entry[1] != " ":
+            continue
+        tag, path = entry[0], entry[2:]
+        if tag in ("S", "s"):
+            found.append("{0} carries skip-worktree".format(path))
+        elif tag.islower():
+            found.append("{0} carries assume-unchanged".format(path))
+    return found
+
+
 def require_clean(project: str, deadline: "peer_module.Deadline") -> None:
-    """Refuse to go on unless no commit is missing anything in the worktree.
+    """Refuse to go on unless the worktree is exactly the committed head.
 
     Git is asked for every untracked file and for ignored entries as well as
     changed ones, and any entry at all means the worktree is not clean. An
@@ -298,31 +381,66 @@ def require_clean(project: str, deadline: "peer_module.Deadline") -> None:
     reason, and being ignored by Git says nothing about whether a reviewing peer
     can read it.
 
+    Three ways of telling Git to stop mentioning something are defeated here,
+    because each of them would otherwise let a worktree that is not the
+    reviewed commit pass as though it were.
+
     Untracked files are asked for by name on the command line rather than left
     to the repository's own preference. A repository may set
     `status.showUntrackedFiles` to `no`, and then an ordinary untracked file -
-    and every ignored one with it - simply does not appear in the answer. A
-    worktree that hides what it contains would otherwise pass as clean, and a
-    reviewer would be reading files no commit holds.
+    and every ignored one with it - simply does not appear in the answer.
 
-    Nothing is ever deleted here. The failure names what was found so that a
-    person can decide what to do with their own files.
+    Submodules are looked into whatever the repository asked for. Setting
+    `submodule.<name>.ignore` to `all`, in the configuration or in
+    `.gitmodules`, or setting `diff.ignoreSubmodules`, makes modified and
+    untracked files inside a tracked submodule vanish from the answer
+    completely. `--ignore-submodules=none` overrides every one of those,
+    wherever it was set.
+
+    And a tracked file carrying `assume-unchanged` or `skip-worktree` is
+    refused outright, wherever in the repository it sits. The index is read
+    from the top of the repository rather than from wherever `--project` was
+    pointed, which has to be asked for explicitly and is explained where the
+    reading is done; without it, a review pointed at a subdirectory would pass
+    over a concealed file above it, and both of these repository-wide checks
+    would have missed the same file for two different reasons.
+
+    That refusal is deliberately stricter than the rest: it is for the bit
+    being there at all, not for the file currently differing, because the whole
+    effect of the bit is that Git will not tell you whether it differs. One
+    consequence is worth saying plainly rather than leaving to be discovered -
+    a sparse checkout sets `skip-worktree` on every path it leaves out, so a
+    sparse checkout cannot be reviewed here. Its worktree is not the reviewed
+    commit, and no reading of it could show that it was.
+
+    Nothing is ever deleted here, and nothing in the index is ever written. The
+    failure names what was found so that a person can decide what to do with
+    their own repository.
     """
     result = _git(
         project,
-        ["status", "--porcelain", "--untracked-files=all", "--ignored"],
+        [
+            "status",
+            "--porcelain",
+            "--untracked-files=all",
+            "--ignored",
+            "--ignore-submodules=none",
+        ],
         deadline,
     )
     entries = [line.strip() for line in result.stdout.splitlines()]
     entries = [line for line in entries if line]
-    if not entries:
-        return
-    found = entries[0]
-    if len(entries) > 1:
-        found = "{0} and {1} more".format(found, len(entries) - 1)
-    raise BridgeError(
-        Failure.DIRTY_WORKTREE, detail="{0}: {1}".format(project, found)
-    )
+    if entries:
+        raise BridgeError(
+            Failure.DIRTY_WORKTREE,
+            detail="{0}: {1}".format(project, _first_of(entries)),
+        )
+    hidden = _hidden_by_index_bits(project, deadline)
+    if hidden:
+        raise BridgeError(
+            Failure.DIRTY_WORKTREE,
+            detail="{0}: {1}".format(project, _first_of(list(hidden))),
+        )
 
 
 def current_head(project: str, deadline: "peer_module.Deadline") -> str:
@@ -451,10 +569,24 @@ def generate_review_evidence(
     A temporary area that is full, unwritable or missing is an ordinary thing to
     run into, so it is reported as `REVIEW_EVIDENCE_UNAVAILABLE` with something
     to do about it. A write that fails part way through takes its half-written
-    file with it - and when that removal fails too, a partly written file is
-    left on the disk, which is a cleanup failure and is reported as one. Saying
-    only that the evidence was unavailable would leave somebody with a file
-    nobody told them about.
+    file with it, and what happens next depends on what actually went wrong, in
+    this order:
+
+    The removal itself runs with stops deferred, so a termination arriving in
+    the middle of it cannot abandon it half done and leave the file behind.
+
+    If the removal failed, that is what is reported - `CLEANUP_FAILURE`, naming
+    the file - and it outranks everything else here, because somebody now has a
+    file on their disk that nothing has told them about.
+
+    If a stop arrived while the removal was running, it is raised once the file
+    is gone. And if the write was interrupted by a stop in the first place, that
+    stop is raised as itself rather than being turned into
+    `REVIEW_EVIDENCE_UNAVAILABLE`. Being stopped is not the evidence being
+    unavailable, and reporting it as though it were would tell a person to go
+    and free up disk space over a key they pressed themselves.
+
+    Only a genuine write failure becomes `REVIEW_EVIDENCE_UNAVAILABLE`.
     """
     argv = [
         "diff",
@@ -479,11 +611,21 @@ def generate_review_evidence(
             stream.flush()
             os.fsync(stream.fileno())
     except BaseException as exc:
-        try:
-            os.unlink(path)
-        except FileNotFoundError:
-            pass
-        except OSError as removal:
+        removal = None  # type: Optional[OSError]
+        # Stops are written down rather than raised for the length of the
+        # removal, exactly as `run_bounded` does around its own cleanup, so a
+        # termination landing inside `os.unlink` cannot leave the half-written
+        # file on the disk. The stop is raised below, once there is nothing
+        # left to abandon.
+        with peer_module.stopped_by_signal() as watch:
+            with watch.deferring():
+                try:
+                    os.unlink(path)
+                except FileNotFoundError:
+                    pass
+                except OSError as failed:
+                    removal = failed
+        if removal is not None:
             raise BridgeError(
                 Failure.CLEANUP_FAILURE,
                 detail=(
@@ -493,6 +635,9 @@ def generate_review_evidence(
                     )
                 ),
             )
+        watch.raise_if_stopped()
+        if isinstance(exc, (peer_module.SignalStop, KeyboardInterrupt)):
+            raise
         raise BridgeError(
             Failure.REVIEW_EVIDENCE_UNAVAILABLE,
             detail="{0}: {1}".format(path, exc),

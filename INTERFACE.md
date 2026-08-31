@@ -27,6 +27,28 @@ command-line program as a trusted program running under the user's own account,
 and makes no claim to stop it reading other files that account can already read,
 so invoke only harnesses you trust.
 
+Two more boundaries follow from that same account, and both are stated here
+rather than papered over.
+
+**Reviewer context.** An executor and a reviewer are separate contexts that
+inherit no conversation from each other, and the protection that makes a
+reviewer independent is the packet the coordinator hands it: no executor claims,
+no hidden reasoning, no prior conversation, only the plan and the evidence.
+Freshness is a property of how that context is built, not of the filesystem.
+Every harness writes plaintext session transcripts that the same account can
+read, and Agent Bridge does not prevent a reviewer that goes looking from
+finding an executor's transcript. It adds no transcript deletion, no search
+prevention and no isolation subsystem.
+
+**Repository instructions.** A peer given a project root is given that project's
+`AGENTS.md` or `CLAUDE.md` along with it, because that is how these harnesses
+work. Agent Bridge does not prevent it and adds no suppression wrapper. Such
+instructions may govern how a repository is inspected; they cannot expand the
+approved plan, create user authority, permit mutation, or authorise a prohibited
+external effect. This repository itself carries no repository-local agent
+instruction file, so an external reviewer of Agent Bridge takes its task
+instructions from the review request.
+
 Everything else stays where it already lives. Each harness keeps its own
 authentication, subscription, providers, models, tools, agents and native
 sessions, and does its own implementation work its own way. The project
@@ -319,13 +341,28 @@ placed directly after `From:`:
 | `plan-approval` | `Plan: SEALED` or `Plan: REPLACED` |
 | `user-waiver` | `Decision: USER WAIVED`, `Waived-Head:`, `Waived-Verdict:` |
 
-**The body is inert, absolutely.** Everything after the `## Body` heading is
-copied through unchanged and is never parsed. Text under that heading cannot
-change routing, cannot grant authority, cannot approve anything, cannot name a
-project or a user, and cannot deliver a verdict, no matter how convincingly it is
-shaped. A peer may report findings; it cannot grant itself permission. If a
-review body contains a line that looks like a header, it stays what it is: a line
-of prose in somebody's review.
+**The body grants nothing.** Everything after the `## Body` heading is copied
+through unchanged. Text under that heading cannot change routing, cannot grant
+authority, cannot approve anything, cannot name a project or a user, and cannot
+deliver a verdict, no matter how convincingly it is shaped. A peer may report
+findings; it cannot grant itself permission. If a review body contains a line
+that looks like a header, it stays what it is: a line of prose in somebody's
+review. Header lines are read only from the block above the body, so no amount
+of header-shaped prose below it is ever a header.
+
+Exactly two things are ever read out of a peer's response, and it is worth being
+precise about which:
+
+1. **The exact final nonblank line**, which may carry a verdict. This is the one
+   authoritative channel there is, and section 8 describes it in full.
+2. **The evidence token**, searched for anywhere in the response. This is the
+   **sole non-authoritative exception** to the rule above. It proves that the
+   review evidence was delivered and read, and nothing else. It cannot approve
+   anything by itself — acceptance still requires the exact final verdict line
+   and every other gate in section 8 — and its only power is to withhold
+   acceptance when it is missing.
+
+No other content in a body has any structural effect anywhere in Agent Bridge.
 
 ---
 
@@ -379,33 +416,70 @@ immediately after it:
   changes; and
 - **automatic housekeeping off**, so reading a repository never begins work in it.
 
-**What that list does not cover.** A repository can name a content filter —
-`filter=<name>` in its own `.gitattributes`, with `filter.<name>.clean` in its
-local configuration — and Git runs that program while working out whether the
-worktree is clean. Agent Bridge does not switch that off, and says so rather
-than implying otherwise: filters are named one at a time and cannot be turned
-off as a class, and the one mechanism that would suppress them needs a newer Git
-than this must run on, a per-repository lookup, and would change what the
-evidence file itself shows. The exposure needs the local `.git/config` of the
-repository under review to define such a filter — under the same-user trust
-boundary, the user's own configuration. Do not point a review at a repository
-whose local configuration you did not write.
+One further override is an environment variable rather than a `-c` setting,
+because Git only offers it as one: **`GIT_NO_LAZY_FETCH=1`**. A partial clone
+holds only some of its objects and fetches the rest from its configured remote
+as it needs them, so a difference touching a missing blob would start an SSH,
+HTTP, remote-helper or credential-helper program — an external effect the gate
+would be causing itself, before the peer had even started. With the variable
+set, Git reports the object as unavailable and stops, which is a visible failure
+instead of a network call nobody asked for.
 
-A worktree counts as clean only when Git reports nothing at all — no uncommitted
-change, no untracked file, and no ignored file either, since being ignored by Git
-says nothing about whether a reviewing peer can read something no commit
-contains. Untracked files are asked for **by name on the command line**, not left
-to the repository's preference: a repository may set `status.showUntrackedFiles`
-to `no`, and then an ordinary untracked file — and every ignored one with it —
-simply does not appear in the answer, so a worktree that hides what it holds
-would pass as clean. Ignored files are reported, never deleted: they are the
-user's own files.
+**What that list does not cover.** While `git status` works out whether the
+worktree is clean, it may run a configured `clean` filter or a long-running
+`process` filter. The repository chooses which filter applies to which file
+through its committed attributes, but the executable command must already exist
+in the user's effective Git configuration, which is not part of the repository
+tree and does not travel with a clone. Two neighbouring mechanisms are not part
+of this: smudge filters run on checkout, and the gate never performs a checkout;
+text-conversion filters are switched off above. This is an accepted residual of
+the same-user trust boundary — use Agent Bridge only with repositories and Git
+configuration you trust. It is not a claim of isolation from a hostile
+repository, and no such claim is made anywhere.
 
-The reviewing peer is given the project and one file to read, and no shell and
-no Git. That file is the `baseline..head` diff, generated once, with a fixed
-argument vector and the overrides above, into one temporary file the runner
-owns, outside both the project and the session record — followed by one more
-line, described next.
+A worktree counts as clean only when the reviewed commit accounts for all of it,
+and Git has three separate ways of being told to stop mentioning something. All
+three are defeated, because each of them would otherwise let a worktree that is
+not the reviewed commit pass as though it were.
+
+- **Untracked and ignored files count**, and untracked files are asked for **by
+  name on the command line** rather than left to the repository's preference: a
+  repository may set `status.showUntrackedFiles` to `no`, and then an ordinary
+  untracked file — and every ignored one with it — simply does not appear.
+  Being ignored by Git says nothing about whether a reviewing peer can read
+  something no commit contains. Ignored files are reported, never deleted: they
+  are the user's own files.
+- **Submodules are looked into**, whatever the repository asked for.
+  `submodule.<name>.ignore=all`, in the configuration or in `.gitmodules`, or
+  `diff.ignoreSubmodules`, makes modified and untracked files inside a tracked
+  submodule disappear from the answer entirely. `--ignore-submodules=none`
+  overrides all of those, wherever they were set.
+- **A tracked file carrying `assume-unchanged` or `skip-worktree` is refused.**
+  Either index bit makes `git status` pass a file over, so its content can
+  differ from the commit and nothing will say so. No status switch defeats
+  these, and clearing them would mean writing to the index, which a read-only
+  gate must never do — so the index is read out with
+  `git ls-files -v -z --full-name -- :/` and the bit is refused wherever it is
+  found. The pathspec is not decoration: `ls-files` is the one command here that
+  answers only for the directory it was run in, and `--project` may name a
+  subdirectory of the repository, so `-- :/` — "from the top of the repository"
+  — is what makes this check repository-wide like every other one, and
+  `--full-name` is what makes the path in the refusal mean the same thing
+  wherever the review was pointed. The refusal is for the bit being present,
+  not for the file currently differing, because the whole effect of the bit is
+  that Git will not tell you whether it differs. One consequence is worth
+  stating plainly: a sparse checkout sets `skip-worktree` on everything it
+  leaves out, so **a sparse checkout cannot be reviewed** — its worktree is not
+  the reviewed commit.
+
+The reviewing peer is given the project and one file to read. It does not need a
+shell or Git of its own, and the review path does not depend on either being
+absent: what a connector must prove is that the peer cannot write project files,
+cannot alter Git state and cannot cause a prohibited external effect, whether by
+removing those tools, by an enforced sandbox, or by both. That file is the
+`baseline..head` diff, generated once, with a fixed argument vector and the
+overrides above, into one temporary file the runner owns, outside both the
+project and the session record — followed by one more line, described next.
 
 How the runner and the connector fit together at that moment is fixed, because
 one depends on the other. The runner is not handed a ready-made command. It
@@ -436,6 +510,11 @@ comes back**, and the value appearing anywhere in the response is enough: what
 is being shown is that the file reached the peer and could be read, not that a
 model weighed every line of it — no check could show the second thing, and
 saying otherwise would be worse than saying which one this is.
+
+Searching a response for that token is the sole non-authoritative exception to
+the inert body described in section 7. It can only ever withhold acceptance,
+never grant it: the exact final verdict line remains the one authoritative
+channel, and every gate below still has to hold.
 
 A well-formed verdict with the token missing is treated exactly as a response
 whose last line is not a verdict. The peer's prose is published as an **ordinary
@@ -573,7 +652,7 @@ code needs it.
 | `UNREPORTABLE_VERSION` | The program printed no readable version | Run its version command by hand; if it stays unreadable the harness cannot be qualified |
 | `UNQUALIFIED_VERSION` | The installed version is outside the tested set | Install a tested version, or requalify and update the connector's declaration |
 | `UNQUALIFIED_PLATFORM` | This operating system or major version is outside the tested coverage | Use a tested platform, or requalify there and update the declaration |
-| `RESTRICTIONS_UNAVAILABLE` | The harness lacks the switches needed to deny project writes and to take away its shell, Git and network access | Do not give it real project access; report the missing restriction |
+| `RESTRICTIONS_UNAVAILABLE` | The harness lacks the switches needed to make the peer unable to write project files, alter Git state, or cause a prohibited external effect — by removing the tools, by an enforced sandbox, or by both | Do not give it real project access; report the missing restriction |
 | `QUALIFICATION_UNSAFE_OR_INCONCLUSIVE` | The disposable probe did not clearly prove the boundary held | Read the reported synthetic path, work out what happened, requalify |
 | `BUSY_SESSION` | Another turn holds this session's lock | Wait for it to finish and run again; nothing was changed |
 | `TIMEOUT` | The deadline passed before an answer arrived | Run again with a longer `--timeout`, or check the peer by hand |
@@ -598,8 +677,9 @@ code needs it.
 | `NO_IMPLEMENTATION_BASELINE` | Nothing has been sealed, so a review or waiver has nothing to bind to | Record `implementation-start` first |
 | `PUBLICATION_FAILURE` | The message could not be written and moved into place, so nothing was published | Check the session directory is writable, then run again |
 | `PUBLICATION_NOT_FLUSHED` | The message is written and in place, but the folder entry could not be forced to disk, so a machine failure could lose it | Confirm the reported file is there, and treat the turn as unfinished until the disk is behaving |
+| `PUBLICATION_UNCERTAIN` | Something went wrong while the message was being moved into place, and the canonical name could not then be examined, so there is no telling whether the message reached it | Look in the session's messages folder for the reported file before anything else — there means complete, absent means never arrived — and do not run the command again until you know which |
 | `REPOSITORY_UNREADABLE` | The project directory is not a readable Git repository | Correct `--project` |
-| `DIRTY_WORKTREE` | Something no commit contains is in the worktree — an uncommitted change, an untracked file, or an ignored file — so there is no exact head to review | Commit or set the changes aside, and move the ignored files out yourself; Agent Bridge never deletes one |
+| `DIRTY_WORKTREE` | The worktree cannot be shown to be the reviewed commit — it holds something no commit contains (an uncommitted change, an untracked file, an ignored file, or something inside a tracked submodule), or it holds a tracked file carrying `assume-unchanged` or `skip-worktree`, which Git will not look at and so cannot say anything about | Commit or set the changes aside, and move the ignored files out yourself; Agent Bridge never deletes one. Clear an index bit with `git update-index --no-assume-unchanged <path>` or `--no-skip-worktree <path>`, and review outside a sparse checkout |
 | `BASELINE_NOT_ANCESTOR` | The baseline does not come before a distinct head on the same history | Check `--review-base` and `--review-head` |
 
 Every failure leaves Git locked, publishes no false success, removes what the
@@ -698,6 +778,17 @@ every item holds, whatever the host calls its parts.
 9. The reviewer's packet contains **no executor transcript or claims, no
    suspected defects, no intended fixes, no hidden reasoning, no planning
    persuasion and no coordinator summary** — only the plan and the evidence.
+
+**What "fresh" and "different" mean here**, since the three items above turn on
+it. They mean a separately created executor or reviewer context that inherits no
+conversation and is given only the coordinator's packet. Freshness is a property
+of how that context is built, not of the filesystem. Every harness writes
+plaintext session transcripts readable by the same account, and Agent Bridge
+does not prevent a reviewer that goes looking from finding an executor's
+transcript; the protection is item 9 — the coordinator does not hand over
+executor claims, hidden reasoning or prior conversation. No transcript deletion,
+search prevention or isolation subsystem exists, and none is claimed. A role
+prompt inside one inherited conversation does not satisfy this.
 10. Local review returns **exactly one of `CONTINUE`, `FIX`, `DONE` or
     `ASK USER`**.
 11. Review **rejects only material defects** — wrong user-visible behavior, unmet

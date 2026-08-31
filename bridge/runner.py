@@ -79,6 +79,16 @@ that the file reached the peer and could be read, not that a model weighed every
 line of it - no check could show the second thing, and pretending otherwise
 would be worse than saying which one this is.
 
+**Looking for that value is the sole non-authoritative exception to the inert
+body.** Exactly two things are ever read out of a peer's response. The first is
+the exact final nonblank line, which may carry a verdict, and that is the one
+authoritative channel there is. The second is this token, and it can only ever
+take acceptance away: it proves the evidence was delivered and nothing else, it
+approves nothing by itself, and a response containing it still has to pass the
+exact verdict line and every other gate. No other text in a body has any
+structural effect - it cannot grant authority, change routing, name a project or
+a user, or approve anything, however it is shaped.
+
 The published request names the evidence file in a `Review-Evidence:` line, and
 it is worth being exact about what that line is for. It is this turn's own note
 of what it generated, kept so that whoever reads the session afterwards can see
@@ -262,7 +272,15 @@ def run_turn(
         # publishing the request, reading the answer. A termination or a hangup
         # in one of those has to raise rather than end the process where it
         # stands, or the `finally` below never gets to delete the file.
-        with stopped_by_signal():
+        #
+        # The deletion itself is the exception, and it is arranged the way
+        # `run_bounded` already arranges its own cleanup: a stop arriving while
+        # the file is being removed is written down instead of raised, so it
+        # cannot abandon the removal and leave the evidence on the disk with
+        # nothing reporting it. `raise_if_stopped` then comes after the whole
+        # try/finally, so a genuine failure already on its way out wins, and a
+        # stop that arrived only during cleanup is raised once the file is gone.
+        with stopped_by_signal() as watch:
             try:
                 if review:
                     evidence = gitgate.generate_review_evidence(
@@ -367,7 +385,9 @@ def run_turn(
                     else:
                         verdict = result.verdict
             finally:
-                gitgate.delete_review_evidence(evidence)
+                with watch.deferring():
+                    gitgate.delete_review_evidence(evidence)
+            watch.raise_if_stopped()
 
         # These run whatever the answer looked like. A repository that moved
         # while the review was being written is the more important fact, and
