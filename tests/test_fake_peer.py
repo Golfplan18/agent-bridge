@@ -7,22 +7,28 @@ lock left behind by a process that was killed outright blocks nobody, that being
 told to stop cleans up what a turn started, and that nothing this turn started
 is still running when it returns.
 
-Four of the checks are about exactly *when* a stop arrives, because the awkward
+Five of the checks are about exactly *when* a stop arrives, because the awkward
 moments are short ones. A stop while the child is being created, before anything
 knows which process group to end. A second stop while that group is being
 emptied. A stop in the instant after a message has been renamed into place,
-which must never be reported as though nothing had been published. And a stop
-inside the removal of the temporary file a failed publication leaves behind,
-which must not become a way of leaving that file on the disk. Each is made to
-happen at the exact moment rather than waited for, by standing in front of the
-one step it has to land on.
+which must never be reported as though nothing had been published. A stop inside
+the removal of the temporary file a failed publication leaves behind, which must
+not become a way of leaving that file on the disk. And a real termination signal
+arriving in the middle of an ordinary, perfectly healthy publication - after the
+temporary file has been made and before the message is moved into place - which
+must not end the process outright and leave that file in the session folder.
+Each is made to happen at the exact moment rather than waited for, by standing
+in front of the one step it has to land on.
 
-Two more are about publication going wrong in ways that are easy to report
-untruthfully. A temporary file that will not be removed has to be named, because
-otherwise nothing tells the person it is there. And a rename whose outcome
-cannot be established afterwards has to be reported as exactly that - not as
-"nothing was published", which would send somebody to run a command again over a
-message that is already on the disk.
+One more is about publication going wrong in a way that is easy to report
+untruthfully: a temporary file that will not be removed has to be named,
+because otherwise nothing tells the person it is there.
+
+One is about the connector, which composes the peer command rather than handing
+one over ready-made. Whatever a connector starts in order to do that - asking
+the harness its version, whether it is signed in, whether the restriction
+switches are there - is bounded by the turn's own deadline, and a builder that
+outruns that deadline never gets a peer started and never publishes a request.
 
 Everything below exercises the real thing. Real processes are started, real
 files are written, real locks are taken out in separate processes, real signals
@@ -36,7 +42,6 @@ SPDX-License-Identifier: Unlicense
 
 from __future__ import annotations
 
-import glob
 import os
 import re
 import shutil
@@ -52,7 +57,7 @@ REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if REPO_ROOT not in sys.path:
     sys.path.insert(0, REPO_ROOT)
 
-from bridge import gitgate, peer, record, runner, session  # noqa: E402
+from bridge import peer, record, runner, session  # noqa: E402
 from bridge.connectors import PeerCommand  # noqa: E402
 from bridge.errors import BridgeError, Failure  # noqa: E402
 from bridge.locking import lock_path, session_lock  # noqa: E402
@@ -148,6 +153,38 @@ SECOND_STOP_DRIVER = (
     + _DRIVER_CALL
 )
 
+#: Publishes one ordinary message and stands still in front of the rename, so a
+#: termination signal sent from outside lands in the one window where the
+#: temporary file exists and the message is not yet in place. Nothing is broken
+#: here: this is a healthy publication interrupted at its most awkward instant.
+#: It writes a marker file the moment it is waiting, so the check signals it
+#: rather than guessing when to. Its arguments are the message to publish and
+#: that marker path, and it exits 3 when it leaves as the stop it was.
+PUBLISH_STOP_DRIVER = (
+    "import os, sys, time\n"
+    "sys.path.insert(0, sys.argv[1])\n"
+    "from bridge import peer, session\n"
+    "target, marker = sys.argv[3], sys.argv[4]\n"
+    "real_replace = os.replace\n"
+    "def replace(source, destination):\n"
+    "    with open(marker, 'w', encoding='utf-8') as stream:\n"
+    "        stream.write('READY\\n')\n"
+    "        stream.flush()\n"
+    "        os.fsync(stream.fileno())\n"
+    "    limit = time.monotonic() + 60.0\n"
+    "    while time.monotonic() < limit:\n"
+    "        time.sleep(0.02)\n"
+    "    return real_replace(source, destination)\n"
+    "os.replace = replace\n"
+    "try:\n"
+    "    session.publish(\n"
+    "        target,\n"
+    "        '# Message 0001\\nRecord: user-correction\\nFrom: codex\\n',\n"
+    "    )\n"
+    "except peer.SignalStop:\n"
+    "    sys.exit(3)\n"
+)
+
 
 def _wait_for(condition, timeout=SHORT_WAIT):
     limit = time.monotonic() + timeout
@@ -195,7 +232,6 @@ class TurnBehavior(unittest.TestCase):
         self.holders = []
         self.drivers = []
         self.strays = []
-        self.evidence_before = self._evidence_files()
 
     def tearDown(self):
         for holder in self.holders:
@@ -220,39 +256,58 @@ class TurnBehavior(unittest.TestCase):
                     os.kill(pid, signal.SIGKILL)
                 except OSError:
                     pass
-        self.assertEqual(
-            self._evidence_files(),
-            self.evidence_before,
-            "a review-evidence file outlived the turn that made it",
-        )
         shutil.rmtree(self.temp, ignore_errors=True)
 
     # -- helpers -----------------------------------------------------------
 
-    def _evidence_files(self):
-        pattern = os.path.join(
-            tempfile.gettempdir(), gitgate.REVIEW_EVIDENCE_PREFIX + "*"
-        )
-        return set(glob.glob(pattern))
-
     def _builder(self, mode, *extra):
         """What the runner calls to compose the command for one turn.
 
-        The runner hands a builder the review-evidence path when it has one,
-        and this turn's deadline so that anything the builder starts is bounded
-        by it. None of the turns here are reviews, so what arrives is None, and
-        this builder declares that it granted the peer no project and no
-        evidence file - which is what the runner requires it to say.
+        The runner hands a builder this turn's deadline, so that anything the
+        builder starts is bounded by it, and takes back the fixed argument
+        vector to run.
         """
         argv = (sys.executable, FAKE_PEER, mode) + tuple(extra)
 
-        def build(evidence_path, deadline):
+        def build(deadline):
             return PeerCommand(
                 argv=argv,
                 cwd=self.temp,
                 env=tuple(os.environ.items()),
-                project_root=None,
-                review_evidence=evidence_path,
+            )
+
+        return build
+
+    def _precheck_builder(self, seconds):
+        """A connector whose own precheck runs longer than the turn allows.
+
+        A real connector asks the harness its version, whether it is signed in,
+        and whether the restriction switches are there. Those are programs, and
+        they run inside the turn's deadline through the same bounded runner
+        everything else uses. This one stands in for a precheck that hangs.
+        """
+
+        def build(deadline):
+            peer.run_bounded(
+                argv=(sys.executable, FAKE_PEER, "hang", str(seconds)),
+                cwd=self.temp,
+                env=tuple(os.environ.items()),
+                stdin_text="",
+                deadline=deadline,
+            )
+            raise AssertionError("the precheck outlasted the deadline")
+
+        return build
+
+    def _late_builder(self):
+        """A connector that finishes, but only after the deadline has passed."""
+
+        def build(deadline):
+            time.sleep(max(0.0, deadline.remaining()) + 0.05)
+            return PeerCommand(
+                argv=(sys.executable, FAKE_PEER, "plain"),
+                cwd=self.temp,
+                env=tuple(os.environ.items()),
             )
 
         return build
@@ -362,8 +417,6 @@ class TurnBehavior(unittest.TestCase):
 
         self.assertEqual(result.request_sequence, 1)
         self.assertEqual(result.response_sequence, 2)
-        self.assertIsNone(result.verdict)
-        self.assertFalse(result.git_unlocked)
         self.assertEqual(
             self._messages(),
             ["0001-local-to-peer.md", "0002-peer-to-local.md"],
@@ -624,60 +677,6 @@ class TurnBehavior(unittest.TestCase):
         real_unlink(left)
         self.assertEqual(self._leftover_temporaries(), [])
 
-    def test_a_rename_that_cannot_be_checked_is_not_called_nothing_published(
-        self,
-    ):
-        """When there is no telling, saying there is would be the lie.
-
-        The rename really happens, the filesystem then reports an ambiguous
-        failure anyway, and the follow-up look at the canonical name fails too.
-        The message is on the disk and complete - but nothing in this process
-        can know that.
-
-        Calling it `PUBLICATION_FAILURE` would tell the person nothing was
-        published and to run the command again, which is exactly wrong: the
-        message is there, and running again would write a second one. So the
-        third answer gets its own failure, which names the file and asks them
-        to go and look.
-        """
-        target = session.message_path(
-            self.session_dir, 1, session.LOCAL_RECORD_SUFFIX
-        )
-        text = "# Message 0001\nRecord: technical-error\nFrom: codex\n"
-        real_replace = os.replace
-        real_stat = os.stat
-
-        def replace_then_fail_ambiguously(source, destination):
-            real_replace(source, destination)
-            raise OSError("forced ambiguous input/output error")
-
-        def stat_that_will_not_answer(path, *args, **kwargs):
-            if path == target:
-                raise OSError("forced failure looking at the canonical name")
-            return real_stat(path, *args, **kwargs)
-
-        with mock.patch("os.replace", replace_then_fail_ambiguously):
-            with mock.patch("os.stat", stat_that_will_not_answer):
-                with self.assertRaises(BridgeError) as caught:
-                    session.publish(target, text)
-
-        self.assertEqual(
-            caught.exception.failure, Failure.PUBLICATION_UNCERTAIN
-        )
-        rendered = str(caught.exception)
-        self.assertIn(target, rendered)
-        self.assertNotIn("nothing was published", rendered)
-        self.assertNotIn("then run the command again", rendered)
-        self.assertIn("Do not run the command again", rendered)
-
-        self.assertTrue(
-            os.path.exists(target),
-            "the message really was published, so this check proves nothing",
-        )
-        with open(target, encoding="utf-8") as stream:
-            self.assertEqual(stream.read(), text)
-        self.assertEqual(self._leftover_temporaries(), [])
-
     def test_a_stop_before_the_rename_leaves_nothing_and_is_not_a_failure(self):
         """Stopped is stopped: nothing published, and nothing blamed on this."""
         target = session.message_path(
@@ -743,6 +742,53 @@ class TurnBehavior(unittest.TestCase):
         )
         self.assertEqual(self._messages(), [])
         self.assertEqual(self._leftover_temporaries(), [])
+
+    def test_a_stop_between_the_temporary_file_and_the_rename_leaves_nothing(
+        self,
+    ):
+        """A healthy publication, stopped at its most awkward instant.
+
+        Between the temporary file being made and the message being moved into
+        place there is a stretch where the file exists under a name nothing has
+        published. A real termination signal arriving there used to end the
+        process outright: the handlers only went on once publication had already
+        failed, so nothing caught the signal, none of the tidying ran, and a
+        `.agent-bridge-publish-` file was left in the session folder with
+        nothing to say it was there.
+
+        Nothing is broken in this check. The publication is an ordinary healthy
+        one, the signal is a real SIGTERM, and it is sent to a separate process
+        so that this one survives sending it. The driver stands still in front
+        of the rename so the signal cannot land anywhere but inside that
+        stretch. The call must leave as the stop it was, and the session folder
+        must be exactly as it was found.
+        """
+        target = session.message_path(
+            self.session_dir, 1, session.LOCAL_RECORD_SUFFIX
+        )
+        marker = os.path.join(self.temp, "ready-to-be-stopped.txt")
+        driver = self._start_driver(PUBLISH_STOP_DRIVER, target, marker)
+
+        self.assertTrue(
+            _wait_for(lambda: os.path.exists(marker)),
+            "the driver never reached the rename",
+        )
+        os.kill(driver.pid, signal.SIGTERM)
+        driver.wait(timeout=SHORT_WAIT)
+
+        self.assertEqual(
+            driver.returncode,
+            3,
+            driver.stderr.read().decode("utf-8", "replace"),
+        )
+        self.assertFalse(
+            os.path.exists(target), "nothing should have been published"
+        )
+        self.assertEqual(
+            self._leftover_temporaries(),
+            [],
+            "a stop before the rename left the temporary file on the disk",
+        )
 
     # -- the lock ----------------------------------------------------------
 
@@ -813,6 +859,33 @@ class TurnBehavior(unittest.TestCase):
     def test_whitespace_only_output_publishes_no_response(self):
         self._expect(Failure.EMPTY_RESPONSE, "whitespace", body="Say air.\n")
         self.assertEqual(self._messages(), ["0001-local-to-peer.md"])
+
+    # -- the connector composes the command ---------------------------------
+
+    def test_a_connector_precheck_runs_inside_the_turn_deadline(self):
+        """A connector's own programs are bounded by the turn, not extra to it.
+
+        Two shapes of the same rule. A precheck that hangs is stopped by the
+        deadline it was handed, and a builder that comes back after the deadline
+        has passed is refused before its command is ever run. Neither publishes
+        anything at all, because nothing was ever sent.
+        """
+        for name, build in (
+            ("a precheck that hangs", self._precheck_builder(30.0)),
+            ("a builder that returns late", self._late_builder()),
+        ):
+            with self.subTest(builder=name):
+                with self.assertRaises(BridgeError) as caught:
+                    runner.run_turn(
+                        self.session_dir,
+                        "claude",
+                        "Please answer this.\n",
+                        build,
+                        2.0,
+                    )
+                self.assertEqual(caught.exception.failure, Failure.TIMEOUT)
+                self.assertEqual(self._messages(), [])
+                self.assertEqual(self._leftover_temporaries(), [])
 
     # -- nothing is left running -------------------------------------------
 

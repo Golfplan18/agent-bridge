@@ -37,14 +37,6 @@ class Failure(enum.Enum):
     TIMEOUT = "TIMEOUT"
     PEER_FAILURE = "PEER_FAILURE"
     EMPTY_RESPONSE = "EMPTY_RESPONSE"
-    INVALID_VERDICT = "INVALID_VERDICT"
-
-    # Binding a review to the exact code that was reviewed.
-    REPOSITORY_CHANGED = "REPOSITORY_CHANGED"
-    BASELINE_CHANGED = "BASELINE_CHANGED"
-    HEAD_CHANGED = "HEAD_CHANGED"
-    REVIEW_EVIDENCE_UNAVAILABLE = "REVIEW_EVIDENCE_UNAVAILABLE"
-    REVIEW_EVIDENCE_NOT_DELIVERED = "REVIEW_EVIDENCE_NOT_DELIVERED"
     CLEANUP_FAILURE = "CLEANUP_FAILURE"
 
     # Calling the commands correctly.
@@ -58,16 +50,8 @@ class Failure(enum.Enum):
     SESSION_INVALID = "SESSION_INVALID"
     SESSION_EXISTS = "SESSION_EXISTS"
     PLAN_SEALED = "PLAN_SEALED"
-    IMPLEMENTATION_ALREADY_SEALED = "IMPLEMENTATION_ALREADY_SEALED"
-    NO_IMPLEMENTATION_BASELINE = "NO_IMPLEMENTATION_BASELINE"
     PUBLICATION_FAILURE = "PUBLICATION_FAILURE"
     PUBLICATION_NOT_FLUSHED = "PUBLICATION_NOT_FLUSHED"
-    PUBLICATION_UNCERTAIN = "PUBLICATION_UNCERTAIN"
-
-    # Reading the project repository.
-    REPOSITORY_UNREADABLE = "REPOSITORY_UNREADABLE"
-    DIRTY_WORKTREE = "DIRTY_WORKTREE"
-    BASELINE_NOT_ANCESTOR = "BASELINE_NOT_ANCESTOR"
 
 
 # For each failure: what happened, then the single next action.
@@ -136,53 +120,7 @@ _GUIDANCE: Dict[Failure, Tuple[str, str]] = {
     ),
     Failure.EMPTY_RESPONSE: (
         "The peer produced no text at all, so there is nothing to publish.",
-        "Check the peer harness by hand, then run the turn again; Git stays "
-        "locked in the meantime.",
-    ),
-    Failure.INVALID_VERDICT: (
-        "The review response did not end with one of the three exact verdict "
-        "lines, so it is not a decision Agent Bridge can act on. The peer's "
-        "text was kept as an ordinary message carrying no review authority.",
-        "Read the kept message if it is useful, then run the review again; "
-        "this is a technical error, never an acceptance, and Git stays locked "
-        "until a fresh review returns an exact ACCEPT.",
-    ),
-    Failure.REPOSITORY_CHANGED: (
-        "The repository in play is not the one sealed when implementation "
-        "started.",
-        "Point the turn at the sealed repository, or start a new session for "
-        "the different repository.",
-    ),
-    Failure.BASELINE_CHANGED: (
-        "The review baseline is not the baseline commit sealed when "
-        "implementation started.",
-        "Run the review again using the sealed baseline commit.",
-    ),
-    Failure.HEAD_CHANGED: (
-        "The task branch moved, so the review no longer describes the code that "
-        "is actually there.",
-        "Run a fresh review against the current head; the earlier verdict no "
-        "longer applies to it.",
-    ),
-    Failure.REVIEW_EVIDENCE_UNAVAILABLE: (
-        "The file holding the difference a reviewer has to read could not be "
-        "created or written, so there is nothing to give the reviewer.",
-        "Free space on the temporary filesystem, or point TMPDIR at a "
-        "directory this account can write to, then run the review again.",
-    ),
-    Failure.REVIEW_EVIDENCE_NOT_DELIVERED: (
-        "The review evidence did not reach the peer, or did not reach it "
-        "intact: the connector granted something other than the exact file "
-        "this turn wrote, or that file was changed while the peer had it, or "
-        "the peer answered without the token that appears only inside it - so "
-        "there is no showing that the difference was ever read. When the peer "
-        "did answer, its text was kept as an ordinary message carrying no "
-        "review authority.",
-        "Make the connector grant the peer exactly the project root and the "
-        "evidence path it was handed and make sure the peer reads that file "
-        "and copies its Agent-Bridge-Evidence-Token line into its answer, then "
-        "run the review again; this is never an acceptance, and Git stays "
-        "locked until a fresh review returns an exact ACCEPT.",
+        "Check the peer harness by hand, then run the turn again.",
     ),
     Failure.CLEANUP_FAILURE: (
         "A file or process this turn created could not be removed, so the turn "
@@ -205,9 +143,9 @@ _GUIDANCE: Dict[Failure, Tuple[str, str]] = {
         "Use a harness whose connector ships in this build.",
     ),
     Failure.UNKNOWN_RECORD_KIND: (
-        "That record kind is not one of the six the record command accepts.",
+        "That record kind is not one of the five the record command accepts.",
         "Name one of: session-create, user-correction, plan-approval, "
-        "technical-error, implementation-start, user-waiver.",
+        "technical-error, implementation-start.",
     ),
     Failure.SESSION_NOT_FOUND: (
         "There is no session record at the given directory.",
@@ -232,18 +170,6 @@ _GUIDANCE: Dict[Failure, Tuple[str, str]] = {
         "If the user has approved a replacement plan, record it again with "
         "--replace; otherwise leave the sealed plan alone.",
     ),
-    Failure.IMPLEMENTATION_ALREADY_SEALED: (
-        "This session already sealed a repository and baseline when "
-        "implementation started, and that pairing cannot be changed.",
-        "Continue against the sealed repository and baseline, or start a new "
-        "session for different work.",
-    ),
-    Failure.NO_IMPLEMENTATION_BASELINE: (
-        "This session has no implementation-start record, so there is no sealed "
-        "repository and baseline to bind a review or a waiver to.",
-        "Record implementation-start with the project and baseline commit "
-        "before requesting a review or recording a waiver.",
-    ),
     Failure.PUBLICATION_FAILURE: (
         "The message could not be written in full and moved into place, so "
         "nothing was published and the record is unchanged.",
@@ -256,41 +182,6 @@ _GUIDANCE: Dict[Failure, Tuple[str, str]] = {
         "machine failure could still lose it.",
         "Confirm the reported file is there and readable, and treat this turn "
         "as unfinished until the session directory's disk is behaving.",
-    ),
-    Failure.PUBLICATION_UNCERTAIN: (
-        "Something went wrong while the message was being moved into place, "
-        "and the canonical name could not then be examined, so there is no "
-        "telling whether the message reached it.",
-        "Look in the session's messages folder for the reported file before "
-        "you do anything else: if it is there, the message is complete and "
-        "the writing is finished; if it is absent, the message never arrived. "
-        "Do not run the command again until you know which of the two it is.",
-    ),
-    Failure.REPOSITORY_UNREADABLE: (
-        "The given project directory could not be read as a Git repository.",
-        "Correct the --project path so it points at a Git repository you can "
-        "read.",
-    ),
-    Failure.DIRTY_WORKTREE: (
-        "The worktree cannot be shown to be the exact committed head a "
-        "reviewer would judge. Either it holds something no commit contains - "
-        "an uncommitted change, an untracked file, or a file Git has been told "
-        "to ignore - or it holds a tracked file Git has been told not to look "
-        "at, which means Git cannot say whether that file matches the commit "
-        "or not.",
-        "Commit or set aside the outstanding changes, and move the ignored "
-        "files out of the worktree yourself - Agent Bridge never deletes one. "
-        "For a tracked file Git is not looking at, clear the bit with "
-        "git update-index --no-assume-unchanged <path> or git update-index "
-        "--no-skip-worktree <path>, and review outside a sparse checkout, "
-        "which sets skip-worktree on everything it leaves out. Then run the "
-        "review again.",
-    ),
-    Failure.BASELINE_NOT_ANCESTOR: (
-        "The baseline commit does not come before a different task head on the "
-        "same history, so a cumulative diff would not describe the work.",
-        "Check --review-base and --review-head; the baseline must be an "
-        "ancestor of a distinct head.",
     ),
 }
 

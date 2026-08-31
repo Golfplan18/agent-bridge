@@ -49,8 +49,8 @@ yet.
 ## Interface
 
 `INTERFACE.md` is the frozen interface: the harness identifiers, the commands,
-the session record and message formats, the verdict rules, the internal failure
-list, what a native package must do, and the neutral Programming Loop contract.
+the session record and message formats, the internal failure list, what a native
+package must do, and the neutral Programming Loop contract.
 
 ## License
 

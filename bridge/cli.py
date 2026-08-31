@@ -79,8 +79,6 @@ def build_parser() -> argparse.ArgumentParser:
     record.add_argument("--workflow")
     record.add_argument("--project")
     record.add_argument("--baseline")
-    record.add_argument("--head")
-    record.add_argument("--waived")
     record.add_argument("--replace", action="store_true")
 
     return parser
@@ -107,13 +105,11 @@ def _run(args: argparse.Namespace) -> str:
             detail="--review-base and --review-head are required together",
         )
     # The connector resolved here is what the runner is given as its command
-    # builder: the runner generates the review evidence first, then calls this
-    # connector with that exact path and with the turn's deadline, so it can
-    # name the file in the restriction switches of the fixed argument vector it
-    # composes, declare the two paths it granted, and run any precheck of its
-    # own inside the same deadline. The runner then runs that vector. This
-    # build ships no connector, so the turn stops here - there is nothing to
-    # hand over - rather than inventing a peer.
+    # builder: the runner calls it with the turn's deadline, so it can run any
+    # precheck of its own inside that deadline and compose the fixed argument
+    # vector, and the runner then runs that vector. This build ships no
+    # connector, so the turn stops here - there is nothing to hand over -
+    # rather than inventing a peer.
     connectors.resolve(args.peer)
     raise BridgeError(Failure.CONNECTOR_UNAVAILABLE, detail=args.peer)
 
@@ -128,8 +124,6 @@ def _record(args: argparse.Namespace) -> str:
         workflow=args.workflow,
         project=args.project,
         baseline=args.baseline,
-        head=args.head,
-        waived=args.waived,
         replace=args.replace,
     )
 

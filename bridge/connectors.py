@@ -75,23 +75,11 @@ class PeerCommand(NamedTuple):
     There is deliberately no prompt field and no command string. The outgoing
     Markdown body always reaches the peer on standard input, so prompt text
     never passes through a command line or a shell.
-
-    The last two fields are the connector saying, in plain terms, what it has
-    granted this peer read access to with the restriction switches it put in
-    `argv`: the project root, and the one review-evidence file. Neither has a
-    default, because a connector that did not think about them must not be
-    able to look as though it had. `None` is a real answer and means "none of
-    this kind" - a turn with no project, or a turn that is not a review. The
-    runner compares both against what it actually made, and refuses to start
-    the peer if they disagree, so a reviewer cannot end up reading something
-    other than the difference the runner wrote.
     """
 
     argv: Tuple[str, ...]
     cwd: str
     env: Tuple[Tuple[str, str], ...]
-    project_root: Optional[str]
-    review_evidence: Optional[str]
 
 
 def _switch(harness_id: str) -> Optional[Any]:

@@ -1,10 +1,9 @@
 """Starting one program, waiting for one answer, and leaving nothing behind.
 
-Everything Agent Bridge starts - a peer harness or the local Git program - is
-started here, the same way, under the same deadline, and cleaned up the same
-way. There is one function worth understanding, `run_bounded`, and the care in
-it is all about two questions: what may be started, and what must be gone
-afterwards.
+Everything Agent Bridge starts is started here, the same way, under the same
+deadline, and cleaned up the same way. There is one function worth
+understanding, `run_bounded`, and the care in it is all about two questions:
+what may be started, and what must be gone afterwards.
 
 **What may be started.** A fixed list of arguments, with no shell anywhere. The
 outgoing Markdown goes down the program's standard input and nowhere else, so
@@ -68,10 +67,9 @@ The consequence for connectors is concrete: a harness command-line program that
 daemonizes during a turn puts its work beyond this cleanup and must therefore
 fail qualification.
 
-The deadline covers the useful work: prechecks, evidence generation, the call
-and the answer. Cleanup afterwards gets its own separate bounded grace, because
-a deadline that has already run out cannot be used to decide how long to wait
-for a process to die.
+The deadline covers the useful work: prechecks, the call and the answer. Cleanup
+afterwards gets its own separate bounded grace, because a deadline that has
+already run out cannot be used to decide how long to wait for a process to die.
 
 SPDX-License-Identifier: Unlicense
 """
@@ -106,8 +104,8 @@ class Deadline(object):
     """One deadline for a whole turn, made once and passed down.
 
     Created at the start of a `run` and handed to every bounded step, so
-    prechecks, review-evidence generation, the peer call and reading the answer
-    all draw on the same budget rather than each getting a fresh one.
+    prechecks, the peer call and reading the answer all draw on the same budget
+    rather than each getting a fresh one.
     """
 
     def __init__(self, seconds: float) -> None:
@@ -137,15 +135,15 @@ class SignalStop(Exception):
 
     Raised from inside a signal handler so that a termination or a hangup
     leaves by the ordinary route - through the cleanup that terminates the
-    process group, deletes the review evidence and releases the session lock -
-    instead of ending the process where it stands. It is deliberately not one
-    of the internal failures: nothing went wrong with the turn, it was stopped.
+    process group and releases the session lock - instead of ending the process
+    where it stands. It is deliberately not one of the internal failures:
+    nothing went wrong with the turn, it was stopped.
     """
 
     def __init__(self, number: int) -> None:
         super().__init__(
             "Agent Bridge was stopped by signal {0}, so the turn did not "
-            "finish and the Git finish line stays locked.".format(number)
+            "finish.".format(number)
         )
         self.number = number
 
