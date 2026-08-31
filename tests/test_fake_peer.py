@@ -20,9 +20,12 @@ must not end the process outright and leave that file in the session folder.
 Each is made to happen at the exact moment rather than waited for, by standing
 in front of the one step it has to land on.
 
-One more is about publication going wrong in a way that is easy to report
-untruthfully: a temporary file that will not be removed has to be named,
-because otherwise nothing tells the person it is there.
+Two more are about publication going wrong in ways that are easy to report
+untruthfully. A temporary file that will not be removed has to be named, because
+otherwise nothing tells the person it is there. And a rename whose outcome
+cannot be established afterwards has to be reported as exactly that - not as
+"nothing was published", which would send somebody to run a command again over a
+message that is already on the disk.
 
 One is about the connector, which composes the peer command rather than handing
 one over ready-made. Whatever a connector starts in order to do that - asking
@@ -675,6 +678,60 @@ class TurnBehavior(unittest.TestCase):
             "nothing was left behind, so this check proves nothing",
         )
         real_unlink(left)
+        self.assertEqual(self._leftover_temporaries(), [])
+
+    def test_a_rename_that_cannot_be_checked_is_not_called_nothing_published(
+        self,
+    ):
+        """When there is no telling, saying there is would be the lie.
+
+        The rename really happens, the filesystem then reports an ambiguous
+        failure anyway, and the follow-up look at the canonical name fails too.
+        The message is on the disk and complete - but nothing in this process
+        can know that.
+
+        Calling it `PUBLICATION_FAILURE` would tell the person nothing was
+        published and to run the command again, which is exactly wrong: the
+        message is there, and running again would write a second one. So the
+        third answer gets its own failure, which names the file and asks them
+        to go and look.
+        """
+        target = session.message_path(
+            self.session_dir, 1, session.LOCAL_RECORD_SUFFIX
+        )
+        text = "# Message 0001\nRecord: technical-error\nFrom: codex\n"
+        real_replace = os.replace
+        real_stat = os.stat
+
+        def replace_then_fail_ambiguously(source, destination):
+            real_replace(source, destination)
+            raise OSError("forced ambiguous input/output error")
+
+        def stat_that_will_not_answer(path, *args, **kwargs):
+            if path == target:
+                raise OSError("forced failure looking at the canonical name")
+            return real_stat(path, *args, **kwargs)
+
+        with mock.patch("os.replace", replace_then_fail_ambiguously):
+            with mock.patch("os.stat", stat_that_will_not_answer):
+                with self.assertRaises(BridgeError) as caught:
+                    session.publish(target, text)
+
+        self.assertEqual(
+            caught.exception.failure, Failure.PUBLICATION_UNCERTAIN
+        )
+        rendered = str(caught.exception)
+        self.assertIn(target, rendered)
+        self.assertNotIn("nothing was published", rendered)
+        self.assertNotIn("then run the command again", rendered)
+        self.assertIn("Do not run the command again", rendered)
+
+        self.assertTrue(
+            os.path.exists(target),
+            "the message really was published, so this check proves nothing",
+        )
+        with open(target, encoding="utf-8") as stream:
+            self.assertEqual(stream.read(), text)
         self.assertEqual(self._leftover_temporaries(), [])
 
     def test_a_stop_before_the_rename_leaves_nothing_and_is_not_a_failure(self):

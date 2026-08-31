@@ -366,6 +366,7 @@ code needs it.
 | `PLAN_SEALED` | An approved plan is already sealed | Use `--replace` only if the user approved a replacement |
 | `PUBLICATION_FAILURE` | The message could not be written and moved into place, so nothing was published | Check the session directory is writable, then run again |
 | `PUBLICATION_NOT_FLUSHED` | The message is written and in place, but the folder entry could not be forced to disk, so a machine failure could lose it | Confirm the reported file is there, and treat the turn as unfinished until the disk is behaving |
+| `PUBLICATION_UNCERTAIN` | Something went wrong while the message was being moved into place, and the canonical name could not then be examined, so there is no telling whether the message reached it | Look in the session's messages folder for the reported file before anything else — there means complete, absent means never arrived — and do not run the command again until you know which |
 
 Every failure publishes no false success, removes what the turn started, and
 gives one next action.

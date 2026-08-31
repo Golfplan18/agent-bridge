@@ -52,6 +52,7 @@ class Failure(enum.Enum):
     PLAN_SEALED = "PLAN_SEALED"
     PUBLICATION_FAILURE = "PUBLICATION_FAILURE"
     PUBLICATION_NOT_FLUSHED = "PUBLICATION_NOT_FLUSHED"
+    PUBLICATION_UNCERTAIN = "PUBLICATION_UNCERTAIN"
 
 
 # For each failure: what happened, then the single next action.
@@ -182,6 +183,15 @@ _GUIDANCE: Dict[Failure, Tuple[str, str]] = {
         "machine failure could still lose it.",
         "Confirm the reported file is there and readable, and treat this turn "
         "as unfinished until the session directory's disk is behaving.",
+    ),
+    Failure.PUBLICATION_UNCERTAIN: (
+        "Something went wrong while the message was being moved into place, "
+        "and the canonical name could not then be examined, so there is no "
+        "telling whether the message reached it.",
+        "Look in the session's messages folder for the reported file before "
+        "you do anything else: if it is there, the message is complete and "
+        "the writing is finished; if it is absent, the message never arrived. "
+        "Do not run the command again until you know which of the two it is.",
     ),
 }
 
