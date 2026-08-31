@@ -7,11 +7,19 @@ lock left behind by a process that was killed outright blocks nobody, that being
 told to stop cleans up what a turn started, and that nothing this turn started
 is still running when it returns.
 
+Three of the checks are about exactly *when* a stop arrives, because the awkward
+moments are short ones. A stop while the child is being created, before anything
+knows which process group to end. A second stop while that group is being
+emptied. And a stop in the instant after a message has been renamed into place,
+which must never be reported as though nothing had been published. Each is made
+to happen at the exact moment rather than waited for, by standing in front of
+the one step it has to land on.
+
 Everything below exercises the real thing. Real processes are started, real
 files are written, real locks are taken out in separate processes, real signals
-are sent, and a real process is killed with no chance to tidy up. The two
-exceptions are the forced publication failures, which cannot be produced on
-demand any other way and are made to happen by breaking the rename, and then
+are sent, and a real process is killed with no chance to tidy up. The exceptions
+are the forced publication outcomes, which cannot be produced on demand any
+other way and are made to happen by breaking, or by interrupting, the rename and
 the flush that follows it, for the length of one call.
 
 SPDX-License-Identifier: Unlicense
@@ -63,14 +71,11 @@ GRANDCHILD_LINE = re.compile(r"^GRANDCHILD (\d+)$", re.MULTILINE)
 #: How the fake peer reports the two processes a stop signal has to reach.
 PID_LINE = re.compile(r"^(PEER|CHILD) (\d+)$", re.MULTILINE)
 
-#: One bounded call, in a process of its own, so a check can signal the thing
-#: doing the waiting rather than the check itself. It exits 3 when it is
-#: stopped, which is how a check tells "cleaned up after a signal" apart from
-#: "died some other way".
-SIGNAL_DRIVER = (
-    "import os, sys\n"
-    "sys.path.insert(0, sys.argv[1])\n"
-    "from bridge import peer\n"
+#: The body every driver below shares: one bounded call, in a process of its
+#: own, so a check can signal the thing doing the waiting rather than the check
+#: itself. It exits 3 when it is stopped, which is how a check tells "cleaned up
+#: after a signal" apart from "died some other way".
+_DRIVER_CALL = (
     "try:\n"
     "    peer.run_bounded(\n"
     "        argv=(sys.executable, sys.argv[2], sys.argv[3], sys.argv[4]),\n"
@@ -79,8 +84,59 @@ SIGNAL_DRIVER = (
     "        stdin_text='Start something and then stop answering.\\n',\n"
     "        deadline=peer.Deadline(60.0),\n"
     "    )\n"
-    "except peer.SignalStop:\n"
+    "except (peer.SignalStop, KeyboardInterrupt):\n"
     "    sys.exit(3)\n"
+)
+
+_DRIVER_HEAD = (
+    "import os, signal, sys\n"
+    "sys.path.insert(0, sys.argv[1])\n"
+    "from bridge import peer\n"
+)
+
+#: Waits for the peer, and is stopped from outside while it waits.
+SIGNAL_DRIVER = _DRIVER_HEAD + _DRIVER_CALL
+
+#: Stopped in the one moment the child exists and nothing yet knows which group
+#: it belongs to. Standing in front of the step that reads the group is the only
+#: way to be sure the signal lands inside that moment rather than near it: the
+#: process id is written down for the check to watch, and the stop is delivered
+#: from here. Its arguments are the peer's sleep in seconds, the file to write
+#: the process id into, and which signal to send.
+CREATION_DRIVER = (
+    _DRIVER_HEAD
+    + "read_group = peer._own_group\n"
+    "def own_group(process):\n"
+    "    with open(sys.argv[4], 'w', encoding='utf-8') as stream:\n"
+    "        stream.write('PEER {0}\\n'.format(process.pid))\n"
+    "        stream.flush()\n"
+    "        os.fsync(stream.fileno())\n"
+    "    os.kill(os.getpid(), int(sys.argv[5]))\n"
+    "    return read_group(process)\n"
+    "peer._own_group = own_group\n"
+    "try:\n"
+    "    peer.run_bounded(\n"
+    "        argv=(sys.executable, sys.argv[2], 'hang', sys.argv[3]),\n"
+    "        cwd=sys.argv[1],\n"
+    "        env=tuple(os.environ.items()),\n"
+    "        stdin_text='Start something and then stop answering.\\n',\n"
+    "        deadline=peer.Deadline(60.0),\n"
+    "    )\n"
+    "except (peer.SignalStop, KeyboardInterrupt):\n"
+    "    sys.exit(3)\n"
+)
+
+#: Stopped a second time, while the first stop's cleanup is under way. The
+#: second signal is delivered from in front of the cleanup step, so it lands
+#: inside it.
+SECOND_STOP_DRIVER = (
+    _DRIVER_HEAD
+    + "empty_group = peer._cleanup_group\n"
+    "def cleanup(process, pgid):\n"
+    "    os.kill(os.getpid(), signal.SIGTERM)\n"
+    "    return empty_group(process, pgid)\n"
+    "peer._cleanup_group = cleanup\n"
+    + _DRIVER_CALL
 )
 
 
@@ -129,6 +185,7 @@ class TurnBehavior(unittest.TestCase):
         )
         self.holders = []
         self.drivers = []
+        self.strays = []
         self.evidence_before = self._evidence_files()
 
     def tearDown(self):
@@ -146,6 +203,14 @@ class TurnBehavior(unittest.TestCase):
             for stream in (driver.stdout, driver.stderr):
                 if stream is not None:
                     stream.close()
+        # A check that found a process still running has already failed; this
+        # makes sure the failure does not also leave the process about.
+        for pid in self.strays:
+            if not _process_gone(pid):
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except OSError:
+                    pass
         self.assertEqual(
             self._evidence_files(),
             self.evidence_before,
@@ -183,18 +248,10 @@ class TurnBehavior(unittest.TestCase):
 
         return build
 
-    def _start_signal_driver(self, mode, pid_path):
+    def _start_driver(self, source, *args):
         """One bounded call waiting in its own process, ready to be signalled."""
         driver = subprocess.Popen(
-            [
-                sys.executable,
-                "-c",
-                SIGNAL_DRIVER,
-                REPO_ROOT,
-                FAKE_PEER,
-                mode,
-                pid_path,
-            ],
+            [sys.executable, "-c", source, REPO_ROOT, FAKE_PEER] + list(args),
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -203,11 +260,20 @@ class TurnBehavior(unittest.TestCase):
         self.drivers.append(driver)
         return driver
 
-    def _await_reported_pids(self, pid_path):
-        """The peer's own process id and its child's, once both are running."""
+    def _start_signal_driver(self, mode, pid_path):
+        return self._start_driver(SIGNAL_DRIVER, mode, pid_path)
+
+    def _await_reported(self, pid_path, names, running=True):
+        """The process ids written into a file, once they are all there.
+
+        With `running`, each is also confirmed to be alive, which is what a
+        check needs before it signals something and watches it go. Without it,
+        only the numbers are wanted: a process that is meant to be ended within
+        moments of reporting itself may be gone before anything can look.
+        """
         reported = {}
 
-        def both_reported():
+        def all_reported():
             try:
                 with open(pid_path, encoding="utf-8") as stream:
                     text = stream.read()
@@ -217,26 +283,30 @@ class TurnBehavior(unittest.TestCase):
                 (name, int(number))
                 for name, number in PID_LINE.findall(text)
             )
-            if len(found) != 2:
+            if len(found) != len(names):
                 return False
             reported.update(found)
             return True
 
         self.assertTrue(
-            _wait_for(both_reported),
-            "the fake peer never reported the processes it started",
+            _wait_for(all_reported),
+            "the processes to watch were never reported",
         )
-        peer_pid = reported["PEER"]
-        child_pid = reported["CHILD"]
-        self.assertTrue(
-            _wait_for(lambda: not _process_gone(peer_pid)),
-            "the peer never started",
-        )
-        self.assertTrue(
-            _wait_for(lambda: not _process_gone(child_pid)),
-            "the process the peer started never ran",
-        )
-        return peer_pid, child_pid
+        pids = []
+        for name in names:
+            pid = reported[name]
+            self.strays.append(pid)
+            if running:
+                self.assertTrue(
+                    _wait_for(lambda: not _process_gone(pid)),
+                    "{0} never started".format(name),
+                )
+            pids.append(pid)
+        return tuple(pids)
+
+    def _await_reported_pids(self, pid_path):
+        """The peer's own process id and its child's, once both are running."""
+        return self._await_reported(pid_path, ("PEER", "CHILD"))
 
     def _messages(self):
         return sorted(os.listdir(session.messages_dir(self.session_dir)))
@@ -403,6 +473,108 @@ class TurnBehavior(unittest.TestCase):
             self.assertEqual(stream.read(), text)
         self.assertEqual(self._leftover_temporaries(), [])
 
+    def test_a_stop_after_the_rename_is_never_called_nothing_published(self):
+        """The message is on the disk, so nothing may say it is not.
+
+        A stop arriving in the instant after the rename - before control has
+        even left the step that performed it - used to be turned into "nothing
+        was published", which was the exact opposite of what had happened. The
+        stop is now passed on as itself, and the message stays where it is.
+        """
+        target = session.message_path(
+            self.session_dir, 1, session.LOCAL_RECORD_SUFFIX
+        )
+        text = "# Message 0001\nRecord: user-correction\nFrom: codex\n"
+        real_replace = os.replace
+
+        def replace_then_stop(source, destination):
+            real_replace(source, destination)
+            raise peer.SignalStop(signal.SIGTERM)
+
+        with mock.patch("os.replace", replace_then_stop):
+            with self.assertRaises(peer.SignalStop):
+                session.publish(target, text)
+
+        self.assertTrue(
+            os.path.exists(target), "the published message is not there"
+        )
+        with open(target, encoding="utf-8") as stream:
+            self.assertEqual(stream.read(), text)
+        self.assertEqual(self._leftover_temporaries(), [])
+
+    def test_a_failure_after_the_rename_says_the_message_is_there(self):
+        """Which side of the rename it happened on is decided by looking."""
+        target = session.message_path(
+            self.session_dir, 1, session.LOCAL_RECORD_SUFFIX
+        )
+        text = "# Message 0001\nRecord: technical-error\nFrom: codex\n"
+        real_replace = os.replace
+
+        def replace_then_fail(source, destination):
+            real_replace(source, destination)
+            raise OSError("forced failure after the rename")
+
+        with mock.patch("os.replace", replace_then_fail):
+            with self.assertRaises(BridgeError) as caught:
+                session.publish(target, text)
+
+        self.assertEqual(
+            caught.exception.failure, Failure.PUBLICATION_NOT_FLUSHED
+        )
+        self.assertIn(target, str(caught.exception))
+        self.assertTrue(
+            os.path.exists(target), "the published message is not there"
+        )
+        with open(target, encoding="utf-8") as stream:
+            self.assertEqual(stream.read(), text)
+        self.assertEqual(self._leftover_temporaries(), [])
+
+    def test_a_temporary_file_that_merely_vanished_is_not_a_publication(self):
+        """Gone is not the same as renamed, and only renamed is published.
+
+        If the folder the message was being written in disappears, the rename
+        fails and the temporary file goes with the folder. Deciding publication
+        by the temporary file's absence would call that a published message and
+        then say so about a file nobody can open. What is asked instead is
+        whether the canonical name now holds the very file that was written.
+        """
+        directory = session.messages_dir(self.session_dir)
+        target = session.message_path(
+            self.session_dir, 1, session.LOCAL_RECORD_SUFFIX
+        )
+        real_replace = os.replace
+
+        def replace_after_the_folder_goes(source, destination):
+            shutil.rmtree(directory)
+            return real_replace(source, destination)
+
+        with mock.patch("os.replace", replace_after_the_folder_goes):
+            with self.assertRaises(BridgeError) as caught:
+                session.publish(target, "# Message 0001\nnever arrives\n")
+
+        self.assertEqual(caught.exception.failure, Failure.PUBLICATION_FAILURE)
+        self.assertIn("nothing was published", str(caught.exception))
+        self.assertFalse(
+            os.path.exists(target),
+            "a message that is not there was called published",
+        )
+        os.makedirs(directory)
+
+    def test_a_stop_before_the_rename_leaves_nothing_and_is_not_a_failure(self):
+        """Stopped is stopped: nothing published, and nothing blamed on this."""
+        target = session.message_path(
+            self.session_dir, 1, session.LOCAL_RECORD_SUFFIX
+        )
+        with mock.patch(
+            "os.replace", side_effect=peer.SignalStop(signal.SIGHUP)
+        ):
+            with self.assertRaises(peer.SignalStop):
+                session.publish(target, "# Message 0001\nnever arrives\n")
+
+        self.assertFalse(os.path.exists(target))
+        self.assertEqual(self._messages(), [])
+        self.assertEqual(self._leftover_temporaries(), [])
+
     # -- the lock ----------------------------------------------------------
 
     def test_a_second_acquirer_is_busy_and_changes_nothing(self):
@@ -533,6 +705,76 @@ class TurnBehavior(unittest.TestCase):
                     _wait_for(lambda: _process_gone(child_pid)),
                     "the process the peer started is still there",
                 )
+
+    def test_a_stop_while_the_child_is_starting_still_cleans_up(self):
+        """The narrow window: the process exists, nothing yet owns it.
+
+        Between the operating system making the child and this code reading
+        which group it is in, there is a moment when a program is running and
+        nothing has yet taken responsibility for ending it. A stop that raised
+        there would leave that program behind.
+
+        The signal is delivered from inside that moment rather than aimed at it
+        from outside, which is the only way to be sure it lands there. The call
+        must still leave by the stopped route, and the peer must be gone.
+
+        All three stops are tried, and the keyboard interrupt is the one that
+        matters most: Ctrl-C is how a person ordinarily stops a program, so a
+        window that stayed open for it would be the window most often used.
+        """
+        for number in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
+            with self.subTest(signal=number):
+                pid_path = os.path.join(
+                    self.temp, "starting-{0}.txt".format(number)
+                )
+                driver = self._start_driver(
+                    CREATION_DRIVER, "60", pid_path, str(int(number))
+                )
+                (peer_pid,) = self._await_reported(
+                    pid_path, ("PEER",), running=False
+                )
+
+                driver.wait(timeout=SHORT_WAIT)
+                self.assertEqual(
+                    driver.returncode,
+                    3,
+                    driver.stderr.read().decode("utf-8", "replace"),
+                )
+                self.assertTrue(
+                    _wait_for(lambda: _process_gone(peer_pid)),
+                    "a stop while the child was starting left it running",
+                )
+
+    def test_a_second_stop_does_not_abandon_the_cleanup(self):
+        """Being stopped twice must not leave more behind than being stopped.
+
+        The first stop ends the waiting and starts the cleanup. The second
+        arrives while that cleanup is under way - delivered from in front of it,
+        so it really does land inside - and must not cut it short. Both the peer
+        and the process it started have to be gone afterwards, exactly as they
+        would be after one stop.
+        """
+        pid_path = os.path.join(self.temp, "second-stop-pids.txt")
+        driver = self._start_driver(
+            SECOND_STOP_DRIVER, "write-pids-then-hang", pid_path
+        )
+        peer_pid, child_pid = self._await_reported_pids(pid_path)
+
+        os.kill(driver.pid, signal.SIGTERM)
+        driver.wait(timeout=SHORT_WAIT)
+        self.assertEqual(
+            driver.returncode,
+            3,
+            driver.stderr.read().decode("utf-8", "replace"),
+        )
+        self.assertTrue(
+            _wait_for(lambda: _process_gone(peer_pid)),
+            "the second stop abandoned the cleanup and left the peer",
+        )
+        self.assertTrue(
+            _wait_for(lambda: _process_gone(child_pid)),
+            "the second stop abandoned the cleanup and left the child",
+        )
 
     def test_a_child_that_leaves_the_group_is_beyond_this_cleanup(self):
         """The stated limit, measured rather than assumed.

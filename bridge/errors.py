@@ -168,12 +168,18 @@ _GUIDANCE: Dict[Failure, Tuple[str, str]] = {
         "directory this account can write to, then run the review again.",
     ),
     Failure.REVIEW_EVIDENCE_NOT_DELIVERED: (
-        "The review evidence did not reach the peer intact: either the "
-        "connector granted it something other than the exact file this turn "
-        "wrote, or that file was changed while the peer had it.",
+        "The review evidence did not reach the peer, or did not reach it "
+        "intact: the connector granted something other than the exact file "
+        "this turn wrote, or that file was changed while the peer had it, or "
+        "the peer answered without the token that appears only inside it - so "
+        "there is no showing that the difference was ever read. When the peer "
+        "did answer, its text was kept as an ordinary message carrying no "
+        "review authority.",
         "Make the connector grant the peer exactly the project root and the "
-        "evidence path it was handed, make sure nothing else writes to that "
-        "file, then run the review again.",
+        "evidence path it was handed and make sure the peer reads that file "
+        "and copies its Agent-Bridge-Evidence-Token line into its answer, then "
+        "run the review again; this is never an acceptance, and Git stays "
+        "locked until a fresh review returns an exact ACCEPT.",
     ),
     Failure.CLEANUP_FAILURE: (
         "A file or process this turn created could not be removed, so the turn "

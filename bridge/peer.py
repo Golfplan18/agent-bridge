@@ -23,18 +23,50 @@ running in.
 passes, or somebody stops Agent Bridge - with an interrupt from the keyboard, or
 with a termination or hangup signal. All three become exceptions, so all three
 leave by the same route and the same cleanup runs. The signal handlers are put
-back exactly as they were found on the way out, and where they cannot be
-installed at all - because this is not the main thread - the turn goes ahead
-without them, which is better than refusing to work.
+back exactly as they were found on the way out.
 
-**What cannot be cleaned up, honestly.** Being killed outright with `SIGKILL`
-cannot be caught by any program, a machine that loses power runs no cleanup
-code, and a child that deliberately puts itself into its own session has left
-the group this turn owns and can no longer be reached by signalling that group.
-None of the three can be controlled portably, so none of them is pretended
-about. The consequence for connectors is concrete: a harness command-line
-program that daemonizes during a turn puts its work beyond this cleanup and must
-therefore fail qualification.
+**When a stop raises, and when it waits.** Raising where it lands is right for
+exactly one stretch of a turn - the wait for the program's answer - and wrong
+for the rest of it.
+
+It is wrong while the child is being created: between the operating system
+making the process and this code knowing which group it belongs to, a stop that
+raised would leave a running program that nothing had yet taken responsibility
+for. It is wrong during cleanup: a second stop arriving while the group is being
+emptied would abandon the emptying half done, which is the opposite of what the
+person pressing the key wants.
+
+So it is arranged the other way round from what might be expected. A stop is
+deferred - written down rather than raised - for the whole life of the child,
+and one window is opened, around the wait, where it raises immediately. That
+window sits inside the cleanup that catches what it raises. There is therefore
+no instruction anywhere between the child appearing and its group being empty at
+which a stop can leave without cleanup having run. Once it has, the stop that
+was written down is raised.
+
+All three stops go through this, the keyboard interrupt included. Ctrl-C still
+raises `KeyboardInterrupt` exactly as it always did, and is handled here for one
+reason only: a handler of our own can be made to wait through those moments,
+where Python's own cannot. Leaving it out would leave the commonest way of
+stopping a program the one way that could still strand a peer.
+
+Deferral changes when a stop is raised, never whether.
+
+**What cannot be cleaned up, honestly.** Four things. Being killed outright with
+`SIGKILL` cannot be caught by any program. A machine that loses power runs no
+cleanup code. A child that deliberately puts itself into its own session has
+left the group this turn owns and can no longer be reached by signalling that
+group. And a turn run off the main thread has no handlers at all: Python only
+ever delivers a signal to the main thread, and only the main thread may install
+a handler, so a termination signal there does whatever the surrounding program
+already arranged - which, by default, ends the process at once and leaves the
+peer running. The turn still goes ahead in that case, because refusing to work
+would be worse, but the tidy exit is not available and is not claimed.
+
+None of the four can be controlled portably, so none of them is pretended about.
+The consequence for connectors is concrete: a harness command-line program that
+daemonizes during a turn puts its work beyond this cleanup and must therefore
+fail qualification.
 
 The deadline covers the useful work: prechecks, evidence generation, the call
 and the answer. Cleanup afterwards gets its own separate bounded grace, because
@@ -118,32 +150,119 @@ class SignalStop(Exception):
         self.number = number
 
 
-#: The two signals a turn turns into `SignalStop`. An interrupt from the
-#: keyboard already arrives as `KeyboardInterrupt` and needs nothing added.
+#: The two signals a turn turns into `SignalStop`.
 STOP_SIGNALS: Tuple[int, ...] = (signal.SIGTERM, signal.SIGHUP)
+
+#: An interrupt from the keyboard goes on raising `KeyboardInterrupt`, exactly
+#: as it always did. It is handled here all the same, and for one reason only:
+#: a handler of our own can be made to wait through the two moments below,
+#: where Python's cannot. Ctrl-C is how a person ordinarily stops a program, so
+#: leaving it out would leave the commonest stop able to strand a peer.
+INTERRUPT_SIGNALS: Tuple[int, ...] = (signal.SIGINT,)
+
+#: Every signal handled here, in the order they are installed.
+HANDLED_SIGNALS: Tuple[int, ...] = STOP_SIGNALS + INTERRUPT_SIGNALS
+
+
+def _stop_exception(number: int) -> BaseException:
+    """What a given signal leaves by. Interrupts keep their own exception."""
+    if number in INTERRUPT_SIGNALS:
+        return KeyboardInterrupt()
+    return SignalStop(number)
+
+
+class StopWatch(object):
+    """When a stop raises where it lands, and when it waits its turn.
+
+    A stop that raises where it lands is what makes it leave through the cleanup
+    around the caller instead of ending the process where it stands. That is
+    right for exactly one stretch of a turn - the wait for the program's answer
+    - and wrong for the rest of it, where a running child either has nothing yet
+    responsible for it or is in the middle of being cleaned up.
+
+    So the arrangement is the other way round from what it might seem. For the
+    whole life of the child a stop is deferred: written down, and raised once
+    the stretch it arrived in is over. `allowing()` opens the one window where
+    it raises immediately, and that window sits inside the cleanup that catches
+    it. There is therefore no instruction anywhere between the child appearing
+    and the group being empty at which a stop can leave without cleanup running.
+
+    Deferral changes when a stop is raised, never whether. Only the first is
+    remembered, because they all mean the same thing: the turn is being stopped,
+    and it leaves once.
+
+    The state lives on the object, not in the module, so it belongs to exactly
+    one `stopped_by_signal` region. Nothing can be left behind for a later turn
+    to trip over.
+    """
+
+    def __init__(self) -> None:
+        self._deferrals = 0
+        self._pending = None  # type: Optional[int]
+
+    def handle(self, number, frame) -> None:
+        """The signal handler itself: raise now, or write it down for later."""
+        if self._deferrals > 0:
+            if self._pending is None:
+                self._pending = number
+            return
+        raise _stop_exception(number)
+
+    @contextlib.contextmanager
+    def deferring(self) -> Iterator[None]:
+        """Inside this block a stop is written down instead of being raised."""
+        self._deferrals += 1
+        try:
+            yield
+        finally:
+            self._deferrals -= 1
+
+    @contextlib.contextmanager
+    def allowing(self) -> Iterator[None]:
+        """Inside this block a stop raises again. Only valid inside `deferring`.
+
+        Reopening the door is what makes a stop interrupt the wait for an
+        answer, which is the whole point of handling one. The block must sit
+        inside a `deferring()` block whose cleanup will catch what it raises.
+
+        A stop that arrived before the door opened is raised as it opens, rather
+        than left to be noticed later. Otherwise a turn already told to stop
+        would go on and wait out its whole deadline for an answer nobody is
+        waiting for any more.
+        """
+        self._deferrals -= 1
+        try:
+            self.raise_if_stopped()
+            yield
+        finally:
+            self._deferrals += 1
+
+    def raise_if_stopped(self) -> None:
+        """Raise a stop that arrived while it was being deferred, if one did."""
+        number, self._pending = self._pending, None
+        if number is not None:
+            raise _stop_exception(number)
 
 
 @contextlib.contextmanager
-def stopped_by_signal() -> Iterator[None]:
+def stopped_by_signal() -> Iterator[StopWatch]:
     """Make termination and hangup raise, and put the handlers back after.
 
     Installing a handler is only possible on the main thread. Somewhere else it
     is impossible rather than wrong, so the block runs without them: losing a
-    tidy exit is a smaller harm than refusing to do the work at all.
+    tidy exit is a smaller harm than refusing to do the work at all. The watch
+    is still yielded in that case and simply never fires, so callers need no
+    second shape of code for it.
     """
-
-    def stop(number, frame):
-        """Leave by raising, so the cleanup around the caller still runs."""
-        raise SignalStop(number)
-
+    watch = StopWatch()
     installed = []
     try:
-        for number in STOP_SIGNALS:
-            installed.append((number, signal.signal(number, stop)))
+        for number in HANDLED_SIGNALS:
+            installed.append((number, signal.signal(number, watch.handle)))
     except (OSError, ValueError):
         pass
     try:
-        yield
+        yield watch
     finally:
         for number, previous in reversed(installed):
             try:
@@ -315,47 +434,68 @@ def run_bounded(
     timed_out = False
     stdout = b""
     stderr = b""
-    # The handlers go on before the child does, so there is no moment where a
-    # process exists that a signal could leave behind.
-    with stopped_by_signal():
-        try:
-            process = subprocess.Popen(
-                list(argv),
-                cwd=cwd,
-                env=dict(env),
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                shell=False,
-                close_fds=True,
-                start_new_session=True,
-            )
-        except OSError as exc:
-            raise BridgeError(spawn_failure, detail=str(exc))
-
-        pgid = _own_group(process)
-        try:
+    process = None  # type: Optional[subprocess.Popen]
+    pgid = None  # type: Optional[int]
+    # The handlers go on before the child does, and a stop is deferred for the
+    # whole life of the child: while it is being started, while its group is
+    # being read, and while that group is being emptied. The one window where a
+    # stop raises where it lands is the wait for the answer, and that window
+    # sits inside the cleanup that catches what it raises. So there is no
+    # instruction anywhere between the child appearing and its group being
+    # empty at which a stop can leave without cleanup having run.
+    with stopped_by_signal() as watch:
+        with watch.deferring():
             try:
-                stdout, stderr = process.communicate(
-                    input=payload, timeout=remaining
-                )
-            except subprocess.TimeoutExpired:
-                timed_out = True
-        finally:
-            try:
-                _cleanup_group(process, pgid)
-            finally:
-                if timed_out:
-                    # The group is gone, so the pipes are at end-of-file and
-                    # this returns at once with everything the program managed
-                    # to say.
+                try:
+                    process = subprocess.Popen(
+                        list(argv),
+                        cwd=cwd,
+                        env=dict(env),
+                        stdin=subprocess.PIPE,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        shell=False,
+                        close_fds=True,
+                        start_new_session=True,
+                    )
+                except OSError as exc:
+                    raise BridgeError(spawn_failure, detail=str(exc))
+                pgid = _own_group(process)
+                with watch.allowing():
                     try:
                         stdout, stderr = process.communicate(
-                            timeout=ESCALATION_GRACE_SECONDS
+                            input=payload, timeout=remaining
                         )
-                    except (subprocess.TimeoutExpired, ValueError, OSError):
-                        stdout, stderr = b"", b""
-                _close_streams(process)
+                    except subprocess.TimeoutExpired:
+                        timed_out = True
+            finally:
+                if process is not None:
+                    try:
+                        # Still deferred, so a second stop cannot abandon this
+                        # half done. When the group was never this turn's to
+                        # signal, `_own_group` has already said so and nothing
+                        # here signals anything.
+                        if pgid is not None:
+                            _cleanup_group(process, pgid)
+                    finally:
+                        if timed_out:
+                            # The group is gone, so the pipes are at end-of-file
+                            # and this returns at once with everything the
+                            # program managed to say.
+                            try:
+                                stdout, stderr = process.communicate(
+                                    timeout=ESCALATION_GRACE_SECONDS
+                                )
+                            except (
+                                subprocess.TimeoutExpired,
+                                ValueError,
+                                OSError,
+                            ):
+                                stdout, stderr = b"", b""
+                        _close_streams(process)
+        # Nothing this turn started is left, so a stop that arrived while it was
+        # being deferred can be raised now without leaving anything behind.
+        watch.raise_if_stopped()
 
     out_text = stdout.decode("utf-8", "replace") if stdout else ""
     err_text = stderr.decode("utf-8", "replace") if stderr else ""

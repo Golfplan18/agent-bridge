@@ -15,15 +15,28 @@ reviewer really made, not failures.
 Every review here also proves the handover a reviewer depends on: the builder
 that stands in for a connector records the evidence path the runner gave it, and
 the checks confirm that path was a real file holding the `baseline..head` diff
-at the moment the command was composed, and is gone once the turn returned. One
-check goes further and proves the peer really opened that file, by hiding a
-token in the reviewed change that can reach the peer no other way.
+followed by this turn's own token at the moment the command was composed, and is
+gone once the turn returned.
+
+Reading that evidence is not optional here, because it is not optional in the
+product. Every peer in this file is given the evidence path unless a check is
+specifically about a peer that was not, and the check that is - a perfectly
+formed `ACCEPT` from a peer that never opened the file - proves the finish line
+stays shut. One further check hides a canary inside the reviewed change itself,
+which proves the difference reached the peer rather than only the line the
+runner appended to it.
+
+Two checks are about what a repository is allowed to say about itself: that it
+cannot hide an untracked file from the cleanliness check, and that the
+filesystem-monitor helper it names is not run while the gate reads it. The
+second proves that one setting and is named for it - a content filter a
+repository names still runs, which `gitgate` and INTERFACE.md both state.
 
 Everything runs against a throwaway repository built for the purpose and deleted
-afterwards, and against the fake peer. No real harness is involved anywhere. Two
-conditions cannot be produced on demand any other way - a temporary filesystem
-that will not take a file, and a step that outruns its deadline - and those are
-forced for the length of one call.
+afterwards, and against the fake peer. No real harness is involved anywhere.
+Three conditions cannot be produced on demand any other way - a temporary
+filesystem that will not take a file, one that will not then remove it, and a
+step that outruns its deadline - and those are forced for the length of one call.
 
 SPDX-License-Identifier: Unlicense
 """
@@ -32,6 +45,7 @@ from __future__ import annotations
 
 import glob
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -47,7 +61,7 @@ REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if REPO_ROOT not in sys.path:
     sys.path.insert(0, REPO_ROOT)
 
-from bridge import gitgate, record, runner, session  # noqa: E402
+from bridge import gitgate, peer, record, runner, session  # noqa: E402
 from bridge.connectors import PeerCommand  # noqa: E402
 from bridge.errors import BridgeError, Failure  # noqa: E402
 from bridge.verdict import ACCEPT, ASK_USER, REJECT, read_verdict  # noqa: E402
@@ -57,9 +71,26 @@ FAKE_PEER = os.path.join(REPO_ROOT, "tests", "fake_peer.py")
 
 REVIEW_BODY = "Review the cumulative change against the approved plan.\n"
 
-#: The shape of token the fake peer looks for inside the evidence file. A fresh
-#: one is committed for the check that proves the peer really read the diff.
-EVIDENCE_TOKEN_PREFIX = "AGENT-BRIDGE-EVIDENCE-TOKEN-"
+#: The shape of canary the fake peer looks for inside the reviewed change. A
+#: fresh one is committed for the check that proves the peer really read the
+#: difference, and not merely the token line the runner appends to it.
+DIFF_CANARY_PREFIX = "AGENT-BRIDGE-DIFF-CANARY-"
+
+#: What the runner appends to every evidence file it writes. A response that
+#: does not quote the value cannot become an acceptance.
+TOKEN_LINE = re.compile(
+    "^" + re.escape(gitgate.EVIDENCE_TOKEN_PREFIX) + "([0-9a-f]{32})$",
+    re.MULTILINE,
+)
+
+#: A filesystem-monitor helper is an ordinary program of the repository's
+#: choosing. This one leaves a mark when it runs and answers Git correctly
+#: enough not to disturb the command that started it.
+FSMONITOR_HELPER = """#!/bin/sh
+: > "{0}"
+printf '/\000'
+exit 0
+"""
 
 
 class HandedEvidence(NamedTuple):
@@ -135,18 +166,21 @@ class GitFinishLine(unittest.TestCase):
 
         A real connector uses the evidence path it is given to name that exact
         file in the restrictions it applies, and then declares both that path
-        and the project root it granted. Standing in for one, this records
-        what it was handed - the path, whether it was a real file at that
-        moment, and what it held - so a check can prove a reviewing peer could
-        actually be told where the diff is, and it declares exactly what it was
-        given so the runner's own comparison passes.
+        and the project root it granted. Standing in for one, this records what
+        it was handed - the path, whether it was a real file at that moment, and
+        what it held - so a check can prove a reviewing peer could actually be
+        told where the diff is, and it declares exactly what it was given so the
+        runner's own comparison passes.
 
-        With `pass_evidence`, the path is also put on the fake peer's command
-        line, which is how a peer that is meant to open the file is told where
-        it is.
+        The path is also put on the fake peer's command line, which is how a
+        peer is told where to read. That is the default because a peer that does
+        not read the evidence cannot produce an accepted review, so every check
+        that expects one has to go through a peer that did. Passing
+        `read_evidence=False` makes a peer that was never told, which is what
+        the checks about a missing token and about an empty answer need.
         """
         project = kwargs.pop("project", None) or self.repo.project
-        pass_evidence = kwargs.pop("pass_evidence", False)
+        read_evidence = kwargs.pop("read_evidence", True)
 
         def build(evidence_path, deadline):
             existed = bool(evidence_path) and os.path.isfile(evidence_path)
@@ -157,14 +191,59 @@ class GitFinishLine(unittest.TestCase):
                     text=self.read(evidence_path) if existed else None,
                 )
             )
-            argv = (sys.executable, FAKE_PEER, mode) + tuple(extra)
-            if pass_evidence:
-                argv = argv + (evidence_path or "",)
+            argv = (sys.executable, FAKE_PEER)
+            if read_evidence and evidence_path:
+                argv = argv + ("--evidence", evidence_path)
+            argv = argv + (mode,) + tuple(extra)
             return PeerCommand(
                 argv=argv,
                 cwd=self.temp,
                 env=tuple(os.environ.items()),
                 project_root=project,
+                review_evidence=evidence_path,
+            )
+
+        return build
+
+    def precheck_builder(self, seconds):
+        """A connector whose own precheck runs longer than the turn allows.
+
+        A real connector asks the harness its version, whether it is signed in,
+        and whether the restriction switches are there. Those are programs, and
+        they run inside the turn's deadline through the same bounded runner
+        everything else uses. This one stands in for a precheck that hangs.
+        """
+
+        def build(evidence_path, deadline):
+            existed = bool(evidence_path) and os.path.isfile(evidence_path)
+            self.handed.append(
+                HandedEvidence(path=evidence_path, existed=existed, text=None)
+            )
+            peer.run_bounded(
+                argv=(sys.executable, FAKE_PEER, "hang", str(seconds)),
+                cwd=self.temp,
+                env=tuple(os.environ.items()),
+                stdin_text="",
+                deadline=deadline,
+            )
+            raise AssertionError("the precheck outlasted the deadline")
+
+        return build
+
+    def late_builder(self):
+        """A connector that finishes, but only after the deadline has passed."""
+
+        def build(evidence_path, deadline):
+            existed = bool(evidence_path) and os.path.isfile(evidence_path)
+            self.handed.append(
+                HandedEvidence(path=evidence_path, existed=existed, text=None)
+            )
+            time.sleep(max(0.0, deadline.remaining()) + 0.05)
+            return PeerCommand(
+                argv=(sys.executable, FAKE_PEER, "accept"),
+                cwd=self.temp,
+                env=tuple(os.environ.items()),
+                project_root=self.repo.project,
                 review_evidence=evidence_path,
             )
 
@@ -228,10 +307,18 @@ class GitFinishLine(unittest.TestCase):
         return completed.stdout.decode("utf-8", "replace")
 
     def assert_evidence_reached_the_builder(self, base, head, calls=1):
-        """The builder was told where the diff was, and it is gone now."""
+        """The builder was told where the diff was, and it is gone now.
+
+        The file it was told about is the `baseline..head` difference followed
+        by one token line the runner wrote for that turn alone. Both halves are
+        checked, and the tokens of separate turns are checked to be different -
+        a token that repeated would be a value a peer could have kept from an
+        earlier call rather than read from this one.
+        """
         diff = self.expected_diff(base, head)
         self.assertIn("diff --git ", diff, "there was no change to review")
         self.assertEqual(len(self.handed), calls)
+        tokens = []
         for handed in self.handed:
             self.assertIsNotNone(
                 handed.path, "the builder was handed no evidence path"
@@ -241,15 +328,29 @@ class GitFinishLine(unittest.TestCase):
                 "{0} was not a real file when the command was "
                 "composed".format(handed.path),
             )
-            self.assertEqual(
-                handed.text,
-                diff,
-                "the evidence was not the baseline..head diff",
+            self.assertTrue(
+                handed.text.startswith(diff),
+                "the evidence did not begin with the baseline..head diff",
             )
+            appended = handed.text[len(diff):]
+            found = TOKEN_LINE.search(appended)
+            self.assertIsNotNone(
+                found, "the evidence carried no token line: {0!r}".format(appended)
+            )
+            self.assertEqual(
+                appended,
+                "\n" + found.group(0) + "\n",
+                "the evidence held more than the diff and its token",
+            )
+            tokens.append(found.group(1))
             self.assertFalse(
                 os.path.exists(handed.path),
                 "the evidence file outlived the turn",
             )
+        self.assertEqual(
+            len(set(tokens)), len(tokens), "two turns used the same token"
+        )
+        return tokens
 
     def review(self, mode, base, head, *extra, **kwargs):
         project = kwargs.pop("project", None) or self.repo.project
@@ -293,23 +394,35 @@ class GitFinishLine(unittest.TestCase):
         with open(path, encoding="utf-8") as stream:
             return stream.read()
 
-    def refuse_but_keep(self, mode, base, head, *extra, **kwargs):
-        """An invalid verdict fails, and the peer's prose survives anyway.
+    def refuse_but_keep(self, failure, mode, base, head, *extra, **kwargs):
+        """The call fails, and the peer's prose survives anyway.
 
-        The opposite expectation to `refuse`: this peer exited cleanly and wrote
-        real text, so one more response message exists afterwards. What it must
-        not have is any binding - which the checks below prove separately.
+        The opposite expectation to `refuse`, and it holds for the two failures
+        where a peer exited cleanly and wrote real text: its last line was not a
+        verdict, or its answer never quoted the evidence token. One more
+        response message exists afterwards. What it must not have is any binding
+        - which the checks below prove separately.
         """
         before = len(self.responses())
         with self.assertRaises(BridgeError) as caught:
             self.review(mode, base, head, *extra, **kwargs)
-        self.assertEqual(caught.exception.failure, Failure.INVALID_VERDICT)
+        self.assertEqual(caught.exception.failure, failure)
         self.assertEqual(
             len(self.responses()),
             before + 1,
             "the peer's text was thrown away instead of kept",
         )
         return caught.exception
+
+    def assert_binds_to_nothing(self, kept, base, head):
+        """A kept response carries no field and no commit that could bind it."""
+        header = kept.split("\n\n", 1)[0]
+        for field in ("Review-Request:", "Review-Base:", "Review-Head:"):
+            self.assertNotIn(
+                field, header, "a kept response must bind to nothing"
+            )
+        for commit in (base, head):
+            self.assertNotIn(commit, header, "a kept response named a commit")
 
     def latest_response_text(self):
         return self.read(
@@ -321,6 +434,7 @@ class GitFinishLine(unittest.TestCase):
     # -- controls ----------------------------------------------------------
 
     def test_a_bound_accept_opens_the_finish_line(self):
+        """The one case that opens it, and the peer had to read to get there."""
         head = self.ready()
         result = self.review("accept", self.repo.initial_commit, head)
 
@@ -342,9 +456,49 @@ class GitFinishLine(unittest.TestCase):
         self.assertTrue(
             response.rstrip().endswith("Agent-Bridge-Verdict: ACCEPT")
         )
-        self.assert_evidence_reached_the_builder(
+        token = self.assert_evidence_reached_the_builder(
             self.repo.initial_commit, head
+        )[0]
+
+        # The token is in the answer because the peer read it out of the file,
+        # and it is nowhere in what was sent, so it cannot have come from there.
+        self.assertIn(token, response)
+        request = self.request_text()
+        self.assertNotIn(token, request)
+        self.assertIn(gitgate.EVIDENCE_TOKEN_PREFIX.strip(), request)
+
+    def test_an_accept_from_a_peer_that_never_read_the_evidence_opens_nothing(
+        self,
+    ):
+        """The gate condition: no token back, no acceptance, however it ends.
+
+        This peer does everything else correctly. It exits cleanly, writes real
+        prose, and ends with the exact `ACCEPT` line. What it never had is the
+        evidence path, so it cannot quote the token, and without that there is
+        nothing showing it ever saw the change it is passing judgment on.
+
+        Its prose is kept, because prose may be worth reading. It is kept as an
+        ordinary message binding to nothing, the call fails, and Git stays shut.
+        """
+        head = self.ready()
+        error = self.refuse_but_keep(
+            Failure.REVIEW_EVIDENCE_NOT_DELIVERED,
+            "accept",
+            self.repo.initial_commit,
+            head,
+            read_evidence=False,
         )
+
+        kept = self.latest_response_text()
+        self.assert_binds_to_nothing(kept, self.repo.initial_commit, head)
+        self.assertTrue(kept.rstrip().endswith("Agent-Bridge-Verdict: ACCEPT"))
+        self.assertIn(self.responses()[-1], error.detail or "")
+        self.assertIn("Next action:", str(error))
+
+        token = self.assert_evidence_reached_the_builder(
+            self.repo.initial_commit, head
+        )[0]
+        self.assertNotIn(token, kept, "the peer quoted a token it never read")
 
     def test_reject_is_published_and_opens_nothing(self):
         head = self.ready()
@@ -380,7 +534,12 @@ class GitFinishLine(unittest.TestCase):
         head = self.ready()
         for mode in modes:
             with self.subTest(mode=mode):
-                self.refuse_but_keep(mode, self.repo.initial_commit, head)
+                self.refuse_but_keep(
+                    Failure.INVALID_VERDICT,
+                    mode,
+                    self.repo.initial_commit,
+                    head,
+                )
         self.assertEqual(len(self.requests()), len(modes))
         self.assertEqual(len(self.responses()), len(modes))
         self.assert_evidence_reached_the_builder(
@@ -388,13 +547,27 @@ class GitFinishLine(unittest.TestCase):
         )
 
     def test_an_unfinished_call_keeps_nothing(self):
-        """Text from a call that did not finish cleanly may be a fragment."""
+        """Text from a call that did not finish cleanly may be a fragment.
+
+        Neither peer here is given the evidence, because neither is about the
+        evidence: one says nothing at all and the other exits with a failure,
+        and both must be reported as what they are rather than as a missing
+        token.
+        """
         head = self.ready()
         self.refuse(
-            Failure.EMPTY_RESPONSE, "empty", self.repo.initial_commit, head
+            Failure.EMPTY_RESPONSE,
+            "empty",
+            self.repo.initial_commit,
+            head,
+            read_evidence=False,
         )
         self.refuse(
-            Failure.PEER_FAILURE, "fail", self.repo.initial_commit, head
+            Failure.PEER_FAILURE,
+            "fail",
+            self.repo.initial_commit,
+            head,
+            read_evidence=False,
         )
         self.assertEqual(len(self.requests()), 2)
         self.assertEqual(self.responses(), [])
@@ -403,21 +576,14 @@ class GitFinishLine(unittest.TestCase):
         """The prose survives; every field that could bind it does not."""
         head = self.ready()
         error = self.refuse_but_keep(
-            "unknown-verdict", self.repo.initial_commit, head
+            Failure.INVALID_VERDICT,
+            "unknown-verdict",
+            self.repo.initial_commit,
+            head,
         )
 
         kept = self.latest_response_text()
-        header = kept.split("\n\n", 1)[0]
-        for field in ("Review-Request:", "Review-Base:", "Review-Head:"):
-            self.assertNotIn(
-                field,
-                header,
-                "a kept invalid verdict must bind to nothing",
-            )
-        for commit in (self.repo.initial_commit, head):
-            self.assertNotIn(
-                commit, header, "a kept invalid verdict named a commit"
-            )
+        self.assert_binds_to_nothing(kept, self.repo.initial_commit, head)
 
         # The peer's own words survived, including the line it got wrong.
         self.assertIn(REVIEW_BODY.strip(), kept)
@@ -533,38 +699,38 @@ class GitFinishLine(unittest.TestCase):
 
     # -- the evidence a reviewer actually read ------------------------------
 
-    def test_the_peer_is_proved_to_have_read_the_evidence(self):
-        """A token that can reach the peer only through the diff comes back.
+    def test_the_peer_is_proved_to_have_read_the_change_itself(self):
+        """A canary that can reach the peer only through the diff comes back.
 
-        The reviewed change carries a fresh random token. It is nowhere in the
-        outgoing body, so a peer that merely pretended to look cannot produce
-        it. Quoting it back is the proof.
+        The runner's own token proves the evidence file was opened. This proves
+        something narrower and worth proving separately: that the file really
+        carried the change under review. The reviewed commit contains a fresh
+        random canary, it is nowhere in the outgoing body, and the peer quotes
+        it back.
         """
         self.seal(self.repo.initial_commit)
-        token = EVIDENCE_TOKEN_PREFIX + uuid.uuid4().hex
+        canary = DIFF_CANARY_PREFIX + uuid.uuid4().hex
         head = self.repo.add_commit(
-            "Work carrying a token nothing else can supply",
-            filename="token.txt",
-            text=token + "\n",
+            "Work carrying a canary nothing else can supply",
+            filename="canary.txt",
+            text=canary + "\n",
         )
 
         result = self.review(
-            "read-evidence",
-            self.repo.initial_commit,
-            head,
-            pass_evidence=True,
+            "read-evidence", self.repo.initial_commit, head
         )
         self.assertEqual(result.verdict, ACCEPT)
         self.assertTrue(result.git_unlocked)
+        published = self.read(result.response_path)
         self.assertIn(
-            token,
-            self.read(result.response_path),
+            canary,
+            published,
             "the peer did not quote what was inside the evidence",
         )
 
         request = self.request_text()
         self.assertNotIn(
-            token, request, "the token was sent instead of being read"
+            canary, request, "the canary was sent instead of being read"
         )
         self.assertEqual(
             request.split("\n\n", 1)[0],
@@ -574,8 +740,32 @@ class GitFinishLine(unittest.TestCase):
                 self.handed[0].path,
             ),
         )
-        self.assert_evidence_reached_the_builder(
+        token = self.assert_evidence_reached_the_builder(
             self.repo.initial_commit, head
+        )[0]
+        self.assertIn(token, published)
+        self.assertNotIn(token, request)
+
+    def test_the_request_asks_for_the_token_without_naming_it(self):
+        """The instruction is sent; the value it asks for never is."""
+        head = self.ready()
+        result = self.review("accept", self.repo.initial_commit, head)
+        self.assertTrue(result.git_unlocked)
+
+        request = self.request_text()
+        self.assertIn(REVIEW_BODY.strip(), request)
+        self.assertIn(
+            gitgate.REVIEW_EVIDENCE_INSTRUCTION.strip(),
+            request,
+            "the peer was never told to copy the token back",
+        )
+        token = self.assert_evidence_reached_the_builder(
+            self.repo.initial_commit, head
+        )[0]
+        self.assertNotIn(
+            token,
+            request,
+            "the value was sent, so quoting it would prove nothing",
         )
 
     def test_evidence_changed_while_the_peer_had_it_voids_the_turn(self):
@@ -586,7 +776,6 @@ class GitFinishLine(unittest.TestCase):
             "rewrite-evidence",
             self.repo.initial_commit,
             head,
-            pass_evidence=True,
         )
         self.assertEqual(len(self.requests()), 1)
 
@@ -634,6 +823,96 @@ class GitFinishLine(unittest.TestCase):
         self.assertIn("TMPDIR", str(error))
         self.assertEqual(self.requests(), [])
         self.assertEqual(self._evidence_files(), self.evidence_before)
+
+    def test_a_partly_written_evidence_file_that_will_not_go_is_reported(self):
+        """A file left on the disk is a cleanup failure, not a shrug.
+
+        Writing the evidence fails, and removing what was written fails too, so
+        a partly written file survives. Reporting only that the evidence was
+        unavailable would be true and useless: somebody has a file they were
+        never told about. The failure has to be the one that says so.
+        """
+        head = self.ready()
+        made = {}
+        real_mkstemp = gitgate.tempfile.mkstemp
+        real_fsync = os.fsync
+        real_unlink = os.unlink
+
+        def mkstemp(*args, **kwargs):
+            handle, path = real_mkstemp(*args, **kwargs)
+            if kwargs.get("prefix") == gitgate.REVIEW_EVIDENCE_PREFIX:
+                made["handle"] = handle
+                made["path"] = path
+            return handle, path
+
+        def fsync(handle):
+            if handle == made.get("handle"):
+                raise OSError("forced write failure")
+            return real_fsync(handle)
+
+        def unlink(path, *args, **kwargs):
+            if path == made.get("path"):
+                raise OSError("forced removal failure")
+            return real_unlink(path, *args, **kwargs)
+
+        with mock.patch.object(gitgate.tempfile, "mkstemp", mkstemp):
+            with mock.patch("os.fsync", fsync):
+                with mock.patch("os.unlink", unlink):
+                    error = self.refuse(
+                        Failure.CLEANUP_FAILURE,
+                        "accept",
+                        self.repo.initial_commit,
+                        head,
+                    )
+
+        left = made["path"]
+        self.assertIn(left, str(error))
+        self.assertIn("forced removal failure", str(error))
+        self.assertIn("Next action:", str(error))
+        self.assertEqual(self.requests(), [])
+        self.assertTrue(
+            os.path.exists(left),
+            "nothing was left behind, so this check proves nothing",
+        )
+        # This check made the file the product could not remove, so this check
+        # removes it - and the teardown then confirms none survived.
+        real_unlink(left)
+
+    def test_a_connector_precheck_runs_inside_the_turn_deadline(self):
+        """A connector's own programs are bounded by the turn, not extra to it.
+
+        Two shapes of the same rule. A precheck that hangs is stopped by the
+        deadline it was handed, and a builder that comes back after the deadline
+        has passed is refused before its command is ever run. Neither publishes
+        a request, because nothing was sent.
+        """
+        head = self.ready()
+        for name, build in (
+            ("a precheck that hangs", self.precheck_builder(30.0)),
+            ("a builder that returns late", self.late_builder()),
+        ):
+            with self.subTest(builder=name):
+                before = len(self.handed)
+                with self.assertRaises(BridgeError) as caught:
+                    runner.run_turn(
+                        self.session_dir,
+                        "claude",
+                        REVIEW_BODY,
+                        build,
+                        2.0,
+                        project=self.repo.project,
+                        review_base=self.repo.initial_commit,
+                        review_head=head,
+                    )
+                self.assertEqual(caught.exception.failure, Failure.TIMEOUT)
+                self.assertEqual(len(self.handed), before + 1)
+                self.assertTrue(
+                    self.handed[-1].existed,
+                    "the evidence was not there when the connector was called",
+                )
+                self.assertEqual(self.requests(), [])
+                self.assertEqual(self.responses(), [])
+                self.assertEqual(self._evidence_files(), self.evidence_before)
 
     def test_evidence_that_outruns_the_deadline_publishes_nothing(self):
         """One deadline covers writing the difference, not just the peer call."""
@@ -731,6 +1010,79 @@ class GitFinishLine(unittest.TestCase):
         self.assertTrue(
             os.path.exists(ignored),
             "an ignored file was deleted instead of being reported",
+        )
+
+    def test_a_repository_cannot_hide_an_untracked_file(self):
+        """Configuration decides what Git mentions. It must not decide this.
+
+        A repository may ask Git to stop reporting untracked files. Set that,
+        and an ordinary untracked file - and every ignored one with it -
+        disappears from the answer, which this check confirms first so that what
+        follows means something. The gate asks for them by name anyway, because
+        a reviewer reading the project would see a file no commit contains.
+        """
+        self.seal(self.repo.initial_commit)
+        head = self.repo.add_commit("Ordinary committed work")
+        self.repo._git("config", "status.showUntrackedFiles", "no")
+        secret = os.path.join(self.repo.project, "secret.txt")
+        with open(secret, "w", encoding="utf-8") as stream:
+            stream.write("Something no commit contains.\n")
+
+        hidden = self.repo._git("status", "--porcelain", "--ignored")
+        self.assertEqual(
+            hidden.strip(),
+            "",
+            "the repository is not hiding anything, so this check proves "
+            "nothing",
+        )
+
+        error = self.refuse(
+            Failure.DIRTY_WORKTREE, "accept", self.repo.initial_commit, head
+        )
+        self.assertIn("secret.txt", str(error))
+        self.assertEqual(self.requests(), [])
+        self.assertTrue(
+            os.path.exists(secret),
+            "an untracked file was deleted instead of being reported",
+        )
+
+    def test_the_gate_does_not_run_the_repositorys_filesystem_monitor(self):
+        """One named way a repository can have its program run, and it cannot.
+
+        Git can be told to start a filesystem-monitor helper while it looks at a
+        worktree, and that helper is an ordinary program of the repository's
+        choosing. This one leaves a mark. Ordinary Git runs it, which the check
+        confirms first; the gate must not, because a supposedly read-only check
+        that runs somebody else's program has already had an effect - before the
+        peer was even started.
+
+        This proves that one setting, and is named for it. It is not a claim
+        that nothing a repository says can make the gate run a program: a
+        content filter still can, which INTERFACE.md and `gitgate` both state.
+        """
+        head = self.ready()
+        marker = os.path.join(self.temp, "the-helper-ran")
+        helper = os.path.join(self.temp, "fsmonitor-helper.sh")
+        with open(helper, "w", encoding="utf-8") as stream:
+            stream.write(FSMONITOR_HELPER.format(marker))
+        os.chmod(helper, 0o700)
+        self.repo._git("config", "core.fsmonitor", helper)
+
+        self.repo._git("status", "--porcelain")
+        self.assertTrue(
+            os.path.exists(marker),
+            "the helper never ran at all, so this check proves nothing",
+        )
+        os.unlink(marker)
+
+        result = self.review("accept", self.repo.initial_commit, head)
+        self.assertTrue(result.git_unlocked)
+        self.assertFalse(
+            os.path.exists(marker),
+            "the repository chose a program and the gate ran it",
+        )
+        self.assert_evidence_reached_the_builder(
+            self.repo.initial_commit, head
         )
 
     # -- the repository outranks a fumbled last line ------------------------

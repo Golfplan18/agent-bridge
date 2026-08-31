@@ -22,6 +22,21 @@ there and complete, but a machine failure could still lose the name. It is
 reported as its own failure, naming the file, rather than as "nothing was
 published", which would be untrue.
 
+Which side something happened on is settled by looking, not by remembering. A
+flag set on the line after the rename is one instruction too late: a signal can
+arrive in between, and the report would then say nothing was published while the
+message sat on the disk. So the question is asked of the filesystem instead, and
+it is asked in the one way that cannot be answered wrongly: the temporary file's
+own identity is noted before the rename, and the message counts as published
+only when the canonical name now holds that very file. A temporary file that has
+merely gone - because the folder it was in went with it - proves nothing and is
+not taken for a rename.
+
+Being stopped is not a publication failure and is never dressed up as one. An
+interrupt or a termination signal is passed straight on, after the temporary
+file has been cleared away if there is one, so that what the person reads is
+that they stopped it.
+
 **Numbering is derived, not remembered.** The next sequence number is whatever is
 one higher than the highest number already on disk. Nothing counts on behalf of
 the directory, so nothing can disagree with it.
@@ -43,6 +58,7 @@ from typing import Dict, List, NamedTuple, Optional, Sequence, Tuple
 
 from . import BRIDGE_FORMAT
 from .errors import BridgeError, Failure
+from .peer import SignalStop
 
 SESSION_FILENAME = "SESSION.md"
 MESSAGES_DIRNAME = "messages"
@@ -133,6 +149,33 @@ def _fsync_directory(directory: str) -> None:
         os.close(handle)
 
 
+def _rename_happened(path: str, written: Optional[Tuple[int, int]]) -> bool:
+    """Did the rename go through? Ask the filesystem, not a variable.
+
+    `written` identifies the temporary file that was filled in - which device
+    it is on and which file on that device. A rename moves that exact file onto
+    the canonical name without making a new one, so the canonical name holding
+    that same identity is the rename having happened, and nothing else is.
+
+    Neither half would do on its own. The canonical name merely existing proves
+    nothing, because a replaced plan is written over a file that was already
+    there. The temporary file merely being gone proves nothing either, because
+    the folder it was in could have gone with it while the rename failed.
+
+    `None` means nothing was ever written, so nothing can have been renamed. A
+    filesystem that will not answer is read as "not published", which is the
+    cautious way round: the caller is then told to look for a message, rather
+    than told to trust one that may not be there.
+    """
+    if written is None:
+        return False
+    try:
+        found = os.stat(path)
+    except OSError:
+        return False
+    return (found.st_dev, found.st_ino) == written
+
+
 def publish(path: str, text: str) -> str:
     """Write one canonical file so that it is either whole or absent.
 
@@ -141,30 +184,51 @@ def publish(path: str, text: str) -> str:
     Any failure up to and including that rename removes the temporary file and
     reports `PUBLICATION_FAILURE`, leaving the session exactly as it was.
 
-    The rename is the moment of publication. After it the message is in place
-    and complete, and the only thing left to do is force the folder entry
-    naming it out to the disk. If that fails, saying nothing was published
-    would be a lie, so it is reported as `PUBLICATION_NOT_FLUSHED` instead: the
-    message is there, and a machine failure could still lose it. The turn fails
-    either way.
+    The rename is the moment of publication, and which side of it something
+    happened on is decided by asking whether the canonical name now holds the
+    very file that was written, rather than by a variable set afterwards. After
+    the rename the message is in place and
+    complete, and the only thing left to do is force the folder entry naming it
+    out to the disk. If that fails, saying nothing was published would be a lie,
+    so it is reported as `PUBLICATION_NOT_FLUSHED` instead: the message is
+    there, and a machine failure could still lose it. The turn fails either way.
+
+    An interrupt or a stop signal is not a publication failure. It is raised on
+    unchanged - after the temporary file is cleared away, when the rename had
+    not happened - so that nothing reports "nothing was published" about a
+    message that is on the disk, and nothing calls a person's own decision to
+    stop a fault of this function.
     """
     directory = os.path.dirname(os.path.abspath(path))
     try:
         handle, temp_path = tempfile.mkstemp(prefix=TEMP_PREFIX, dir=directory)
     except OSError as exc:
         raise BridgeError(Failure.PUBLICATION_FAILURE, detail=str(exc))
+    written = None  # type: Optional[Tuple[int, int]]
     try:
         with os.fdopen(handle, "w", encoding="utf-8") as stream:
             stream.write(text)
             stream.flush()
             os.fsync(stream.fileno())
+            marks = os.fstat(stream.fileno())
+            written = (marks.st_dev, marks.st_ino)
         os.replace(temp_path, path)
     except BaseException as exc:
+        if _rename_happened(path, written):
+            # The message is in place. Whatever went wrong went wrong after
+            # publication, so it is never reported as though nothing was sent.
+            if isinstance(exc, (SignalStop, KeyboardInterrupt)):
+                raise
+            raise BridgeError(
+                Failure.PUBLICATION_NOT_FLUSHED,
+                detail="{0}: {1}".format(path, exc),
+            )
         try:
-            if os.path.exists(temp_path):
-                os.unlink(temp_path)
+            os.unlink(temp_path)
         except OSError:
             pass
+        if isinstance(exc, (SignalStop, KeyboardInterrupt)):
+            raise
         raise BridgeError(
             Failure.PUBLICATION_FAILURE, detail="{0}: {1}".format(path, exc)
         )
@@ -226,9 +290,14 @@ def local_to_peer_text(
 
     An ordinary request carries nothing but who it is from and who it is for.
     A review request carries one more runner-owned line, `Review-Evidence:`,
-    naming the exact file the reviewing peer was given to read. It is written
-    here so the record says what the reviewer was pointed at, and it is a fact
-    the runner already held: the peer supplies none of it.
+    naming the exact file the reviewing peer was given to read.
+
+    That line is a note the runner writes to itself and to whoever reads the
+    session afterwards: this is the file this turn generated. It is not what
+    gets the file to the peer, and the peer never sees it - a header line lives
+    above the body, and the peer receives only the body. What tells a peer where
+    the evidence is are the connector's restriction switches, and what proves it
+    read the file is the token inside the file coming back in the answer.
 
     None of the `Review-Request`, `Review-Base` or `Review-Head` fields ever
     appear on a request. Those bind an answer, and no answer has been given

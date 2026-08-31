@@ -17,19 +17,47 @@ begins from. A path alone could be a different repository moved into place; root
 commits alone could be a clone somewhere else. Together they say "the same
 repository, in the same place".
 
-Every Git command here also runs with replacement objects switched off. Git
-lets a repository say "wherever you see this commit, read that one instead", and
-a review that honoured such a mapping would show a reviewer contents that are
-not the commit named by `Review-Head`. Nothing in a repository's own
-configuration is allowed to decide what a reviewer sees.
+Every Git command here is given the same fixed set of overrides, so that as
+little as possible of what a repository says about itself can decide what a
+reviewer sees or start a program while this module reads.
+
+Replacement objects are switched off, because Git lets a repository say
+"wherever you see this commit, read that one instead" and a review that honoured
+such a mapping would show a reviewer contents that are not the commit named by
+`Review-Head`. External difference programs and text-conversion filters are
+switched off for the same reason. A filesystem-monitor helper, a hook directory
+and automatic housekeeping are switched off because a supposedly read-only check
+that runs somebody else's program has already had an effect before the peer was
+even started.
+
+**One way in is left open, and it is left open knowingly.** A repository can
+name a content filter - `filter=<name>` in its own `.gitattributes`, and
+`filter.<name>.clean` in its local configuration - and Git runs that program
+while working out whether the worktree is clean. Agent Bridge does not switch
+that off, because there is no fixed switch that does: filters are named one at a
+time and cannot be turned off as a class, and the one mechanism that would
+suppress them needs a Git new enough to take `--attr-source`, a per-repository
+lookup to name an empty tree, and would change what the evidence file itself
+shows. So it is stated rather than pretended about. The exposure needs the local
+`.git/config` of the repository under review to define such a filter, which
+under the same-user trust boundary is the user's own configuration; a person who
+does not want it should not point a review at a repository whose local
+configuration they did not write.
+
+Cleanliness is asked for in full. Untracked files are requested explicitly
+rather than left to the repository's own preference, because a repository may
+ask Git to stop mentioning them; ignored entries are asked for as well. Anything
+at all means the worktree holds something no commit contains.
 
 The reviewer gets no shell and no Git. What it gets instead is one file: the
-cumulative difference between the two commits, generated here, once, with
-external difference programs and text-conversion filters switched off for the
-same reason. That file lives outside both the project and the session record, is
-derived evidence rather than a second source of truth, and is deleted on every
-way out. The exact bytes written are hashed at the same moment, so the file the
-peer had can be shown afterwards to be the file this turn wrote.
+cumulative difference between the two commits, generated here, once, and then
+one more line - a fresh unpredictable token, written by this turn and reachable
+no other way. That token is what turns "the peer was told where the evidence is"
+into "the peer read it": the runner asks for it back and refuses to open the Git
+finish line without it. The file lives outside both the project and the session
+record, is derived evidence rather than a second source of truth, and is deleted
+on every way out. The exact bytes written are hashed at the same moment, so the
+file the peer had can be shown afterwards to be the file this turn wrote.
 
 SPDX-License-Identifier: Unlicense
 """
@@ -38,6 +66,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import secrets
 import tempfile
 from typing import Iterable, NamedTuple, Optional, Sequence, Tuple
 
@@ -49,6 +78,36 @@ from .session import SealedImplementation
 #: none of them outlived the turn that made one.
 REVIEW_EVIDENCE_PREFIX = "agent-bridge-review-evidence-"
 REVIEW_EVIDENCE_SUFFIX = ".diff"
+
+#: The last line of every review-evidence file begins with this, and ends with a
+#: value generated fresh for that one turn. Spacing is exact, because the
+#: instruction sent to the peer quotes this prefix and nothing else.
+EVIDENCE_TOKEN_PREFIX = "Agent-Bridge-Evidence-Token: "
+
+#: How many random bytes the token is made of. Thirty-two hexadecimal characters
+#: cannot be guessed, worked out from the outgoing message, or repeated by
+#: accident between two turns.
+EVIDENCE_TOKEN_BYTES = 16
+
+#: What the runner appends to the outgoing body of a review request. It names
+#: the prefix and never the value: the value exists only inside the evidence
+#: file, so quoting it back is the one thing a peer that did not open the file
+#: cannot do.
+REVIEW_EVIDENCE_INSTRUCTION = """
+---
+
+## Proof that you received and read the review evidence
+
+The last line of the review-evidence file this call granted you begins with
+`{0}`. Open that file, read it, and copy that line into
+your response.
+
+Agent Bridge refuses any review whose response does not contain that value,
+whatever verdict the response carries, and no such review can unlock the Git
+finish line.
+""".format(
+    EVIDENCE_TOKEN_PREFIX.strip()
+)
 
 
 class RepositoryIdentity(NamedTuple):
@@ -62,13 +121,19 @@ class ReviewEvidence(NamedTuple):
     """The review evidence a peer was given, and proof of what it held.
 
     `digest` is the SHA-256 of the exact bytes written into `path`. It is taken
-    at the moment of writing so that, once the peer has finished, the same
-    bytes can be shown to be there still - which is the only way to tell a
-    reviewer that read the difference from one that was handed something else.
+    at the moment of writing so that, once the peer has finished, the same bytes
+    can be shown to be there still.
+
+    `token` is the unpredictable value on the file's last line, made fresh for
+    this one turn. The digest proves the file did not change under the peer;
+    the token proves the peer opened it. Neither alone is enough: a file nobody
+    read is unchanged too, and a value quoted back says nothing about what the
+    file held at the end.
     """
 
     path: str
     digest: str
+    token: str
 
 
 def _git_env() -> Tuple[Tuple[str, str], ...]:
@@ -87,6 +152,38 @@ def _git_env() -> Tuple[Tuple[str, str], ...]:
     return tuple(sorted(env.items()))
 
 
+#: The settings every gate command overrides, and why each one is here. This is
+#: the complete list, not a summary of one: a content filter named through the
+#: repository's own `.gitattributes` is not on it and still runs, for the
+#: reasons given at the top of this file.
+#:
+#: - `core.fsmonitor` names a filesystem-monitor helper that Git starts while
+#:   reading the worktree. A repository could point it at any program at all, so
+#:   `git status` would have run somebody else's code before the peer existed.
+#: - `core.hooksPath` names where Git looks for hooks. None of the commands
+#:   below is meant to run one; pointing the directory at nothing means none can
+#:   be found however Git changes.
+#: - `gc.auto` and `maintenance.auto` let Git decide to start housekeeping of
+#:   its own. Reading a repository must not begin work in it.
+#: - `diff.external` and `core.attributesFile` are how a repository asks for its
+#:   own difference program or text-conversion filter to produce what a reviewer
+#:   reads. What a reviewer reads is Git's own output for two named commits.
+_NO_REPOSITORY_PROGRAMS: Tuple[str, ...] = (
+    "-c",
+    "core.fsmonitor=false",
+    "-c",
+    "core.hooksPath=" + os.devnull,
+    "-c",
+    "gc.auto=0",
+    "-c",
+    "maintenance.auto=false",
+    "-c",
+    "diff.external=",
+    "-c",
+    "core.attributesFile=" + os.devnull,
+)
+
+
 def _git(
     project: str,
     args: Sequence[str],
@@ -101,12 +198,16 @@ def _git(
     the caller did not name as an expected answer is a failure - by default
     `REPOSITORY_UNREADABLE`, carrying Git's own words.
 
-    Replacement objects are switched off for every one of these commands, so a
-    mapping stored in the repository cannot make a commit read as a different
-    commit. Without it, the contents a reviewer judged could differ from the
-    commit written into `Review-Head`.
+    Two kinds of override are applied to every one of these commands. Replacement
+    objects are switched off, so a mapping stored in the repository cannot make a
+    commit read as a different commit; without it, the contents a reviewer judged
+    could differ from the commit written into `Review-Head`. And the settings
+    listed above, which would otherwise let the repository choose a program for
+    Git to run, are switched off. That list is exact and does not cover content
+    filters, which the top of this file explains.
     """
     argv = ["git", "-C", project, "--no-pager", "--no-replace-objects"]
+    argv.extend(_NO_REPOSITORY_PROGRAMS)
     argv.extend(args)
     result = peer_module.run_bounded(
         argv=argv,
@@ -190,16 +291,28 @@ def is_ancestor(
 def require_clean(project: str, deadline: "peer_module.Deadline") -> None:
     """Refuse to go on unless no commit is missing anything in the worktree.
 
-    Git is asked for ignored entries as well as changed and untracked ones, and
-    any entry at all means the worktree is not clean. An untracked file counts
-    because a reviewer reading the project would see it and no commit would
-    contain it; an ignored file counts for exactly the same reason, and being
-    ignored by Git says nothing about whether a reviewing peer can read it.
+    Git is asked for every untracked file and for ignored entries as well as
+    changed ones, and any entry at all means the worktree is not clean. An
+    untracked file counts because a reviewer reading the project would see it
+    and no commit would contain it; an ignored file counts for exactly the same
+    reason, and being ignored by Git says nothing about whether a reviewing peer
+    can read it.
+
+    Untracked files are asked for by name on the command line rather than left
+    to the repository's own preference. A repository may set
+    `status.showUntrackedFiles` to `no`, and then an ordinary untracked file -
+    and every ignored one with it - simply does not appear in the answer. A
+    worktree that hides what it contains would otherwise pass as clean, and a
+    reviewer would be reading files no commit holds.
 
     Nothing is ever deleted here. The failure names what was found so that a
     person can decide what to do with their own files.
     """
-    result = _git(project, ["status", "--porcelain", "--ignored"], deadline)
+    result = _git(
+        project,
+        ["status", "--porcelain", "--untracked-files=all", "--ignored"],
+        deadline,
+    )
     entries = [line.strip() for line in result.stdout.splitlines()]
     entries = [line for line in entries if line]
     if not entries:
@@ -324,27 +437,36 @@ def generate_review_evidence(
     outside the session record - because it is derived evidence, not part of the
     permanent account of the work.
 
+    One line is added after the difference: a token made from fresh random bytes
+    for this turn alone. A real difference contains nothing a peer could not
+    have worked out from the change itself, so there would otherwise be nothing
+    in the file that proves it was opened. The token is written here and named
+    nowhere else, so a peer can only produce it by reading the file, and the
+    runner requires it back before any acceptance counts.
+
     Bytes are written, and those same bytes are hashed, rather than text being
     handed to an encoder twice: the digest has to describe the file on disk
     exactly, or checking it afterwards would prove nothing.
 
-    A temporary area that is full, unwritable or missing is an ordinary thing
-    to run into, so it is reported as `REVIEW_EVIDENCE_UNAVAILABLE` with
-    something to do about it. A write that fails part way through takes its
-    half-written file with it.
+    A temporary area that is full, unwritable or missing is an ordinary thing to
+    run into, so it is reported as `REVIEW_EVIDENCE_UNAVAILABLE` with something
+    to do about it. A write that fails part way through takes its half-written
+    file with it - and when that removal fails too, a partly written file is
+    left on the disk, which is a cleanup failure and is reported as one. Saying
+    only that the evidence was unavailable would leave somebody with a file
+    nobody told them about.
     """
     argv = [
-        "-c",
-        "diff.external=",
-        "-c",
-        "core.attributesFile=" + os.devnull,
         "diff",
         "--no-ext-diff",
         "--no-textconv",
         "{0}..{1}".format(base, head),
     ]
     result = _git(project, argv, deadline)
-    payload = result.stdout.encode("utf-8")
+    token = secrets.token_hex(EVIDENCE_TOKEN_BYTES)
+    payload = (
+        result.stdout + "\n" + EVIDENCE_TOKEN_PREFIX + token + "\n"
+    ).encode("utf-8")
     try:
         handle, path = tempfile.mkstemp(
             prefix=REVIEW_EVIDENCE_PREFIX, suffix=REVIEW_EVIDENCE_SUFFIX
@@ -358,15 +480,26 @@ def generate_review_evidence(
             os.fsync(stream.fileno())
     except BaseException as exc:
         try:
-            if os.path.exists(path):
-                os.unlink(path)
-        except OSError:
+            os.unlink(path)
+        except FileNotFoundError:
             pass
+        except OSError as removal:
+            raise BridgeError(
+                Failure.CLEANUP_FAILURE,
+                detail=(
+                    "the partly written review evidence {0} could not be "
+                    "removed after it failed to be written ({1}): {2}".format(
+                        path, exc, removal
+                    )
+                ),
+            )
         raise BridgeError(
             Failure.REVIEW_EVIDENCE_UNAVAILABLE,
             detail="{0}: {1}".format(path, exc),
         )
-    return ReviewEvidence(path=path, digest=hashlib.sha256(payload).hexdigest())
+    return ReviewEvidence(
+        path=path, digest=hashlib.sha256(payload).hexdigest(), token=token
+    )
 
 
 def verify_review_evidence(evidence: ReviewEvidence) -> None:
@@ -376,6 +509,13 @@ def verify_review_evidence(evidence: ReviewEvidence) -> None:
     removed. A file that is gone, shorter, or different in any byte means the
     reviewer was not judging the difference this turn generated, so the turn is
     void - there is no way to tell what it was actually looking at.
+
+    What this does not catch, stated plainly rather than implied away: it
+    compares two moments, not the whole time in between. Evidence replaced with
+    bytes identical to the ones written passes, which is the intended answer -
+    the file still holds the difference this turn generated. Evidence that was
+    something else for a while and was put back before the peer finished passes
+    too, and that one is a genuine gap: this check would not see it.
     """
     try:
         with open(evidence.path, "rb") as stream:

@@ -54,17 +54,42 @@ Running that vector once, safely, inside the deadline is still this function's
 work. Keeping those apart is why the runner never imports a connector.
 
 **A reviewer has to be shown to have read the evidence, not trusted to have.**
-Three things together do that. The connector states what it granted the peer
-read access to - the project root and the evidence file - and both statements
-have to match, exactly, what this turn made. The published request names the
-evidence file, so the record says what the reviewer was pointed at. And the
-exact bytes written are hashed and checked again the moment the peer finishes,
-so a file that was replaced, truncated or removed voids the turn rather than
-producing a verdict about something nobody can identify.
+Three things together do that, and the third is the one that makes it a rule
+rather than a hope.
 
-That is also why nothing is published until the evidence exists, the command
-has been composed and the declared paths agree. Until all three are true nothing
-has been sent, and a request message on disk would be saying otherwise.
+The connector states what it granted the peer read access to - the project root
+and the evidence file - and both statements have to match, exactly, what this
+turn made. The exact bytes written are hashed and checked again the moment the
+peer finishes, so a file that was replaced, truncated or removed voids the turn
+rather than producing a verdict about something nobody can identify.
+
+And the evidence file ends with one line nobody could have written but this
+turn: a fresh unpredictable token. The instruction this function appends to the
+outgoing body names the beginning of that line and never its value, so the only
+way to produce the value is to open the file and read it. **No answer becomes an
+acceptance unless that value comes back.** A review whose response does not
+contain it is treated exactly as a review whose last line is not a verdict: the
+peer's prose is kept as an ordinary message that binds to nothing and carries no
+authority, the call fails with `REVIEW_EVIDENCE_NOT_DELIVERED`, Git stays
+locked, and acceptance requires a fresh review call. Good findings are not
+thrown away for a missing token, and a missing token is not forgiven either.
+
+The value appearing anywhere in the response is enough. What is being proved is
+that the file reached the peer and could be read, not that a model weighed every
+line of it - no check could show the second thing, and pretending otherwise
+would be worse than saying which one this is.
+
+The published request names the evidence file in a `Review-Evidence:` line, and
+it is worth being exact about what that line is for. It is this turn's own note
+of what it generated, kept so that whoever reads the session afterwards can see
+what the reviewer was pointed at. It is not what makes delivery possible and
+never reaches the peer: a header sits above the body, and the peer receives only
+the body. What tells a peer where to read are the connector's restriction
+switches, and what shows it read is the token above.
+
+All of that is also why nothing is published until the evidence exists, the
+command has been composed and the declared paths agree. Until all three are true
+nothing has been sent, and a request message on disk would be saying otherwise.
 
 SPDX-License-Identifier: Unlicense
 """
@@ -98,7 +123,23 @@ class TurnResult(NamedTuple):
 
 
 def _canonical(path: Optional[str]) -> Optional[str]:
-    """One spelling of a path, so two names for one file compare equal."""
+    """One spelling of a path, so two names for one file compare equal.
+
+    Symbolic links are followed, so a link and its target are seen as the one
+    file they are. Two limits are worth saying out loud rather than leaving to
+    be discovered.
+
+    Letter case is not folded. On a filesystem that ignores case - the ordinary
+    macOS one does - two spellings that differ only in case name the same file,
+    and this comparison calls them different, so the turn is refused. That is
+    the safe way round, and a connector that hands back the path it was given
+    never meets it.
+
+    And a link is looked at once, here. A link changed after this moment points
+    somewhere else and nothing looks again. Under the same-user trust boundary
+    that is not a defence this can offer: whoever could move the link could
+    equally read the file.
+    """
     if not path:
         return None
     return os.path.realpath(path)
@@ -164,20 +205,25 @@ def run_turn(
     whatever the answer looked like.
 
     One review turn happens in this order, holding the session lock: check the
-    repository; write the evidence and record what it holds; compose the
-    command, with the deadline checked either side; require the connector's
-    declared paths to match; publish the request naming the evidence; run the
-    peer; confirm the evidence is unchanged, then delete it whatever happened;
-    check the repository again; and only then publish the answer.
+    repository; write the evidence, which ends with this turn's own token, and
+    record what it holds; compose the command, with the deadline checked either
+    side; require the connector's declared paths to match; publish the request,
+    naming the evidence and carrying the instruction to copy the token back; run
+    the peer; confirm the evidence is still the bytes that were written; read
+    the verdict and require the token; delete the evidence, which happens on the
+    way out of any of those steps whatever their outcome; check the repository
+    again; and only then publish the answer.
 
-    Every failure raises and leaves the Git finish line locked. A failure
-    before the request is published leaves no request behind, because nothing
-    was sent. Almost every failure also leaves no response message - including
-    a failure to build the command, where the evidence is deleted just the same
-    and nothing is published. The single exception is `INVALID_VERDICT`: a peer
-    that exited cleanly with real output whose final line is not a verdict has
-    its text kept as an ordinary message, published with no `Review-*` fields,
-    which is why it can hold no authority. The call fails all the same.
+    Every failure raises and leaves the Git finish line locked. A failure before
+    the request is published leaves no request behind, because nothing was sent.
+    Almost every failure also leaves no response message - including a failure
+    to build the command, where the evidence is deleted just the same and
+    nothing is published. There are two exceptions, and they are the same
+    exception twice: a peer that exited cleanly with real output whose final
+    line is not a verdict (`INVALID_VERDICT`), and one whose answer never
+    mentions the evidence token (`REVIEW_EVIDENCE_NOT_DELIVERED`). Both have
+    their text kept as an ordinary message, published with no `Review-*` fields,
+    which is why neither can hold any authority. The call fails all the same.
     """
     deadline = Deadline(timeout_seconds)
     review = review_base is not None and review_head is not None
@@ -234,6 +280,17 @@ def run_turn(
                 deadline.check("composing the peer command")
                 _require_declared_access(command, project, evidence)
 
+                # A review carries one more thing than the workflow wrote: this
+                # turn's own instruction to copy the evidence token back. It is
+                # appended to the outgoing text, so what is sent and what the
+                # record shows are the same words.
+                outgoing = body
+                if evidence is not None:
+                    outgoing = (
+                        session_module.body_block(body)
+                        + gitgate.REVIEW_EVIDENCE_INSTRUCTION
+                    )
+
                 # Only now has anything been sent, so only now is there a
                 # request worth recording - and it names the file the reviewer
                 # was given.
@@ -248,7 +305,7 @@ def run_turn(
                         request_sequence,
                         record.local,
                         record.peer,
-                        body,
+                        outgoing,
                         review_evidence=(
                             evidence.path if evidence is not None else None
                         ),
@@ -259,7 +316,7 @@ def run_turn(
                     argv=command.argv,
                     cwd=command.cwd,
                     env=command.env,
-                    stdin_text=body,
+                    stdin_text=outgoing,
                     deadline=deadline,
                 )
                 if evidence is not None:
@@ -280,7 +337,7 @@ def run_turn(
                         Failure.EMPTY_RESPONSE, detail=command.argv[0]
                     )
                 verdict = None
-                unusable_from = None
+                unusable = None
                 if review:
                     result = read_verdict(response)
                     if result.failure is Failure.INVALID_VERDICT:
@@ -288,10 +345,24 @@ def run_turn(
                         # its last line is wrong. Keep the prose - published
                         # below with every binding field withheld - and still
                         # fail.
-                        unusable_from = command.argv[0]
+                        unusable = (
+                            Failure.INVALID_VERDICT,
+                            command.argv[0],
+                        )
                     elif not result.ok:
                         raise BridgeError(
                             result.failure, detail=command.argv[0]
+                        )
+                    elif evidence is None or evidence.token not in response:
+                        # A well-formed verdict from a peer that never quoted
+                        # the token cannot have been reached by reading the
+                        # difference. It is treated exactly as a fumbled last
+                        # line: the prose is kept, bound to nothing, and the
+                        # call fails.
+                        unusable = (
+                            Failure.REVIEW_EVIDENCE_NOT_DELIVERED,
+                            "{0} answered without the token that was only in "
+                            "the evidence file".format(command.argv[0]),
                         )
                     else:
                         verdict = result.verdict
@@ -305,7 +376,7 @@ def run_turn(
         if review:
             gitgate.after_review_checks(project, sealed, head, deadline)
 
-        bound = review and unusable_from is None
+        bound = review and unusable is None
 
         response_sequence = session_module.next_sequence(session_dir)
         response_path = session_module.publish(
@@ -325,13 +396,14 @@ def run_turn(
             ),
         )
 
-        if unusable_from is not None:
+        if unusable is not None:
             # Published, but as an ordinary message with no Review-* fields: it
             # holds no authority, unlocks nothing, and the call still fails.
+            failure, why = unusable
             raise BridgeError(
-                Failure.INVALID_VERDICT,
+                failure,
                 detail="{0}; the response was kept as {1}".format(
-                    unusable_from, response_path
+                    why, response_path
                 ),
             )
 

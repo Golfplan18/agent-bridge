@@ -119,10 +119,22 @@ from the keyboard, a termination signal and a hangup signal all take the same
 route out: the process group the turn owns is emptied, the review evidence is
 deleted, and the session lock is released. After a termination or a hangup the
 command then says in one plain sentence that it was stopped, and exits nonzero.
-Three things stay outside anybody's control and are not pretended about: being
-killed outright with `SIGKILL`, a machine that loses power, and a child that
+Two moments inside a turn are treated differently, because raising there would
+do the opposite of what the person pressing the key wants: while the child is
+being created, when a program exists that nothing has yet taken responsibility
+for, and during the cleanup itself, when a second signal would abandon the
+emptying half done. In both, the stop waits until the moment has passed and is
+then raised. It changes when the stop is raised, never whether.
+
+Four things stay outside anybody's control and are not pretended about: being
+killed outright with `SIGKILL`; a machine that loses power; a child that
 deliberately puts itself into a session of its own and so leaves the group the
-turn owns. The last of those has an exact consequence for connectors: a harness
+turn owns; and a turn run somewhere other than the main thread, where no handler
+can be installed at all, so a termination signal does whatever the surrounding
+program already arranged — by default, ending it at once and leaving the peer
+running. The turn still goes ahead off the main thread, because refusing to work
+would be worse, but the tidy exit is not available there and is not claimed. The
+third of the four has an exact consequence for connectors: a harness
 command-line program that daemonizes during a turn puts its work beyond this
 cleanup, and must therefore fail qualification.
 
@@ -247,7 +259,12 @@ To: codex
 ```
 
 A review request, which adds one runner-owned line naming the exact file the
-reviewing peer was given to read:
+runner generated for this turn. That line is the runner's own note of what it
+made, kept so that whoever reads the session afterwards can see what the
+reviewer was pointed at. It is not what gets the evidence to the peer and the
+peer never sees it: a header sits above the body, and the peer receives only the
+body. What tells a peer where to read is the connector's restriction switches,
+and what shows it read is described in section 8:
 
 ```markdown
 # Message 0011
@@ -343,19 +360,52 @@ reading the report: `EMPTY_RESPONSE` when the peer produced no text at all, and
 `INVALID_VERDICT` when it produced text that does not end correctly.
 
 A verdict is only worth anything if it describes the exact code that was
-reviewed, so `run` binds it to commits. Every Git command it runs to do that has
-replacement objects disabled, because Git lets a repository say "wherever you see
-this commit, read that one instead" and a review that honoured such a mapping
-would show a reviewer contents the `Review-Head` line does not name. A worktree
-counts as clean only when Git reports nothing at all — no uncommitted change, no
-untracked file, and no ignored file either, since being ignored by Git says
-nothing about whether a reviewing peer can read something no commit contains.
-Ignored files are reported, never deleted: they are the user's own files.
+reviewed, so `run` binds it to commits. As little as possible of what a
+repository says about itself is allowed to decide what the gate sees or to make
+it start a program, so every Git command the gate runs carries the same fixed
+overrides — this list, exactly, and one thing it does not cover is named
+immediately after it:
+
+- **replacement objects off**, because Git lets a repository say "wherever you
+  see this commit, read that one instead", and a review that honoured such a
+  mapping would show a reviewer contents the `Review-Head` line does not name;
+- **external difference programs and text-conversion filters off**, for the same
+  reason — what a reviewer reads is Git's own output for two named commits;
+- **the filesystem-monitor helper off**, because `core.fsmonitor` names a program
+  of the repository's choosing that Git starts while reading a worktree, and a
+  supposedly read-only check that runs somebody else's program has already had an
+  effect before the peer was even started;
+- **the hook directory pointed at nothing**, so no hook can be found however Git
+  changes; and
+- **automatic housekeeping off**, so reading a repository never begins work in it.
+
+**What that list does not cover.** A repository can name a content filter —
+`filter=<name>` in its own `.gitattributes`, with `filter.<name>.clean` in its
+local configuration — and Git runs that program while working out whether the
+worktree is clean. Agent Bridge does not switch that off, and says so rather
+than implying otherwise: filters are named one at a time and cannot be turned
+off as a class, and the one mechanism that would suppress them needs a newer Git
+than this must run on, a per-repository lookup, and would change what the
+evidence file itself shows. The exposure needs the local `.git/config` of the
+repository under review to define such a filter — under the same-user trust
+boundary, the user's own configuration. Do not point a review at a repository
+whose local configuration you did not write.
+
+A worktree counts as clean only when Git reports nothing at all — no uncommitted
+change, no untracked file, and no ignored file either, since being ignored by Git
+says nothing about whether a reviewing peer can read something no commit
+contains. Untracked files are asked for **by name on the command line**, not left
+to the repository's preference: a repository may set `status.showUntrackedFiles`
+to `no`, and then an ordinary untracked file — and every ignored one with it —
+simply does not appear in the answer, so a worktree that hides what it holds
+would pass as clean. Ignored files are reported, never deleted: they are the
+user's own files.
 
 The reviewing peer is given the project and one file to read, and no shell and
 no Git. That file is the `baseline..head` diff, generated once, with a fixed
-argument vector and external diff and text-conversion hooks disabled, into one
-temporary file the runner owns, outside both the project and the session record.
+argument vector and the overrides above, into one temporary file the runner
+owns, outside both the project and the session record — followed by one more
+line, described next.
 
 How the runner and the connector fit together at that moment is fixed, because
 one depends on the other. The runner is not handed a ready-made command. It
@@ -369,16 +419,61 @@ subprocess the connector runs to answer that call goes through the shared
 bounded process runner with that same deadline; there is no second way to start
 a program and no separate budget for one.
 
+**The evidence ends with one line nobody but this turn could have written.** A
+real difference contains nothing unpredictable — a peer could describe it from
+the change itself — so the runner appends a token made from fresh random bytes
+for that turn alone:
+
+```text
+Agent-Bridge-Evidence-Token: <32 hexadecimal characters>
+```
+
+The runner then appends its own instruction to the outgoing body, telling the
+peer to open the evidence file and copy that line back. The instruction names
+the beginning of the line and never its value, so the only way to produce the
+value is to read the file. **No answer becomes an acceptance unless the value
+comes back**, and the value appearing anywhere in the response is enough: what
+is being shown is that the file reached the peer and could be read, not that a
+model weighed every line of it — no check could show the second thing, and
+saying otherwise would be worse than saying which one this is.
+
+A well-formed verdict with the token missing is treated exactly as a response
+whose last line is not a verdict. The peer's prose is published as an **ordinary
+message** carrying none of the `Review-*` fields, so it holds no authority; the
+call fails with `REVIEW_EVIDENCE_NOT_DELIVERED`; Git stays locked; nothing is
+rewritten or retried; and acceptance requires a fresh review call. Useful
+findings are not thrown away for a missing token, and a missing token is not
+forgiven either.
+
 The connector also states, as part of the command it returns, what it granted the
 peer read access to: the project root, and the review-evidence file. Neither has
 a default. The runner resolves both statements and both of its own paths to real
 paths and requires exact agreement — a review must name a real evidence file, an
 ordinary turn must name none, and a turn with no project must be granted none.
 It also records a digest of the exact bytes it wrote as evidence and checks the
-file again the moment the peer finishes. A reviewer therefore cannot be merely
-trusted to have read the right thing: a mismatched grant stops the turn before
-the peer is started, and a file that was replaced, truncated or removed voids the
-turn afterwards.
+file again the moment the peer finishes.
+
+A reviewer therefore cannot be merely trusted to have read the right thing. A
+mismatched grant stops the turn before the peer is started; a file that was
+replaced, truncated or removed voids the turn afterwards; and an answer that
+never quotes the token opens nothing.
+
+**What those three checks do not catch**, stated rather than implied away:
+
+- Paths are compared with symbolic links resolved but letter case unfolded. On a
+  filesystem that ignores case — the ordinary macOS one — two spellings that
+  differ only in case name one file and are called different here, so the turn is
+  refused. That is the safe way round, and a connector that hands back the path it
+  was given never meets it.
+- A symbolic link is resolved once, before the peer starts. A link changed after
+  that points somewhere else and nothing looks again. Under the same-user trust
+  boundary that is not a defence this could offer anyway: whoever could move the
+  link could read the file.
+- The digest compares two moments, not the time between them. Evidence replaced
+  with identical bytes passes, which is the intended answer — the file still
+  holds the difference this turn generated. Evidence that was something else for
+  a while and was put back before the peer finished passes too, and that one is a
+  genuine gap.
 
 One review turn therefore runs in this order, holding the session lock:
 
@@ -386,29 +481,35 @@ One review turn therefore runs in this order, holding the session lock:
    baseline to equal the baseline sealed at `implementation-start`, require it to
    be an ancestor of a distinct task head, confirm the sealed repository, a clean
    worktree and the exact expected `HEAD`;
-2. generate the evidence and record what it holds;
+2. generate the evidence — the difference followed by this turn's token — and
+   record its exact bytes and that token;
 3. check the deadline, compose the command, check the deadline again;
 4. require the connector's declared project and evidence paths to match exactly;
-5. publish the request, which names the evidence file in a `Review-Evidence:`
-   line the runner owns;
+5. publish the request: the outgoing body with the runner's instruction to copy
+   the token appended, and a `Review-Evidence:` line the runner owns naming the
+   file it generated;
 6. run the peer inside the deadline;
-7. confirm the evidence is unchanged, then delete it on every way out;
-8. repeat the repository, cleanliness and `HEAD` checks;
-9. publish the response, carrying the binding fields only when the verdict is
-   valid.
+7. confirm the evidence is still exactly the bytes that were written;
+8. read the verdict, and require the token to appear in the response;
+9. delete the evidence — which happens on the way out of any of steps 2 to 8,
+   whatever their outcome, and not only when they all succeeded;
+10. repeat the repository, cleanliness and `HEAD` checks;
+11. publish the response, carrying the binding fields only when the verdict is
+    valid and the token came back.
 
 A failure before step 5 publishes no request, because nothing was sent. Any
 mismatch at any step, or any failure to clean up, voids the verdict as a
 technical error.
 
-Git unlocks only when all five of these hold at once:
+Git unlocks only when all six of these hold at once:
 
 1. the call succeeded — the peer was started, answered, and exited normally;
 2. the verdict is exactly `ACCEPT`;
-3. the response is bound to its request, and to the baseline and head sealed at
+3. the response contains the evidence token this turn generated;
+4. the response is bound to its request, and to the baseline and head sealed at
    `implementation-start`;
-4. both rounds of repository checks passed, before the call and after it; and
-5. `HEAD` is still the head that was reviewed.
+5. both rounds of repository checks passed, before the call and after it; and
+6. `HEAD` is still the head that was reviewed.
 
 A new commit invalidates the verdict.
 
@@ -423,17 +524,20 @@ baseline or head, a dirty worktree, or a failure to clean up. Captured text in
 those cases may be a fragment of an answer the peer never finished, and a
 fragment must not stand in for a reply.
 
-`INVALID_VERDICT` is the one failure that keeps the text. A peer that exited
-cleanly with real output, and got only its final line wrong, has that output
-published as an **ordinary message** — the same shape any non-review answer
-takes, carrying none of the `Review-*` fields that bind an answer to a request
-and to two commits. It therefore holds no external-review authority and unlocks
-nothing. The repository checks at step 8 come first, whatever the last line
-looked like, because prose is only worth keeping once the code it describes is
-known to be still there: a repository that moved during the review reports the
-movement and publishes nothing at all. The call still fails, Git stays locked, and the text is never rewritten,
-read for an intention, or retried; acceptance requires a fresh review call. A
-reviewer that did good work and fumbled one line should not lose the work.
+Two failures keep the text, and they are the same rule twice: `INVALID_VERDICT`,
+where a peer exited cleanly with real output and got only its final line wrong,
+and `REVIEW_EVIDENCE_NOT_DELIVERED`, where it answered without the evidence
+token. Both have that output published as an **ordinary message** — the same
+shape any non-review answer takes, carrying none of the `Review-*` fields that
+bind an answer to a request and to two commits. It therefore holds no
+external-review authority and unlocks nothing. The repository checks at step 10
+come first, whatever the answer looked like, because prose is only worth keeping
+once the code it describes is known to be still there: a repository that moved
+during the review reports the movement and publishes nothing at all. The call
+still fails, Git stays locked, and the text is never rewritten, read for an
+intention, or retried; acceptance requires a fresh review call. A reviewer that
+did good work and fumbled one line, or forgot to quote one, should not lose the
+work.
 
 In every failing case the request message that was already published stays where
 it is, because it truthfully records what was sent, and the workflow writes the
@@ -479,9 +583,9 @@ code needs it.
 | `REPOSITORY_CHANGED` | The repository is not the one sealed at implementation start | Point at the sealed repository, or start a new session |
 | `BASELINE_CHANGED` | The review baseline is not the sealed baseline | Run the review again with the sealed baseline |
 | `HEAD_CHANGED` | The branch moved, so the review no longer describes the code | Run a fresh review against the current head |
-| `REVIEW_EVIDENCE_UNAVAILABLE` | The file holding the difference could not be created or written | Free space on the temporary filesystem, or point `TMPDIR` somewhere writable |
-| `REVIEW_EVIDENCE_NOT_DELIVERED` | The peer was granted a different file from the one written, or that file changed while the peer had it | Make the connector grant exactly the paths it was handed, check nothing else writes there |
-| `CLEANUP_FAILURE` | Something the turn created could not be removed | Remove the reported path or process by hand and confirm nothing is left |
+| `REVIEW_EVIDENCE_UNAVAILABLE` | The file holding the difference could not be created or written, and what had been written was removed | Free space on the temporary filesystem, or point `TMPDIR` somewhere writable |
+| `REVIEW_EVIDENCE_NOT_DELIVERED` | The peer was granted a different file from the one written, or that file changed while the peer had it, or the peer answered without the token that appears only inside it; where it answered, its text was kept as an ordinary message with no review authority | Make the connector grant exactly the paths it was handed, make sure the peer reads that file and copies its token line back, check nothing else writes there |
+| `CLEANUP_FAILURE` | Something the turn created could not be removed — including a partly written evidence file whose removal failed after the write did, which is reported as the cleanup failure it is rather than only as unavailable evidence | Remove the reported path or process by hand and confirm nothing is left |
 | `USAGE_ERROR` | Missing, conflicting or empty arguments, including empty input | Correct the command line and the input, then run again |
 | `UNKNOWN_HARNESS` | The named harness is not one of the five | Name one of the five identifiers |
 | `CONNECTOR_UNAVAILABLE` | A real identifier, but no connector for it ships in this build | Use a harness whose connector ships |
@@ -499,8 +603,10 @@ code needs it.
 | `BASELINE_NOT_ANCESTOR` | The baseline does not come before a distinct head on the same history | Check `--review-base` and `--review-head` |
 
 Every failure leaves Git locked, publishes no false success, removes what the
-turn started, and gives one next action. `INVALID_VERDICT` alone keeps the
-peer's text, as an ordinary message that carries no review authority.
+turn started, and gives one next action. `INVALID_VERDICT` and
+`REVIEW_EVIDENCE_NOT_DELIVERED` are the two that keep the peer's text, and only
+when the peer really answered — as an ordinary message that carries no review
+authority.
 
 ---
 
