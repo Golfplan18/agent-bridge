@@ -6,21 +6,14 @@ the locking, the envelope and the atomic write. That way there is one writer for
 the canonical record no matter which harness is driving, and one numbering
 scheme that cannot disagree with itself.
 
-There are six kinds and there will not be a seventh without editing this file.
+There are five kinds and there will not be a sixth without editing this file.
 Each one is written out in a plain switch below, because the complete list of
 things that may be written into a session ought to be readable in one sitting.
 
 What this command cannot do is the point of it existing:
 
 - it never starts a peer harness;
-- it never writes a `Review-Request`, `Review-Base` or `Review-Head` line;
-- it never produces a verdict, and no body text can become one.
-
-A user's waiver is recorded here, and a waiver is a different authority from an
-acceptance: it is reported as `USER WAIVED`, it binds to one exact commit, and a
-new commit invalidates it. It cannot paper over a changed repository, a moved
-head or an unclean worktree - those are checked here, before anything is
-written, and must be put right first.
+- it never writes a `Review-Request`, `Review-Base` or `Review-Head` line.
 
 SPDX-License-Identifier: Unlicense
 """
@@ -30,24 +23,20 @@ from __future__ import annotations
 import os
 from typing import List, Optional
 
-from . import gitgate, session as session_module
+from . import session as session_module
 from .connectors import HARNESS_IDS
 from .errors import BridgeError, Failure
 from .locking import session_lock
-from .peer import DEFAULT_TIMEOUT_SECONDS, Deadline
 
-#: The six kinds, in the order the interface lists them. Nothing else is a kind.
+#: The five kinds, in the order the interface lists them. Nothing else is a
+#: kind.
 RECORD_KINDS = (
     "session-create",
     "user-correction",
     "plan-approval",
     "technical-error",
     "implementation-start",
-    "user-waiver",
 )
-
-#: What a waiver may be recorded against.
-WAIVABLE = ("REJECT", "ERROR")
 
 
 def _require(value: Optional[str], what: str) -> str:
@@ -114,34 +103,32 @@ def _create_session(
         )
 
 
-def _seal_implementation(
+def _record_implementation_start(
     session_dir: str,
     record: "session_module.SessionRecord",
     body: str,
     project: Optional[str],
     baseline: Optional[str],
-    deadline: Deadline,
 ) -> str:
-    """Seal the repository and baseline every later review is bound to."""
+    """Write down where the work started, and condition nothing on it.
+
+    The repository and the baseline the task began from are worth having in the
+    ordered account of the session: a later reader can see which project was
+    being worked on and what the work is measured from. That is the whole of it.
+    Nothing here consults Git, nothing checks that the baseline names a commit
+    that exists, and no later command is conditioned, withheld or bound by what
+    is written. The baseline is recorded exactly as it was given.
+    """
     project_path = os.path.abspath(_require(project, "--project"))
     revision = _require(baseline, "--baseline")
-    if session_module.read_sealed_implementation(session_dir) is not None:
-        raise BridgeError(
-            Failure.IMPLEMENTATION_ALREADY_SEALED, detail=session_dir
-        )
-    commit = gitgate.resolve_commit(project_path, revision, deadline)
-    identity = gitgate.resolve_identity(project_path, commit, deadline)
     return _publish_local_record(
         session_dir,
         "implementation-start",
         record.local,
         body,
         extra_headers=[
-            "Repository-Path: {0}".format(identity.path),
-            "Repository-Root-Commits: {0}".format(
-                " ".join(identity.root_commits)
-            ),
-            "Baseline: {0}".format(commit),
+            "Repository-Path: {0}".format(project_path),
+            "Baseline: {0}".format(revision),
         ],
     )
 
@@ -172,49 +159,6 @@ def _approve_plan(
     return session_module.publish(plan_path, session_module.body_block(body))
 
 
-def _waive(
-    session_dir: str,
-    record: "session_module.SessionRecord",
-    body: str,
-    project: Optional[str],
-    head: Optional[str],
-    waived: Optional[str],
-    deadline: Deadline,
-) -> str:
-    """Record the user's waiver, bound to one exact commit that still stands."""
-    project_path = os.path.abspath(_require(project, "--project"))
-    revision = _require(head, "--head")
-    verdict = _require(waived, "--waived")
-    if verdict not in WAIVABLE:
-        raise BridgeError(Failure.USAGE_ERROR, detail="--waived " + verdict)
-    sealed = session_module.read_sealed_implementation(session_dir)
-    if sealed is None:
-        raise BridgeError(
-            Failure.NO_IMPLEMENTATION_BASELINE, detail=session_dir
-        )
-    gitgate.check_identity(project_path, sealed, deadline)
-    commit = gitgate.resolve_commit(project_path, revision, deadline)
-    if not gitgate.is_clean(project_path, deadline):
-        raise BridgeError(Failure.DIRTY_WORKTREE, detail=project_path)
-    here = gitgate.current_head(project_path, deadline)
-    if here != commit:
-        raise BridgeError(
-            Failure.HEAD_CHANGED,
-            detail="the worktree is on {0}, not {1}".format(here, commit),
-        )
-    return _publish_local_record(
-        session_dir,
-        "user-waiver",
-        record.local,
-        body,
-        extra_headers=[
-            "Decision: USER WAIVED",
-            "Waived-Head: {0}".format(commit),
-            "Waived-Verdict: {0}".format(verdict),
-        ],
-    )
-
-
 def record(
     session_dir: str,
     kind: str,
@@ -224,12 +168,9 @@ def record(
     workflow: Optional[str] = None,
     project: Optional[str] = None,
     baseline: Optional[str] = None,
-    head: Optional[str] = None,
-    waived: Optional[str] = None,
     replace: bool = False,
-    timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
 ) -> str:
-    """Write one local record of one of the six kinds. Returns the path written.
+    """Write one local record of one of the five kinds. Returns the path written.
 
     The substantive Markdown always arrives as `body`, read by the caller from
     standard input; empty or whitespace-only text is a usage error, because a
@@ -245,7 +186,6 @@ def record(
     if kind == "session-create":
         return _create_session(session_dir, body, local, peer, workflow, project)
 
-    deadline = Deadline(timeout_seconds)
     session_record = session_module.read_session(session_dir)
     with session_lock(session_dir):
         if kind == "user-correction":
@@ -259,17 +199,7 @@ def record(
         if kind == "plan-approval":
             return _approve_plan(session_dir, session_record, body, replace)
         if kind == "implementation-start":
-            return _seal_implementation(
-                session_dir, session_record, body, project, baseline, deadline
-            )
-        if kind == "user-waiver":
-            return _waive(
-                session_dir,
-                session_record,
-                body,
-                project,
-                head,
-                waived,
-                deadline,
+            return _record_implementation_start(
+                session_dir, session_record, body, project, baseline
             )
     raise BridgeError(Failure.UNKNOWN_RECORD_KIND, detail=kind)

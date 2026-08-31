@@ -22,7 +22,32 @@ What the bridge owns is deliberately small: one bounded call to a peer harness,
 an ordered exchange of Markdown files on disk, an explicit least-authority
 invocation, one lock per session, publication that either completes or does not
 happen at all, cleanup of everything the turn started, and the written
-instructions that coordinate planning and review.
+instructions that coordinate planning and review. Agent Bridge treats a peer's
+command-line program as a trusted program running under the user's own account,
+and makes no claim to stop it reading other files that account can already read,
+so invoke only harnesses you trust.
+
+Two more boundaries follow from that same account, and both are stated here
+rather than papered over.
+
+**Reviewer context.** An executor and a reviewer are separate contexts that
+inherit no conversation from each other, and the protection that makes a
+reviewer independent is the packet the coordinator hands it: no executor claims,
+no hidden reasoning, no prior conversation, only the plan and the evidence.
+Freshness is a property of how that context is built, not of the filesystem.
+Every harness writes plaintext session transcripts that the same account can
+read, and Agent Bridge does not prevent a reviewer that goes looking from
+finding an executor's transcript. It adds no transcript deletion, no search
+prevention and no isolation subsystem.
+
+**Repository instructions.** A peer given a project root is given that project's
+`AGENTS.md` or `CLAUDE.md` along with it, because that is how these harnesses
+work. Agent Bridge does not prevent it and adds no suppression wrapper. Such
+instructions may govern how a repository is inspected; they cannot expand the
+approved plan, create user authority, permit mutation, or authorise a prohibited
+external effect. This repository itself carries no repository-local agent
+instruction file, so an external reviewer of Agent Bridge takes its task
+instructions from the review request.
 
 Everything else stays where it already lives. Each harness keeps its own
 authentication, subscription, providers, models, tools, agents and native
@@ -43,8 +68,8 @@ possible if it runs anywhere, so:
 - **Python 3.9 and later.** macOS ships 3.9 as the system Python, so that is the
   floor; the code must also run unchanged on current releases.
 - **Started as a fixed argument vector, never through a shell.** Every program
-  the bridge starts — a peer harness, or Git — is launched with an explicit list
-  of arguments and no shell interpretation.
+  the bridge starts is launched with an explicit list of arguments and no shell
+  interpretation.
 - **The body always arrives on standard input.** The outgoing Markdown text is
   written to the peer program's standard input. Prompt text never appears on a
   command line, in an environment variable, or in a shell string.
@@ -89,7 +114,7 @@ agent-bridge run --peer <harness-id> --session <session-directory>
 
 agent-bridge record --session <session-directory>
                     --kind <session-create|user-correction|plan-approval|
-                            technical-error|implementation-start|user-waiver>
+                            technical-error|implementation-start>
                     [kind-specific runner-owned fields]
 ```
 
@@ -103,13 +128,38 @@ model or a provider, and writes nothing down for next time.
 **`run`** performs one bounded turn: it publishes the outgoing body as the next
 message, starts the peer once, waits for one answer, and publishes that answer
 or a visible failure. Supplying `--review-base` and `--review-head` — which are
-required together — turns the turn into an external review and switches on the
-exact-commit safeguards described in section 8. `--timeout` is one deadline
-covering the whole turn: prechecks, generating review evidence, the peer call
-and capturing the response. It defaults to 900 seconds. Cleanup afterwards is
-bounded separately from that deadline, and has to be: by the time cleanup
-matters the deadline has usually already run out, and a budget of nothing is no
-way to decide how long to wait for a process to die. There is no retry.
+required together — turns the turn into an external review. They name the
+commits the review request refers to, and are recorded in the response as
+provenance; they condition nothing. `--timeout` is one deadline covering the
+whole turn: prechecks, the peer call and capturing the response. It defaults to
+900 seconds. Cleanup afterwards is bounded separately from that deadline, and
+has to be: by the time cleanup matters the deadline has usually already run out,
+and a budget of nothing is no way to decide how long to wait for a process to
+die. There is no retry.
+
+A turn that is stopped rather than finished cleans up the same way. An interrupt
+from the keyboard, a termination signal and a hangup signal all take the same
+route out: the process group the turn owns is emptied, and the session lock is
+released. After a termination or a hangup the command then says in one plain
+sentence that it was stopped, and exits nonzero. Two moments inside a turn are
+treated differently, because raising there would do the opposite of what the
+person pressing the key wants: while the child is being created, when a program
+exists that nothing has yet taken responsibility for, and during the cleanup
+itself, when a second signal would abandon the emptying half done. In both, the
+stop waits until the moment has passed and is then raised. It changes when the
+stop is raised, never whether.
+
+Four things stay outside anybody's control and are not pretended about: being
+killed outright with `SIGKILL`; a machine that loses power; a child that
+deliberately puts itself into a session of its own and so leaves the group the
+turn owns; and a turn run somewhere other than the main thread, where no handler
+can be installed at all, so a termination signal does whatever the surrounding
+program already arranged — by default, ending it at once and leaving the peer
+running. The turn still goes ahead off the main thread, because refusing to work
+would be worse, but the tidy exit is not available there and is not claimed. The
+third of the four has an exact consequence for connectors: a harness
+command-line program that daemonizes during a turn puts its work beyond this
+cleanup, and must therefore fail qualification.
 
 **`record`** writes one local message into the session without calling anybody.
 It is described in the next section.
@@ -127,7 +177,7 @@ is; the runner does the numbering, the locking, the envelope and the atomic
 write. This keeps one writer for the canonical record, whichever harness is
 driving.
 
-It accepts exactly six kinds and nothing else. Every kind reads its substantive
+It accepts exactly five kinds and nothing else. Every kind reads its substantive
 Markdown body from standard input; input that is empty or only whitespace is a
 usage error.
 
@@ -137,25 +187,17 @@ usage error.
 | `user-correction` | none | none | one numbered local record |
 | `plan-approval` | none | `--replace` | one numbered local record holding the approved plan text, then `PLAN.md` with the same text |
 | `technical-error` | none | none | one numbered local record |
-| `implementation-start` | `--project <dir>`, `--baseline <commit>` | none | one numbered local record carrying the repository identity the runner resolved and the full baseline commit |
-| `user-waiver` | `--project <dir>`, `--head <commit>`, `--waived <REJECT\|ERROR>` | none | one numbered local record |
+| `implementation-start` | `--project <dir>`, `--baseline <commit>` | none | one numbered local record carrying the repository path and the baseline commit it was given |
 
-Two kinds have extra rules. `plan-approval` seals `PLAN.md`; sealing over an
+One kind has an extra rule. `plan-approval` seals `PLAN.md`; sealing over an
 already approved plan requires `--replace`, and the earlier approved text stays
-readable in its own numbered message. `implementation-start` may happen at most
-once in a session, because the repository and baseline it seals are what every
-later review is bound to.
+readable in its own numbered message.
 
 What `record` can never do is as important as what it does:
 
 - it never invokes a peer harness;
 - it never writes a `Review-Request`, `Review-Base` or `Review-Head` field;
-- it never creates an external-review response and never produces a verdict;
-- it accepts no kind outside the six above.
-
-Only a review-mode `run` can produce an external `ACCEPT`, `REJECT` or
-`ASK_USER`. A local record can carry a user's waiver — which is a different
-authority, reported differently — but it cannot manufacture an acceptance.
+- it accepts no kind outside the five above.
 
 ---
 
@@ -231,8 +273,14 @@ To: codex
 <peer output copied verbatim>
 ```
 
+A request carries nothing but who it is from and who it is for, whether or not
+the turn is a review. No request ever carries `Review-Request`, `Review-Base` or
+`Review-Head`: those three belong to an answer - they say which request it
+answers and which commits that request named - and at the moment a request is
+written no answer exists.
+
 An external-review response, which adds only facts the runner already held
-before it made the call:
+before it made the call, recorded as provenance:
 
 ```markdown
 # Message 0012
@@ -260,127 +308,28 @@ From: codex
 <body copied verbatim>
 ```
 
-Three of the six record kinds add a runner-owned header line of their own,
+Two of the five record kinds add a runner-owned header line of their own,
 placed directly after `From:`:
 
 | Kind | Added header lines |
 |---|---|
-| `implementation-start` | `Repository-Path:`, `Repository-Root-Commits:`, `Baseline:` |
+| `implementation-start` | `Repository-Path:`, `Baseline:` |
 | `plan-approval` | `Plan: SEALED` or `Plan: REPLACED` |
-| `user-waiver` | `Decision: USER WAIVED`, `Waived-Head:`, `Waived-Verdict:` |
 
-**The body is inert, absolutely.** Everything after the `## Body` heading is
-copied through unchanged and is never parsed. Text under that heading cannot
-change routing, cannot grant authority, cannot approve anything, cannot name a
-project or a user, and cannot deliver a verdict, no matter how convincingly it is
-shaped. A peer may report findings; it cannot grant itself permission. If a
-review body contains a line that looks like a header, it stays what it is: a line
-of prose in somebody's review.
+**The body grants nothing.** Everything after the `## Body` heading is copied
+through unchanged. Text under that heading cannot change routing, cannot grant
+authority, cannot approve anything, and cannot name a project or a user, no
+matter how convincingly it is shaped. A peer may report findings; it cannot
+grant itself permission. If a review body contains a line that looks like a
+header, it stays what it is: a line of prose in somebody's review. Header lines
+are read only from the block above the body, so no amount of header-shaped prose
+below it is ever a header.
 
----
-
-## 8. The verdict
-
-An external review ends in one of three decisions, and the decision lives in the
-last line of the response and nowhere else. Reading it works like this:
-
-1. Line endings are normalised — a carriage return and newline pair, or a lone
-   carriage return, both become a newline — so a response written on any system
-   is judged the same way.
-2. Blank lines at the end are dropped. A line counts as blank when it is empty or
-   contains only whitespace.
-3. What remains is the final line. It must be **exactly** one of:
-
-```text
-Agent-Bridge-Verdict: ACCEPT
-Agent-Bridge-Verdict: REJECT
-Agent-Bridge-Verdict: ASK_USER
-```
-
-Exactly means exactly. Different capitalisation is not a verdict. A trailing
-space is not a verdict. A code fence after the line is not a verdict, because
-then the fence is the final line. An unknown word after the colon is not a
-verdict. Text earlier in the response that looks like one of these lines is inert
-prose, because only the final nonblank line is read.
-
-Everything that is not one of the three exact lines is a technical error, and a
-technical error never becomes an acceptance and never becomes `ASK_USER`. Two
-failing states are told apart, because they mean different things to the person
-reading the report: `EMPTY_RESPONSE` when the peer produced no text at all, and
-`INVALID_VERDICT` when it produced text that does not end correctly.
-
-A verdict is only worth anything if it describes the exact code that was
-reviewed, so `run` binds it to commits. Before the call: resolve both commits,
-require the review baseline to equal the baseline sealed at
-`implementation-start`, require it to be an ancestor of a distinct task head,
-confirm the sealed repository, a clean worktree and the exact expected `HEAD`.
-The runner then generates the `baseline..head` diff once, with a fixed argument
-vector and external diff and text-conversion hooks disabled, into one temporary
-file it owns, outside both the project and the session record. The reviewing peer
-gets read access to the project and that one file, and no shell and no Git. After
-the peer exits the evidence is deleted and the repository, cleanliness and `HEAD`
-checks are repeated. Any mismatch, or any failure to clean up, voids the verdict
-as a technical error.
-
-How the runner and the connector fit together at that moment is fixed, because
-one depends on the other. The runner is not handed a ready-made command. It
-writes the evidence first, and then calls the connector to compose the fixed
-argument vector for this one call, giving it the exact path of that evidence
-file — `None` when the turn is not a review — so that the connector can name
-that exact path among the paths its restriction switches let the peer read.
-Nothing coarser will do: the boundary is the project root and that one file, not
-the folder the file happens to sit in. Because the command is composed inside the
-turn, the connector's own inexpensive prechecks fall inside the one deadline,
-alongside the runner's checks, the evidence, the peer call and the response. If
-composing the command fails, the evidence is deleted as on any other way out,
-nothing is published, and Git stays locked.
-
-Git unlocks only when all five of these hold at once:
-
-1. the call succeeded — the peer was started, answered, and exited normally;
-2. the verdict is exactly `ACCEPT`;
-3. the response is bound to its request, and to the baseline and head sealed at
-   `implementation-start`;
-4. both rounds of repository checks passed, before the call and after it; and
-5. `HEAD` is still the head that was reviewed.
-
-A new commit invalidates the verdict.
-
-**What gets written down when the answer is not an acceptance** matters as much
-as when it is. `REJECT` and `ASK_USER` are published exactly like any other
-answer — they are decisions a reviewer really made — and they unlock nothing.
-
-The rule for failures is that **no failed call ever publishes an authoritative
-verdict.** Where the call did not finish cleanly, nothing is published at all: an
-empty response, a peer that failed or ran out of time, a changed repository,
-baseline or head, a dirty worktree, or a failure to clean up. Captured text in
-those cases may be a fragment of an answer the peer never finished, and a
-fragment must not stand in for a reply.
-
-`INVALID_VERDICT` is the one failure that keeps the text. A peer that exited
-cleanly with real output, and got only its final line wrong, has that output
-published as an **ordinary message** — the same shape any non-review answer
-takes, carrying none of the `Review-*` fields that bind an answer to a request
-and to two commits. It therefore holds no external-review authority and unlocks
-nothing. The call still fails, Git stays locked, and the text is never rewritten,
-read for an intention, or retried; acceptance requires a fresh review call. A
-reviewer that did good work and fumbled one line should not lose the work.
-
-In every failing case the request message that was already published stays where
-it is, because it truthfully records what was sent, and the workflow writes the
-failure down itself with `record --kind technical-error`.
-
-The one alternative path is a user waiver: after a `REJECT` or a technical error,
-a later direct message from the user may waive external review for that exact
-head. It is recorded as a local record, reported as `USER WAIVED` and never as
-acceptance, and it is invalidated by a new commit. It cannot waive a changed
-repository, a changed baseline, a changed head, a dirty worktree, a publication
-or cleanup failure, or the use of an unqualified connector; those are corrected
-first, and only then can review be waived for the restored head.
+Nothing under the `## Body` heading is read by anything anywhere in Agent Bridge.
 
 ---
 
-## 9. The internal failure list
+## 8. The internal failure list
 
 There is one list of ways a turn can fail, owned by the core. Connectors
 translate whatever a vendor's program did into exactly one member of it, and may
@@ -400,39 +349,31 @@ code needs it.
 | `UNREPORTABLE_VERSION` | The program printed no readable version | Run its version command by hand; if it stays unreadable the harness cannot be qualified |
 | `UNQUALIFIED_VERSION` | The installed version is outside the tested set | Install a tested version, or requalify and update the connector's declaration |
 | `UNQUALIFIED_PLATFORM` | This operating system or major version is outside the tested coverage | Use a tested platform, or requalify there and update the declaration |
-| `RESTRICTIONS_UNAVAILABLE` | The harness lacks the switches needed to deny writes and outside reads | Do not give it real project access; report the missing restriction |
+| `RESTRICTIONS_UNAVAILABLE` | The harness lacks the switches needed to make the peer unable to write project files, alter Git state, or cause a prohibited external effect — by removing the tools, by an enforced sandbox, or by both | Do not give it real project access; report the missing restriction |
 | `QUALIFICATION_UNSAFE_OR_INCONCLUSIVE` | The disposable probe did not clearly prove the boundary held | Read the reported synthetic path, work out what happened, requalify |
 | `BUSY_SESSION` | Another turn holds this session's lock | Wait for it to finish and run again; nothing was changed |
 | `TIMEOUT` | The deadline passed before an answer arrived | Run again with a longer `--timeout`, or check the peer by hand |
 | `PEER_FAILURE` | The peer's program exited with a failure | Read its own error output and fix it inside that harness |
-| `EMPTY_RESPONSE` | The peer produced no text at all | Check the peer by hand and run again; Git stays locked |
-| `INVALID_VERDICT` | A review response did not end with one of the three exact lines; the text was kept as an ordinary message with no review authority | Read the kept message if useful, then run the review again; this is never an acceptance |
-| `REPOSITORY_CHANGED` | The repository is not the one sealed at implementation start | Point at the sealed repository, or start a new session |
-| `BASELINE_CHANGED` | The review baseline is not the sealed baseline | Run the review again with the sealed baseline |
-| `HEAD_CHANGED` | The branch moved, so the review no longer describes the code | Run a fresh review against the current head |
+| `EMPTY_RESPONSE` | The peer produced no text at all | Check the peer by hand and run again |
 | `CLEANUP_FAILURE` | Something the turn created could not be removed | Remove the reported path or process by hand and confirm nothing is left |
 | `USAGE_ERROR` | Missing, conflicting or empty arguments, including empty input | Correct the command line and the input, then run again |
 | `UNKNOWN_HARNESS` | The named harness is not one of the five | Name one of the five identifiers |
 | `CONNECTOR_UNAVAILABLE` | A real identifier, but no connector for it ships in this build | Use a harness whose connector ships |
-| `UNKNOWN_RECORD_KIND` | Not one of the six record kinds | Name one of the six kinds |
+| `UNKNOWN_RECORD_KIND` | Not one of the five record kinds | Name one of the five kinds |
 | `SESSION_NOT_FOUND` | There is no session at that directory | Create it with `record --kind session-create`, or fix `--session` |
 | `SESSION_INVALID` | The folder is there but is not a readable session | Inspect `SESSION.md` and `messages/`; repair or start a new session |
 | `SESSION_EXISTS` | A session already exists there | Continue in it, or choose a new empty directory |
 | `PLAN_SEALED` | An approved plan is already sealed | Use `--replace` only if the user approved a replacement |
-| `IMPLEMENTATION_ALREADY_SEALED` | This session already sealed a repository and baseline | Continue against them, or start a new session |
-| `NO_IMPLEMENTATION_BASELINE` | Nothing has been sealed, so a review or waiver has nothing to bind to | Record `implementation-start` first |
 | `PUBLICATION_FAILURE` | The message could not be written and moved into place, so nothing was published | Check the session directory is writable, then run again |
-| `REPOSITORY_UNREADABLE` | The project directory is not a readable Git repository | Correct `--project` |
-| `DIRTY_WORKTREE` | Uncommitted changes mean there is no exact head to review | Commit or set the changes aside, then review |
-| `BASELINE_NOT_ANCESTOR` | The baseline does not come before a distinct head on the same history | Check `--review-base` and `--review-head` |
+| `PUBLICATION_NOT_FLUSHED` | The message is written and in place, but the folder entry could not be forced to disk, so a machine failure could lose it | Confirm the reported file is there, and treat the turn as unfinished until the disk is behaving |
+| `PUBLICATION_UNCERTAIN` | Something went wrong while the message was being moved into place, and the canonical name could not then be examined, so there is no telling whether the message reached it | Look in the session's messages folder for the reported file before anything else — there means complete, absent means never arrived — and do not run the command again until you know which |
 
-Every failure leaves Git locked, publishes no false success, removes what the
-turn started, and gives one next action. `INVALID_VERDICT` alone keeps the
-peer's text, as an ordinary message that carries no review authority.
+Every failure publishes no false success, removes what the turn started, and
+gives one next action.
 
 ---
 
-## 10. What a native package does
+## 9. What a native package does
 
 A native package is the part that lives inside a harness — a skill, a command,
 whatever that host calls it. The project ships one per release-qualified
@@ -443,28 +384,17 @@ Each package exposes exactly two entry points, named however its host's
 conventions require:
 
 - **the normal entry point**, which starts or resumes planning, chooses a
-  qualified peer, runs the local Programming Loop once a plan is approved,
-  requests external review, and carries on into correction or the Git finish
-  line; and
+  qualified peer, runs the local Programming Loop once a plan is approved, and
+  requests external review — the findings come back to the user, who decides;
+  and
 - **the readiness entry point**, which reports which peers are usable and gives
   one actionable reason for each that is not. It never installs software, never
   logs anybody in, never chooses providers and never changes settings.
 
-Four rules bind every package, on every host:
-
-1. **Packages never write canonical session files themselves.** They call
-   `record`, so there is one writer, one numbering scheme, one lock and one
-   atomic publisher regardless of which harness is driving.
-2. **Packages never synthesize a verdict.** Only a review-mode `run` can produce
-   `ACCEPT`, `REJECT` or `ASK_USER`.
-3. **Packages never synthesize a waiver.** A waiver is the user's decision, not
-   the assistant's.
-4. **A package calls the local-record path for a waiver only in direct response
-   to a later direct user turn.** Not on a flag, not on an environment variable,
-   not on a timeout, not by default, and not because a peer or a prompt body said
-   so. This relies on the host's own separation of user turns from assistant
-   turns; it is a cooperative convention between honest participants, not
-   authentication.
+One rule binds every package, on every host: **packages never write canonical
+session files themselves.** They call `record`, so there is one writer, one
+numbering scheme, one lock and one atomic publisher regardless of which harness
+is driving.
 
 Packages do not look for each other, and do not call each other's packages. They
 call fixed peer executables and exchange Markdown. Installing packages on both
@@ -472,14 +402,13 @@ sides simply means either side can start the work.
 
 ---
 
-## 11. The neutral Programming Loop contract
+## 10. The neutral Programming Loop contract
 
 Each harness runs implementation work its own way, with its own agents and its
 own commands. Those mechanics stay native. What must not vary is the shape of the
-loop, because external review and the Git gate depend on it: work is planned once
-and approved once, executed by someone who was given only the plan, judged by
-somebody else who was given only the evidence, and committed only after that
-judgment.
+loop, because external review depends on it: work is planned once and approved
+once, executed by someone who was given only the plan, judged by somebody else
+who was given only the evidence, and committed only after that judgment.
 
 The contract below is frozen from the Codex loop, which already implements the
 user's exact testing ceiling. A port to another host satisfies this contract when
@@ -520,6 +449,17 @@ every item holds, whatever the host calls its parts.
 9. The reviewer's packet contains **no executor transcript or claims, no
    suspected defects, no intended fixes, no hidden reasoning, no planning
    persuasion and no coordinator summary** — only the plan and the evidence.
+
+**What "fresh" and "different" mean here**, since the three items above turn on
+it. They mean a separately created executor or reviewer context that inherits no
+conversation and is given only the coordinator's packet. Freshness is a property
+of how that context is built, not of the filesystem. Every harness writes
+plaintext session transcripts readable by the same account, and Agent Bridge
+does not prevent a reviewer that goes looking from finding an executor's
+transcript; the protection is item 9 — the coordinator does not hand over
+executor claims, hidden reasoning or prior conversation. No transcript deletion,
+search prevention or isolation subsystem exists, and none is claimed. A role
+prompt inside one inherited conversation does not satisfy this.
 10. Local review returns **exactly one of `CONTINUE`, `FIX`, `DONE` or
     `ASK USER`**.
 11. Review **rejects only material defects** — wrong user-visible behavior, unmet

@@ -18,6 +18,11 @@ one thing to do next, on the error stream, with a nonzero exit. That includes th
 argument parser's own complaints, which are turned into the same shape rather
 than being allowed to print in a different voice.
 
+Being stopped is not a failure of that kind, so it reads differently: a
+termination or hangup signal caught while a program was running says so in one
+plain sentence and exits nonzero. There is nothing to do next except run it
+again, and by the time that message is printed the cleanup has already happened.
+
 SPDX-License-Identifier: Unlicense
 """
 
@@ -29,7 +34,7 @@ from typing import Optional, Sequence
 
 from . import connectors, record as record_module
 from .errors import BridgeError, Failure
-from .peer import DEFAULT_TIMEOUT_SECONDS
+from .peer import DEFAULT_TIMEOUT_SECONDS, SignalStop
 
 PROGRAM = "agent-bridge"
 
@@ -74,8 +79,6 @@ def build_parser() -> argparse.ArgumentParser:
     record.add_argument("--workflow")
     record.add_argument("--project")
     record.add_argument("--baseline")
-    record.add_argument("--head")
-    record.add_argument("--waived")
     record.add_argument("--replace", action="store_true")
 
     return parser
@@ -102,11 +105,11 @@ def _run(args: argparse.Namespace) -> str:
             detail="--review-base and --review-head are required together",
         )
     # The connector resolved here is what the runner is given as its command
-    # builder: the runner generates the review evidence first, then calls this
-    # connector with that exact path so it can name the file in the restriction
-    # switches of the fixed argument vector it composes. The runner then runs
-    # that vector. This build ships no connector, so the turn stops here - there
-    # is nothing to hand over - rather than inventing a peer.
+    # builder: the runner calls it with the turn's deadline, so it can run any
+    # precheck of its own inside that deadline and compose the fixed argument
+    # vector, and the runner then runs that vector. This build ships no
+    # connector, so the turn stops here - there is nothing to hand over -
+    # rather than inventing a peer.
     connectors.resolve(args.peer)
     raise BridgeError(Failure.CONNECTOR_UNAVAILABLE, detail=args.peer)
 
@@ -121,8 +124,6 @@ def _record(args: argparse.Namespace) -> str:
         workflow=args.workflow,
         project=args.project,
         baseline=args.baseline,
-        head=args.head,
-        waived=args.waived,
         replace=args.replace,
     )
 
@@ -142,6 +143,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             written = _run(args)
         else:
             written = _record(args)
+    except SignalStop as stopped:
+        sys.stderr.write(str(stopped) + "\n")
+        return 1
     except BridgeError as error:
         sys.stderr.write(str(error) + "\n")
         return 1

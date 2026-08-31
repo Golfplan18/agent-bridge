@@ -44,7 +44,16 @@ class Qualification(NamedTuple):
     evidence covers every release inside it. `architectures` is left empty when
     the restriction surface does not depend on the processor. `restrictions` is
     the fixed set of switches that must be present for the harness to be called
-    at all - the deny-writes and deny-outside-reads surface.
+    at all - the ones that make the peer unable to write project files, unable
+    to alter Git state, and unable to cause a browser, web-fetch, MCP,
+    messaging, credential, publication or deployment effect.
+
+    Those are properties, not an inventory. A connector may reach them by
+    removing the tools, by confining them in the harness's own enforced
+    permission or sandbox mode, or by both, and qualification proves the
+    resulting behaviour rather than checking off a list of absent tools. A
+    harness that leaves a shell or Git harmlessly available is not thereby
+    unqualified; one whose peer can mutate anything or reach outside is.
     """
 
     cli_identity: str
