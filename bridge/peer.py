@@ -77,6 +77,7 @@ SPDX-License-Identifier: Unlicense
 from __future__ import annotations
 
 import contextlib
+import errno
 import os
 import signal
 import subprocess
@@ -457,6 +458,21 @@ def run_bounded(
                         start_new_session=True,
                     )
                 except OSError as exc:
+                    # The one refusal that is about the call rather than the
+                    # program: the kernel would not build an argument block
+                    # this large. It is the transport's failure and is named
+                    # as such, not as a missing program or a failed peer.
+                    if exc.errno == errno.E2BIG:
+                        raise BridgeError(
+                            Failure.USAGE_ERROR,
+                            detail=(
+                                "the operating system refused to start {0} "
+                                "because its argument list and environment "
+                                "together were too long ({1}); send a "
+                                "shorter message, or use a peer that reads "
+                                "standard input".format(argv[0], exc)
+                            ),
+                        )
                     raise BridgeError(spawn_failure, detail=str(exc))
                 pgid = _own_group(process)
                 with watch.allowing():

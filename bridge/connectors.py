@@ -6,14 +6,15 @@ is no registry, no plugin search, no dynamic import, and no base class for a
 connector to inherit. Adding a sixth harness means editing this file, which is
 the point - the set of programs the bridge will start is visible in source.
 
-Three modules are wired in this build. Codex and Claude Code each offer
-exactly two operations - answer whether the harness could be used right now,
-and compose the one fixed argument vector a turn runs. Hermes Agent has the
-same two operations and the same prerequisites, and on the installed version
-both end in a refusal that names its reason: Hermes cannot take the body on
-standard input, so it answers readiness truthfully and starts no turn. The
-other two branches resolve to nothing, so asking for one of them is an honest
-failure rather than a silent fallback.
+Three connectors ship in this build, Codex, Claude Code and Hermes Agent.
+Each is a module of its own offering exactly two operations - answer whether
+the harness could be used right now, and compose the one fixed argument vector
+a turn runs. Hermes is the courier-only one: its program has no standard-input
+path, so the body reaches it as the final command-line argument, and its tools
+cannot read a file without also being able to write one, so it is given no
+project and answers on what it is sent. The other two branches resolve to
+nothing, so asking for one of them is an honest failure rather than a silent
+fallback.
 
 This module also holds what the connectors share, and the sharing is
 deliberately shallow: a handful of plain functions, called by both, and no
@@ -93,14 +94,30 @@ class PeerCommand(NamedTuple):
     ordered name/value pairs, so the whole value stays immutable; the caller
     turns it into a mapping at the moment it starts the process.
 
-    There is deliberately no prompt field and no command string. The outgoing
-    Markdown body always reaches the peer on standard input, so prompt text
-    never passes through a command line or a shell.
+    There is deliberately no prompt field and no command string: the body is
+    the runner's to hand over, and a connector only says how. `body_argument`
+    is `None` for every harness whose program reads standard input, which is
+    the required transport wherever one exists, and the runner then writes the
+    body there. A connector may set it only for a program that has demonstrably
+    no standard-input path for a one-shot prompt, established by probe. The
+    runner then appends the body to `argv` as exactly one final argument, with
+    this string in front of it, and writes nothing to standard input. The
+    string is empty when the vector already ends in a bare `--` and the body
+    follows it whole, and it is the option's own attached prefix - `--oneshot=`
+    - when the program's parser will not let a bare `--` stand before a single
+    option value. Either way nothing in the body can be read as an option. A
+    body that would push the process-creation payload - the vector, the
+    environment and their overhead together - past what this computer
+    supports, less explicit headroom, is refused before any request is
+    published, and is never truncated, split or spilled to a file; so is a
+    body holding a NUL byte, which no argument can carry. Under either
+    transport prompt text never passes through a shell.
     """
 
     argv: Tuple[str, ...]
     cwd: str
     env: Tuple[Tuple[str, str], ...]
+    body_argument: Optional[str] = None
 
 
 # -- what both connectors do the same way -----------------------------------

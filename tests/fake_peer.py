@@ -17,7 +17,10 @@ of them.
 The first is about what a peer says: a good answer, which is whatever it was
 given handed straight back; no answer at all; and an answer that is nothing but
 whitespace. Between them they are every shape the runner has to tell apart when
-it decides whether there is anything to publish.
+it decides whether there is anything to publish. One more stands in for a
+program that takes its body on the command line rather than standard input: it
+hands back its own final argument, and says so if anything arrived on standard
+input as well.
 
 The second is about what a peer leaves behind: a program that exits badly, one
 that will not stop, one that starts a child and then will not stop, and two that
@@ -44,6 +47,7 @@ MODES = (
     "plain",
     "empty",
     "whitespace",
+    "final-argument",
     "fail",
     "hang",
     "spawn-child-then-hang",
@@ -148,6 +152,12 @@ def _run(mode: str, extra: list) -> int:
 
     if mode == "whitespace":
         _emit("\n   \n\n  \n")
+        return 0
+
+    if mode == "final-argument":
+        _emit(_echoed(extra[-1] if extra else ""))
+        if body:
+            _emit("STANDARD INPUT WAS NOT EMPTY\n")
         return 0
 
     if mode == "fail":
