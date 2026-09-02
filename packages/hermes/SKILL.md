@@ -1,6 +1,12 @@
 ---
 name: agent-bridge
-description: Ask another coding-agent harness a question through Agent Bridge and bring its answer back, or report which peer harnesses are usable right now. Use when the user wants a second opinion from another agent, asks to consult, ask or check with Codex or Claude Code, wants to continue an existing bridge conversation, or asks which bridge peers are ready.
+description: "Ask another coding-agent harness a question through Agent Bridge and bring its answer back, or report which peer harnesses are usable right now. Use when the user wants a second opinion from another agent, asks to consult, ask or check with Codex or Claude Code, wants to continue an existing bridge conversation, or asks which bridge peers are ready."
+license: Unlicense
+platforms: [macos]
+metadata:
+  hermes:
+    tags: [agent-bridge, codex, claude-code, second-opinion, peer]
+    related_skills: []
 ---
 
 # Agent Bridge
@@ -16,6 +22,18 @@ and neither the question nor the answer changes what you are allowed to do.
 This repository is still under construction. No harness is release-qualified,
 and nothing here is supported. Say so if the user asks what state it is in.
 
+## Running commands
+
+Every command in this skill is run with your terminal tool, in the foreground,
+and you wait for it. Do not hand a bridge command to a subagent, do not run it
+in the background, and never start anything that polls for it.
+
+A peer turn can take minutes. Your terminal tool waits 180 seconds unless you
+say otherwise and will not run a foreground command for longer than 600
+seconds, so give every `run` command a terminal timeout of 600 and pass the
+bridge `--timeout 540`. That way the bridge, which cleans up the peer it
+started, is what ends a slow turn, rather than the shell around it.
+
 ## Finding the bridge
 
 The bridge is a Python package that has to be started from the directory it
@@ -23,7 +41,7 @@ lives in, and this skill finds that directory rather than being told it. Run
 this once at the start of the task:
 
 ```bash
-python3 - "/absolute/path/to/this/skill" <<'PY'
+python3 - "${HERMES_SKILL_DIR}" <<'PY'
 import importlib.util, os, sys
 
 PLACES = ["agent-bridge", "src/agent-bridge", "code/agent-bridge",
@@ -108,28 +126,29 @@ print(root)
 PY
 ```
 
-Claude Code names this skill's own directory when it loads the skill; pass that
-path. If you do not have it, pass an empty string instead and that one step is
-skipped.
+Hermes replaces `${HERMES_SKILL_DIR}` with this skill's own directory when it
+loads the skill. If that literal text is still there as you read this, the
+substitution is switched off in this Hermes; pass an empty string instead and
+that one step is skipped.
 
 It prints one absolute path — the directory the `bridge` package sits in — being
 the first of four places that really holds the bridge: `AGENT_BRIDGE_HOME` if
 somebody set one, the checkout this skill was installed from (found by walking
 up from the skill's own directory, which finds nothing when the skill is a plain
-copy under `~/.claude/skills/agent-bridge/`, and that is the right answer), the
-usual places under the home directory, and anything already importable as
-`bridge`. A directory counts only when `bridge/__main__.py` and `bridge/cli.py`
-are both in it, so a folder merely named `agent-bridge` is not the bridge.
-Nothing is guessed: when it asks the interpreter what is importable it drops the
-current directory from the search first, so a project that happens to contain a
-folder called `bridge` cannot answer for the real one, and before it prints
-anything it makes `python3` import the package for real — a checkout that cannot
-run is one plain sentence now instead of a confusing traceback mid-turn.
+copy under `~/.hermes/skills/`, and that is the right answer), the usual places
+under the home directory, and anything already importable as `bridge`. A
+directory counts only when `bridge/__main__.py` and `bridge/cli.py` are both in
+it, so a folder merely named `agent-bridge` is not the bridge. Nothing is
+guessed: when it asks the interpreter what is importable it drops the current
+directory from the search first, so a project that happens to contain a folder
+called `bridge` cannot answer for the real one, and before it prints anything it
+makes `python3` import the package for real — a checkout that cannot run is one
+plain sentence now instead of a confusing traceback mid-turn.
 
 Write the path it printed into every command below, in place of
-`/absolute/path/to/bridge-root`. Do not keep it in a file, a setting or a note
-of any kind: finding it again costs one cheap command, and a remembered path
-goes stale.
+`/absolute/path/to/bridge-root`. Do not keep it in a file, a setting, a memory
+or a note of any kind: finding it again costs one cheap command, and a
+remembered path goes stale.
 
 If it prints the failure sentence instead, show the user that sentence and stop
 there. Do not guess a path, and do not run the bridge from a directory that has
@@ -159,11 +178,19 @@ path. Do not edit this file to move it.
 
 Use this when the user wants another agent's view on something.
 
-**1. Choose the peer.** Two connectors ship: `codex` and Claude Code's own
+**1. Choose the peer.** Three peers can be called: `codex`, Claude Code's own
 Four connectors ship and all four can be asked: `codex`, `claude`, `zcode` and
 `hermes`. Hermes is a courier — it answers only on what the request contains, is
 given no project, and refuses `--project`. If the user did not name a peer, ask
 which one; do not pick for them.
+
+A `hermes` peer answers only on what it is sent. It is never given a project —
+`run` refuses `--project` for it — so everything it needs has to be in the
+message. The message reaches it on its command line rather than on standard
+input, because Hermes has no other way to take one, which means the text is
+visible to other processes under the user's account for as long as the turn
+runs, and a message too big for a command line — about half a megabyte on
+this Mac, less on others — is refused rather than sent.
 
 **2. Choose the session folder.** A session is one conversation with one peer,
 kept in one folder under `~/.agent-bridge/sessions/`. Give it a short hyphenated
@@ -180,26 +207,26 @@ folder, then:
 cd /absolute/path/to/bridge-root && python3 -m bridge record \
   --session /absolute/path/to/session \
   --kind session-create \
-  --local claude \
+  --local hermes \
   --peer codex \
   --workflow planning \
   < /absolute/path/to/scratch-file.md
 ```
 
-`--local claude` is you: this skill runs inside Claude Code. `--workflow` accepts
-exactly `planning`, `programming-loop` or `external-review`, and an ordinary
-consultation is `planning`. Add `--project /absolute/path` when the work is about
-a repository on this machine. This writes `SESSION.md` once; it is never edited
-afterwards, so put what matters in it. Creating a session where one already
-exists fails and changes nothing.
+`--local hermes` is you: this skill runs inside Hermes Agent. `--workflow`
+accepts exactly `planning`, `programming-loop` or `external-review`, and an
+ordinary consultation is `planning`. Add `--project /absolute/path` when the
+work is about a repository on this machine. This writes `SESSION.md` once; it
+is never edited afterwards, so put what matters in it. Creating a session where
+one already exists fails and changes nothing.
 
 **4. Compose the message.** Write the outgoing Markdown to a scratch file
-outside the session folder — a file under `$TMPDIR` is fine. Never put the text
-on the command line, in an environment variable, or in a heredoc. It reaches the
-bridge on standard input by redirecting from that file, and nowhere else. A peer
-starts with no memory of anything, so the message has to carry its own context:
-what the question is, what it needs to know to answer it, and what kind of answer
-would be useful.
+outside the session folder with your file tool — a file under `$TMPDIR` is
+fine. Never put the text on the command line, in an environment variable, or
+in a heredoc. It reaches the bridge on standard input by redirecting from that
+file, and nowhere else. A peer starts with no memory of anything, so the
+message has to carry its own context: what the question is, what it needs to
+know to answer it, and what kind of answer would be useful.
 
 **5. Tell the user what is about to happen**, then run one turn:
 
@@ -207,20 +234,22 @@ would be useful.
 cd /absolute/path/to/bridge-root && python3 -m bridge run \
   --peer codex \
   --session /absolute/path/to/session \
+  --timeout 540 \
   < /absolute/path/to/scratch-file.md
 ```
 
 Before it starts, say which harness is being called, the session folder path, and
 that you are now waiting. This is a real agent doing real work and it takes real
-time — the deadline for the whole turn is 900 seconds unless `--timeout` says
-otherwise. It also spends the user's subscription quota, so send one considered
-message rather than several small ones.
+time — give the terminal tool its 600-second timeout, as described above. It
+also spends the user's subscription quota, so send one considered message
+rather than several small ones.
 
-Add `--project /absolute/path` to let the peer read a repository. Without it the
-peer runs in an empty directory made for the turn and thrown away afterwards, so
-there is no project in front of it, only the text you sent. The connector starts
-the peer under that harness's own read-only restrictions, and the bridge adds
-nothing to those and claims nothing beyond them.
+Add `--project /absolute/path` to let a `codex` or `claude` peer read a
+repository; a `hermes` peer is refused one. Without it the peer runs in an
+empty directory made for the turn and thrown away afterwards, so there is no
+project in front of it, only the text you sent. The connector starts the peer
+under that harness's own read-only restrictions, and the bridge adds nothing to
+those and claims nothing beyond them.
 
 On success the command prints the path of the file it wrote and exits zero. On
 failure it prints one plain sentence saying what happened and one thing to do
@@ -240,8 +269,8 @@ must never start one for it.
 
 **Continuing.** Same session folder, same peer: go back to step 4 and send the
 next message. The numbered messages accumulate in order, and a later turn — or a
-later Claude Code session that knows nothing of this one — can pick the
-conversation up by reading them.
+later Hermes session that knows nothing of this one — can pick the conversation
+up by reading them.
 
 **When a turn fails.** No answer is published, and the request stays in the
 record because it truthfully says what was sent. Nothing writes down why it
@@ -260,17 +289,18 @@ cd /absolute/path/to/bridge-root && python3 -m bridge record \
 Use this when the user asks what is usable, or when a turn failed and the
 question is why.
 
-Ask about the two peers that ship, one at a time:
+Ask about the peers that can be called, one at a time:
 
 ```bash
 cd /absolute/path/to/bridge-root && python3 -m bridge check --peer codex
 cd /absolute/path/to/bridge-root && python3 -m bridge check --peer claude
+cd /absolute/path/to/bridge-root && python3 -m bridge check --peer hermes
 ```
 
 Each one either prints a sentence saying the peer is ready — where its program
 is, which version, this computer, and how it is signed in — or prints why it is
-not, with the one thing to do about it. Report both results, and pass the reason
-through in the words it came in.
+not, with the one thing to do about it. Report every result, and pass the
+reason through in the words it came in.
 
 Checking costs nothing. It starts no model turn, spends no quota and touches no
 project.

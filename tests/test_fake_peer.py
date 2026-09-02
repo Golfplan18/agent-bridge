@@ -33,6 +33,17 @@ the harness its version, whether it is signed in, whether the restriction
 switches are there - is bounded by the turn's own deadline, and a builder that
 outruns that deadline never gets a peer started and never publishes a request.
 
+Three groups are about the one transport that is not standard input. A harness
+whose program has no standard-input path may take the body as its final
+command-line argument, on conditions that can all be seen from outside without
+the real program: the body arrives whole as exactly one argument, behind
+whatever prefix the connector said, with nothing on standard input, even when
+it begins with hyphens or carries the program's own option names; a body too
+large for the whole argument block, or holding a NUL byte, is refused before
+any request is published and is never cut down, because a request on the disk
+would say something had been sent; and a peer that is given no project is
+refused one by the command itself, before anything is read or started.
+
 The last group is about the other way something gets into a session: `record`,
 which writes one local message without calling anybody. There are five kinds it
 may write, each with its own envelope, and the list is closed - the point of
@@ -51,6 +62,7 @@ SPDX-License-Identifier: Unlicense
 
 from __future__ import annotations
 
+import io
 import os
 import re
 import shutil
@@ -66,8 +78,8 @@ REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if REPO_ROOT not in sys.path:
     sys.path.insert(0, REPO_ROOT)
 
-from bridge import peer, record, runner, session  # noqa: E402
-from bridge.connectors import PeerCommand  # noqa: E402
+from bridge import cli, peer, record, runner, session  # noqa: E402
+from bridge.connectors import COMMAND_LINE_BODY_LIMIT, PeerCommand  # noqa: E402
 from bridge.errors import BridgeError, Failure  # noqa: E402
 from bridge.locking import lock_path, session_lock  # noqa: E402
 
@@ -283,6 +295,23 @@ class TurnBehavior(unittest.TestCase):
                 argv=argv,
                 cwd=self.temp,
                 env=tuple(os.environ.items()),
+            )
+
+        return build
+
+    def _argument_builder(self, prefix):
+        """A connector that has declared the command-line transport.
+
+        The fake peer's `last-argument` mode hands back its final argument, so
+        whatever the runner bound to the prefix is exactly what comes back.
+        """
+
+        def build(deadline):
+            return PeerCommand(
+                argv=(sys.executable, FAKE_PEER, "last-argument"),
+                cwd=self.temp,
+                env=tuple(os.environ.items()),
+                body_argument=prefix,
             )
 
         return build
@@ -923,6 +952,57 @@ class TurnBehavior(unittest.TestCase):
         self._expect(Failure.EMPTY_RESPONSE, "whitespace", body="Say air.\n")
         self.assertEqual(self._messages(), ["0001-local-to-peer.md"])
 
+    # -- the body on the command line, where a harness has no other way ----
+
+    def test_a_hyphen_led_body_travels_as_one_argument_and_comes_back_whole(
+        self,
+    ):
+        body = (
+            "---\ntitle: bound\n--mode yolo\n-p not an option\n"
+            "--disallowed-tools=Edit is text\n---\n\nAnswer this.\n"
+        )
+        result = runner.run_turn(
+            self.session_dir, "claude", body, self._argument_builder("--prompt="), 30.0
+        )
+        with open(result.response_path, encoding="utf-8") as stream:
+            response = stream.read()
+        self.assertEqual(
+            response,
+            "# Message 0002\nFrom: claude\nTo: codex\n\n## Body\n\n"
+            "--prompt=" + body,
+        )
+        self.assertNotIn("STDIN WAS NOT EMPTY", response)
+        self.assertEqual(self._leftover_temporaries(), [])
+
+    def test_a_body_the_command_line_cannot_carry_is_refused_before_anything(
+        self,
+    ):
+        for name, body in (
+            ("one byte over the limit", "x" * (COMMAND_LINE_BODY_LIMIT + 1)),
+            ("a NUL byte inside", "before\x00after\n"),
+        ):
+            with self.subTest(body=name):
+                with self.assertRaises(BridgeError) as caught:
+                    runner.run_turn(
+                        self.session_dir,
+                        "claude",
+                        body,
+                        self._argument_builder("--prompt="),
+                        30.0,
+                    )
+                self.assertEqual(caught.exception.failure, Failure.USAGE_ERROR)
+                self.assertEqual(self._messages(), [])
+                self.assertEqual(self._leftover_temporaries(), [])
+        # And exactly at the limit the body is carried, not refused.
+        result = runner.run_turn(
+            self.session_dir,
+            "claude",
+            "y" * COMMAND_LINE_BODY_LIMIT,
+            self._argument_builder(""),
+            30.0,
+        )
+        self.assertEqual(result.response_sequence, 2)
+
     # -- the connector composes the command ---------------------------------
 
     def test_a_connector_precheck_runs_inside_the_turn_deadline(self):
@@ -1293,6 +1373,137 @@ class LocalRecordKinds(unittest.TestCase):
         self.assertIn("implementation-finish", str(caught.exception))
         self.assertEqual(self._message_names(), [])
         self.assertFalse(os.path.exists(session.plan_file(self.session_dir)))
+
+
+class CommandLineBody(unittest.TestCase):
+    """The body as a final argument: whole, alone, bounded, and never a project.
+
+    Standard input is the transport wherever a program has one. For the two
+    harnesses whose programs have none, the connector says so on the command
+    it returns and the runner hands the body over as exactly one final argument
+    instead. Everything the fake peer can see about that is checked here: what
+    it received as its final argument and that its standard input stayed empty,
+    that a body over the limit never becomes a request at all, and that a
+    courier-only peer is refused a project by the command line before the
+    connector's own program is even looked for.
+    """
+
+    def setUp(self):
+        self.temp = tempfile.mkdtemp(prefix="agent-bridge-argv-")
+        self.session_dir = os.path.join(self.temp, "session")
+        record.record(
+            self.session_dir,
+            "session-create",
+            "Prove the command-line transport without a real harness.\n",
+            local="codex",
+            peer="hermes",
+            workflow="planning",
+        )
+
+    def tearDown(self):
+        shutil.rmtree(self.temp, ignore_errors=True)
+
+    def _messages(self):
+        return sorted(os.listdir(session.messages_dir(self.session_dir)))
+
+    def _builder(self, prefix, *vector_tail):
+        """A connector whose program takes the body on its command line.
+
+        `prefix` is what the connector puts in front of the body - empty when
+        the vector ends in a bare `--`, the option's own attached form when the
+        program's parser needs that - and `vector_tail` is the end of the
+        vector itself.
+        """
+        argv = (sys.executable, FAKE_PEER, "last-argument") + vector_tail
+
+        def build(deadline):
+            return PeerCommand(
+                argv=argv,
+                cwd=self.temp,
+                env=tuple(os.environ.items()),
+                body_argument=prefix,
+            )
+
+        return build
+
+    def test_the_body_is_one_final_argument_and_standard_input_stays_empty(
+        self,
+    ):
+        """A body that looks like options arrives whole, and only once."""
+        body = "---\nname: probe\n---\n-h\n--oneshot=not an option\n"
+        for name, prefix, tail in (
+            ("a bare -- and then the body", "", ("--",)),
+            ("the option's attached value", "--oneshot=", ()),
+        ):
+            with self.subTest(transport=name):
+                result = runner.run_turn(
+                    self.session_dir,
+                    "hermes",
+                    body,
+                    self._builder(prefix, *tail),
+                    30.0,
+                )
+                with open(result.response_path, encoding="utf-8") as stream:
+                    response = stream.read()
+                self.assertEqual(
+                    response,
+                    "# Message {0:04d}\nFrom: hermes\nTo: codex\n\n## Body\n\n"
+                    "{1}".format(result.response_sequence, prefix + body),
+                )
+                self.assertNotIn("STANDARD INPUT WAS NOT EMPTY", response)
+
+    def test_a_body_too_big_for_the_command_line_is_refused_unsent(self):
+        """Too big is measured in encoded bytes, and refused before sending.
+
+        The limit is a byte count, not a character count, so a body of
+        two-byte characters reaches it with half as many characters. A NUL
+        byte is refused for a different reason: no argument can carry one.
+        """
+        limit = COMMAND_LINE_BODY_LIMIT
+        for name, body, expected in (
+            ("one byte over, in one-byte characters", "x" * (limit + 1), str(limit)),
+            (
+                "one byte over, in two-byte characters",
+                "\u00e9" * (limit // 2 + 1),
+                str(limit),
+            ),
+            ("a NUL byte", "before\x00after\n", "NUL"),
+        ):
+            with self.subTest(body=name):
+                with self.assertRaises(BridgeError) as caught:
+                    runner.run_turn(
+                        self.session_dir,
+                        "hermes",
+                        body,
+                        self._builder("", "--"),
+                        30.0,
+                    )
+                self.assertEqual(caught.exception.failure, Failure.USAGE_ERROR)
+                self.assertIn(expected, str(caught.exception))
+                self.assertEqual(self._messages(), [])
+
+    def test_a_courier_only_peer_is_refused_a_project_before_anything_starts(
+        self,
+    ):
+        """Refused by the command line, with nothing read and nothing sent."""
+        captured = io.StringIO()
+        with mock.patch("sys.stderr", captured):
+            with mock.patch("sys.stdin", io.StringIO("A question.\n")):
+                status = cli.main(
+                    [
+                        "run",
+                        "--peer",
+                        "hermes",
+                        "--session",
+                        self.session_dir,
+                        "--project",
+                        self.temp,
+                    ]
+                )
+        self.assertEqual(status, 1)
+        self.assertIn("--project is not accepted for hermes", captured.getvalue())
+        self.assertIn("Next action:", captured.getvalue())
+        self.assertEqual(self._messages(), [])
 
 
 if __name__ == "__main__":

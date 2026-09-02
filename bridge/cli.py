@@ -6,18 +6,22 @@ without calling anybody.
 
 Three things about this file are worth knowing before reading it.
 
-**Both `check` and `run` go through the same five-way switch.** Two of the five
-branches lead to a real connector, Codex and Claude Code; the other three
-truthfully report that no connector for them ships. There is no fallback, no
-stub that answers as though a harness had, and no undocumented way to reach a
-program anyway.
+**Both `check` and `run` go through the same four-way switch.** All four
+branches now lead to a real connector: Codex, Claude Code, ZCode and Hermes
+Agent. An identifier that is not one of the four is an honest failure. There is
+no fallback, no stub that answers as though a harness had, and no undocumented
+way to reach a program anyway.
 
 **The working directory is decided here, and nowhere else.** A peer runs in the
 directory `--project` names, or, when there is none, in a neutral empty
 directory made for the command and taken away again on every way out - including
 a failure and being stopped. That is the only source of the fact. Nothing under
 a message's `## Body` heading is read anywhere in Agent Bridge, so no text a peer
-or a plan wrote can put a directory in front of a harness.
+or a plan wrote can put a directory in front of a harness. A courier-only
+connector - one whose harness cannot read a file without also being able to
+write one - is never given a project: `--project` is refused for it here,
+before anything is read or started, and its peer runs in the neutral directory
+every time.
 
 **Every failure looks the same.** One plain sentence saying what happened, then
 one thing to do next, on the error stream, with a nonzero exit. That includes the
@@ -188,6 +192,14 @@ def _run(args: argparse.Namespace) -> str:
             detail="--review-base and --review-head are required together",
         )
     connector = connectors.resolve(args.peer)
+    # A connector says it is courier-only by carrying the name; the two that
+    # can be pointed at a project simply do not carry it.
+    if args.project is not None and getattr(connector, "COURIER_ONLY", False):
+        raise BridgeError(
+            Failure.USAGE_ERROR,
+            detail="--project is not accepted for {0}, which is given no "
+            "project and answers only on what it is sent".format(args.peer),
+        )
     body = _read_body()
     if not body.strip():
         raise BridgeError(

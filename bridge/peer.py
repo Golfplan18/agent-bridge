@@ -6,8 +6,11 @@ understanding, `run_bounded`, and the care in it is all about two questions:
 what may be started, and what must be gone afterwards.
 
 **What may be started.** A fixed list of arguments, with no shell anywhere. The
-outgoing Markdown goes down the program's standard input and nowhere else, so
-text a peer or a plan may have influenced never becomes part of a command.
+outgoing Markdown goes down the program's standard input, or, for the one kind
+of connector that has proved its harness has no standard-input path, arrives
+bound to an option as a single final argument that the runner composed; either
+way no shell ever sees it, so text a peer or a plan may have influenced never
+becomes part of a command.
 
 **What must be gone afterwards.** The child is started as its own session
 leader, which makes it the leader of a brand new process group containing it and
@@ -77,6 +80,7 @@ SPDX-License-Identifier: Unlicense
 from __future__ import annotations
 
 import contextlib
+import errno
 import os
 import signal
 import subprocess
@@ -457,6 +461,21 @@ def run_bounded(
                         start_new_session=True,
                     )
                 except OSError as exc:
+                    # The one refusal that is about the call rather than the
+                    # program: the kernel would not build an argument block
+                    # this large. It is the transport's failure and is named
+                    # as such, not as a missing program or a failed peer.
+                    if exc.errno == errno.E2BIG:
+                        raise BridgeError(
+                            Failure.USAGE_ERROR,
+                            detail=(
+                                "the operating system refused to start {0} "
+                                "because its argument list and environment "
+                                "together were too long ({1}); send a "
+                                "shorter message, or use a peer that reads "
+                                "standard input".format(argv[0], exc)
+                            ),
+                        )
                     raise BridgeError(spawn_failure, detail=str(exc))
                 pgid = _own_group(process)
                 with watch.allowing():
