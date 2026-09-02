@@ -1,56 +1,54 @@
 # Agent Bridge
 
-Agent Bridge lets two coding-agent harnesses work on one job together. It calls
-them through the official command-line programs their vendors publish. It does
-not connect model APIs.
+Agent Bridge is a standalone one-to-many Markdown courier. Any application or
+coding-agent harness can use one shared Bridge installation to make a bounded
+call to Codex, Claude Code, ZCode, or Hermes Agent through the official
+command-line program that vendor publishes. Agent Bridge does not connect model
+APIs.
 
-What the bridge owns is deliberately small: one bounded call to a peer harness,
-an ordered exchange of Markdown files on disk, an explicit least-authority
-invocation, one lock per session, publication that either completes or does not
-happen at all, cleanup of everything the turn started, and the written
-instructions that coordinate planning and review. Agent Bridge treats a peer's
-command-line program as a trusted program running under the user's own account,
-and makes no claim to stop it reading other files that account can already read,
-so invoke only harnesses you trust.
+What the bridge owns is deliberately small: target readiness, one request and
+one response, an ordered Markdown record, an explicit least-authority
+invocation, one lock per session, atomic publication, a bounded foreground
+process, and cleanup of everything the turn started.
 
-Two further boundaries follow from that same account, and both are stated rather
-than papered over.
+Applications own everything else. They may plan, review, coordinate several
+targets, manage Git, or interpret responses, but none of that behavior is part
+of Agent Bridge. Initiators identify themselves with an inert label; adding
+another application requires no Bridge registry, connector, or release.
 
-**Reviewer context.** An executor and a reviewer are separate contexts that
-inherit no conversation from each other, and what makes a reviewer independent is
-the packet it is handed: the plan and the evidence, never the executor's claims,
-hidden reasoning or prior conversation. That is a property of how the context is
-built, not of the disk. Every harness writes plaintext session transcripts the
-same account can read, and Agent Bridge does not stop a reviewer that goes
-looking from finding one. It adds no transcript deletion, no search prevention
-and no isolation subsystem.
+Agent Bridge treats a target CLI as a trusted program running under the user's
+own account. It makes no claim to stop that program reading other files the
+account can already read, so users should invoke only harnesses they trust.
+Every connector must still prove that its production restrictions prevent
+project mutation, Git changes, and prohibited external effects.
 
-**Repository instructions.** A peer given a project root is given that project's
-`AGENTS.md` or `CLAUDE.md` with it. Agent Bridge does not prevent that and adds
-no suppression wrapper. Such instructions may govern how a repository is
-inspected; they cannot expand the approved plan, create user authority, permit
-mutation, or authorise a prohibited external effect. This repository carries no
-agent instruction file of its own, so an external reviewer of Agent Bridge takes
-its instructions from the review request.
+A target given a project may load that project's `AGENTS.md`, `CLAUDE.md`,
+or equivalent instructions. Target CLIs may also write their own plaintext
+transcripts. Agent Bridge neither suppresses repository instructions nor hides
+vendor transcripts.
 
-Everything else stays where it already lives. Each harness keeps its own
-authentication, subscription, providers, models, tools, agents and native
-sessions, and does its own implementation work its own way. The project
-repository and Git remain the record of what was built and the way to undo it.
-There is no daemon, no scheduler and no background service; when the foreground
-command exits, Agent Bridge is idle.
+Each harness keeps its own authentication, subscription, providers, models,
+tools, agents, and native sessions. Agent Bridge installs nothing, signs in to
+nothing, selects no model or provider, and has no API fallback. There is no
+daemon, scheduler, database, coordinator, router, workflow engine, Git gate, or
+background service; when the foreground command exits, Agent Bridge is idle.
 
 ## Status
 
-This repository is under construction and has not been released. No harness is
-release-qualified, nothing here is supported, and there is no installation path
-yet.
+This repository is under construction and has not been released. The frozen
+courier interface is the Release 1 target; current code may not yet conform to
+all of it. No harness is release-qualified, nothing here is supported, and
+there is no installation path yet.
 
 ## Interface
 
-`INTERFACE.md` is the frozen interface: the harness identifiers, the commands,
-the session record and message formats, the internal failure list, what a native
-package must do, and the neutral Programming Loop contract.
+`INTERFACE.md` defines the frozen courier contract: initiator labels, the four
+callable targets, commands, session and message formats, connector
+qualification, failures, cleanup, thin adapter responsibilities, and Release 1
+transport conformance.
+
+It intentionally contains no planning, Programming Loop, external-review, Git,
+approval, or application-workflow contract.
 
 ## License
 
