@@ -60,7 +60,7 @@ background service. When the foreground command exits, Agent Bridge is idle.
 
 ## 2. The shared runtime
 
-One implementation of the runner serves all five harnesses. That is only
+One implementation of the runner serves all four harnesses. That is only
 possible if it runs anywhere, so:
 
 - **Python standard library only.** No third-party runtime dependency, in the
@@ -70,12 +70,22 @@ possible if it runs anywhere, so:
 - **Started as a fixed argument vector, never through a shell.** Every program
   the bridge starts is launched with an explicit list of arguments and no shell
   interpretation.
-- **The body always arrives on standard input.** The outgoing Markdown text is
-  written to the peer program's standard input. Prompt text never appears on a
-  command line, in an environment variable, or in a shell string.
+- **No byte of the body can be read as an option or a command.** Standard input
+  is the transport wherever the peer's program has one, and the body is written
+  there. Two of the four programs have none: ZCode and Hermes take a one-shot
+  prompt only from their command line. For those, the body is bound to the
+  program's own prompt option as exactly one final argument, so nothing in it can
+  begin a new argument whatever it starts with. It is never split, never
+  truncated, never spilled to a file, and never placed in an environment variable
+  or a shell string. A body too large for the whole argument block, or holding a
+  NUL byte, is refused before any request is published.
 
-The last two points are one safety property stated twice: text that a peer or a
-plan may have influenced never becomes part of a command.
+Those points are one safety property stated twice: text that a peer or a plan
+may have influenced never becomes a command. Standard input remains the required
+transport wherever one exists, because a command line is visible to other
+processes under the same account and may be captured by crash reporters and
+vendor telemetry — a cost a connector may accept only where no standard-input
+path exists, proven by probe.
 
 A native package starts the bridge the same way it starts anything else — as a
 fixed argument vector, with no shell and no installed console script to depend
@@ -87,16 +97,16 @@ python3 -m bridge <command> ...
 
 ---
 
-## 3. The five harnesses
+## 3. The four harnesses
 
-Agent Bridge knows exactly five harnesses, identified by these fixed names:
+Agent Bridge knows exactly four harnesses, identified by these fixed names:
 
 ```text
-codex   claude   zcode   hermes   minimax-code
+codex   claude   zcode   hermes
 ```
 
 The list is written out in source, in that order. There is no discovery, no
-plugin search, no registry and no marketplace: adding a sixth harness means
+plugin search, no registry and no marketplace: adding a fifth harness means
 editing the file that names them, which is the point — the complete set of
 programs the bridge is willing to start is visible by reading it.
 

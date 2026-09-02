@@ -1,23 +1,22 @@
-"""The five harnesses Agent Bridge can call, and how one call is described.
+"""The four harnesses Agent Bridge can call, and how one call is described.
 
 Agent Bridge knows exactly five coding-agent harnesses, named once here and
-never discovered at runtime. Looking one up is a literal five-way switch: there
+never discovered at runtime. Looking one up is a literal four-way switch: there
 is no registry, no plugin search, no dynamic import, and no base class for a
 connector to inherit. Adding a sixth harness means editing this file, which is
 the point - the set of programs the bridge will start is visible in source.
 
-Three connectors ship in this build, Codex, Claude Code and Hermes Agent.
-Each is a module of its own offering exactly two operations - answer whether
-the harness could be used right now, and compose the one fixed argument vector
-a turn runs. Hermes is the courier-only one: its program has no standard-input
-path, so the body reaches it as the final command-line argument, and its tools
-cannot read a file without also being able to write one, so it is given no
-project and answers on what it is sent. The other two branches resolve to
-nothing, so asking for one of them is an honest failure rather than a silent
-fallback.
+Four connectors ship in this build: Codex, Claude Code, ZCode and Hermes
+Agent. Each is a module of its own offering exactly two operations - answer
+whether the harness could be used right now, and compose the one fixed
+argument vector a turn runs. Two of them, ZCode and Hermes, have programs with
+no standard-input path, so the body reaches them as the final command-line
+argument; Hermes is courier-only besides, because its tools cannot read a file
+without also being able to write one, so it is given no project and answers on
+what it is sent.
 
 This module also holds what the connectors share, and the sharing is
-deliberately shallow: a handful of plain functions, called by both, and no
+deliberately shallow: a handful of plain functions, called by each, and no
 inheritance. Finding the program, reading its version, describing this
 computer, running one of a harness's own cheap questions inside the turn's
 deadline, and proving that a restriction switch really exists on the installed
@@ -39,18 +38,17 @@ import os
 import platform
 import re
 import shutil
-from typing import Any, NamedTuple, Optional, Sequence, Tuple
+from typing import Any, Iterable, NamedTuple, Optional, Sequence, Tuple
 
 from .errors import BridgeError, Failure
 from .peer import CompletedCall, Deadline, run_bounded
 
-#: The five harness identifiers, fixed and ordered. Nothing else is a harness.
+#: The four harness identifiers, fixed and ordered. Nothing else is a harness.
 HARNESS_IDS: Tuple[str, ...] = (
     "codex",
     "claude",
     "zcode",
     "hermes",
-    "minimax-code",
 )
 
 
@@ -118,6 +116,52 @@ class PeerCommand(NamedTuple):
     cwd: str
     env: Tuple[Tuple[str, str], ...]
     body_argument: Optional[str] = None
+
+
+#: The most a body may be when it travels on the command line, in encoded
+#: bytes. Fixed by the plan; half the argument space macOS allows a process.
+COMMAND_LINE_BODY_LIMIT = 524288
+
+#: Room left unused below the operating system's argument-space limit, because
+#: the exact accounting of pointers and padding is the kernel's, not ours.
+ARGUMENT_SPACE_HEADROOM = 65536
+
+#: What to assume for the argument space when the operating system will not
+#: say: the macOS value, which is the platform the connectors are qualified on.
+ASSUMED_ARGUMENT_SPACE = 1048576
+
+
+def argument_space_limit() -> int:
+    """How many bytes of arguments and environment a new process may carry.
+
+    Asked of the operating system where it answers, with the headroom above
+    taken off, because a program refused at creation for an oversized argument
+    block is a failure that should have been refused here, in words, first.
+    """
+    try:
+        total = os.sysconf("SC_ARG_MAX")
+    except (AttributeError, OSError, ValueError):
+        total = ASSUMED_ARGUMENT_SPACE
+    if not isinstance(total, int) or total <= 0:
+        total = ASSUMED_ARGUMENT_SPACE
+    return max(0, total - ARGUMENT_SPACE_HEADROOM)
+
+
+def argument_space_used(
+    argv: Sequence[str], env: Iterable[Tuple[str, str]]
+) -> int:
+    """The bytes a process creation would spend on these arguments and this
+    environment: every string with its terminator, and a pointer for each."""
+    pointer = 8
+    used = 0
+    count = 0
+    for argument in argv:
+        used += len(argument.encode("utf-8")) + 1
+        count += 1
+    for name, value in env:
+        used += len(name.encode("utf-8")) + len(value.encode("utf-8")) + 2
+        count += 1
+    return used + pointer * (count + 2)
 
 
 # -- what both connectors do the same way -----------------------------------
@@ -280,48 +324,40 @@ def readiness(
     )
 
 
-# -- the five-way switch ----------------------------------------------------
+# -- the four-way switch ---------------------------------------------------
 
 
 def _switch(harness_id: str) -> Optional[Any]:
     """Resolve one identifier to its connector, or raise for an unknown name.
 
     The branches are written out one by one on purpose: this is the whole list
-    of programs Agent Bridge is willing to start. Two of them still resolve to
-    nothing, because no connector for those harnesses has been written. The
-    Hermes branch resolves to a module that runs the readiness questions and
-    then refuses, because the installed Hermes cannot be handed the body on
-    standard input; that refusal is the truthful answer, and it is given by
-    the connector rather than by this switch so that the reason travels with
-    it.
+    of programs Agent Bridge is willing to start, and every one of the four
+    now resolves to a module.
 
-    The three that are wired are imported inside this function for one
-    ordinary reason: each of them uses the shapes and the helpers defined
-    above, and a module cannot be half-imported into itself. The names are
-    literal and there are three of them; nothing is searched for, and nothing
-    is built from a string.
+    They are imported inside this function for one ordinary reason: each of
+    them uses the shapes and the helpers defined above, and a module cannot be
+    half-imported into itself. The names are literal and there are four of
+    them; nothing is searched for, and nothing is built from a string.
     """
-    from . import claude, codex, hermes
+    from . import claude, codex, hermes, zcode
 
     if harness_id == "codex":
         return codex
     if harness_id == "claude":
         return claude
     if harness_id == "zcode":
-        return None
+        return zcode
     if harness_id == "hermes":
         return hermes
-    if harness_id == "minimax-code":
-        return None
     raise BridgeError(Failure.UNKNOWN_HARNESS, detail=harness_id)
 
 
 def resolve(harness_id: str) -> Any:
-    """Return the connector for one of the five harnesses.
+    """Return the connector for one of the four harnesses.
 
-    Raises UNKNOWN_HARNESS for a name that is not one of the five, and
-    CONNECTOR_UNAVAILABLE for one of the five whose connector does not ship in
-    this build.
+    Raises UNKNOWN_HARNESS for a name that is not one of the four. Every one of
+    the four now ships a connector, so CONNECTOR_UNAVAILABLE is reserved for a
+    build in which one does not.
     """
     connector = _switch(harness_id)
     if connector is None:

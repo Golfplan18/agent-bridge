@@ -135,8 +135,8 @@ _GUIDANCE: Dict[Failure, Tuple[str, str]] = {
         "input, and run it again.",
     ),
     Failure.UNKNOWN_HARNESS: (
-        "The named harness is not one of the five Agent Bridge knows about.",
-        "Name one of: codex, claude, zcode, hermes, minimax-code.",
+        "The named harness is not one of the four Agent Bridge knows about.",
+        "Name one of: codex, claude, zcode, hermes.",
     ),
     Failure.CONNECTOR_UNAVAILABLE: (
         "That harness identifier is real, but this build ships no connector "

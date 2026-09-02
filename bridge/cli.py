@@ -6,11 +6,11 @@ without calling anybody.
 
 Three things about this file are worth knowing before reading it.
 
-**Both `check` and `run` go through the same five-way switch.** Two of the five
-branches lead to a real connector, Codex and Claude Code; the other three
-truthfully report that no connector for them ships. There is no fallback, no
-stub that answers as though a harness had, and no undocumented way to reach a
-program anyway.
+**Both `check` and `run` go through the same four-way switch.** All four
+branches now lead to a real connector: Codex, Claude Code, ZCode and Hermes
+Agent. An identifier that is not one of the four is an honest failure. There is
+no fallback, no stub that answers as though a harness had, and no undocumented
+way to reach a program anyway.
 
 **The working directory is decided here, and nowhere else.** A peer runs in the
 directory `--project` names, or, when there is none, in a neutral empty

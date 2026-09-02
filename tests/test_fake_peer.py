@@ -33,15 +33,16 @@ the harness its version, whether it is signed in, whether the restriction
 switches are there - is bounded by the turn's own deadline, and a builder that
 outruns that deadline never gets a peer started and never publishes a request.
 
-One group is about the one transport that is not standard input. A harness
+Three groups are about the one transport that is not standard input. A harness
 whose program has no standard-input path may take the body as its final
-command-line argument, on three conditions, and all three can be seen from
-outside without the real program: the body arrives whole as exactly one
-argument, behind whatever prefix the connector said, with nothing on standard
-input; a body too large for the whole argument block, or holding a NUL byte,
-is refused before any request is published and is never cut down; and a peer
-that is given no project is refused one by the command itself, before anything
-is read or started.
+command-line argument, on conditions that can all be seen from outside without
+the real program: the body arrives whole as exactly one argument, behind
+whatever prefix the connector said, with nothing on standard input, even when
+it begins with hyphens or carries the program's own option names; a body too
+large for the whole argument block, or holding a NUL byte, is refused before
+any request is published and is never cut down, because a request on the disk
+would say something had been sent; and a peer that is given no project is
+refused one by the command itself, before anything is read or started.
 
 The last group is about the other way something gets into a session: `record`,
 which writes one local message without calling anybody. There are five kinds it
@@ -78,7 +79,7 @@ if REPO_ROOT not in sys.path:
     sys.path.insert(0, REPO_ROOT)
 
 from bridge import cli, peer, record, runner, session  # noqa: E402
-from bridge.connectors import PeerCommand  # noqa: E402
+from bridge.connectors import COMMAND_LINE_BODY_LIMIT, PeerCommand  # noqa: E402
 from bridge.errors import BridgeError, Failure  # noqa: E402
 from bridge.locking import lock_path, session_lock  # noqa: E402
 
@@ -294,6 +295,23 @@ class TurnBehavior(unittest.TestCase):
                 argv=argv,
                 cwd=self.temp,
                 env=tuple(os.environ.items()),
+            )
+
+        return build
+
+    def _argument_builder(self, prefix):
+        """A connector that has declared the command-line transport.
+
+        The fake peer's `last-argument` mode hands back its final argument, so
+        whatever the runner bound to the prefix is exactly what comes back.
+        """
+
+        def build(deadline):
+            return PeerCommand(
+                argv=(sys.executable, FAKE_PEER, "last-argument"),
+                cwd=self.temp,
+                env=tuple(os.environ.items()),
+                body_argument=prefix,
             )
 
         return build
@@ -934,6 +952,57 @@ class TurnBehavior(unittest.TestCase):
         self._expect(Failure.EMPTY_RESPONSE, "whitespace", body="Say air.\n")
         self.assertEqual(self._messages(), ["0001-local-to-peer.md"])
 
+    # -- the body on the command line, where a harness has no other way ----
+
+    def test_a_hyphen_led_body_travels_as_one_argument_and_comes_back_whole(
+        self,
+    ):
+        body = (
+            "---\ntitle: bound\n--mode yolo\n-p not an option\n"
+            "--disallowed-tools=Edit is text\n---\n\nAnswer this.\n"
+        )
+        result = runner.run_turn(
+            self.session_dir, "claude", body, self._argument_builder("--prompt="), 30.0
+        )
+        with open(result.response_path, encoding="utf-8") as stream:
+            response = stream.read()
+        self.assertEqual(
+            response,
+            "# Message 0002\nFrom: claude\nTo: codex\n\n## Body\n\n"
+            "--prompt=" + body,
+        )
+        self.assertNotIn("STDIN WAS NOT EMPTY", response)
+        self.assertEqual(self._leftover_temporaries(), [])
+
+    def test_a_body_the_command_line_cannot_carry_is_refused_before_anything(
+        self,
+    ):
+        for name, body in (
+            ("one byte over the limit", "x" * (COMMAND_LINE_BODY_LIMIT + 1)),
+            ("a NUL byte inside", "before\x00after\n"),
+        ):
+            with self.subTest(body=name):
+                with self.assertRaises(BridgeError) as caught:
+                    runner.run_turn(
+                        self.session_dir,
+                        "claude",
+                        body,
+                        self._argument_builder("--prompt="),
+                        30.0,
+                    )
+                self.assertEqual(caught.exception.failure, Failure.USAGE_ERROR)
+                self.assertEqual(self._messages(), [])
+                self.assertEqual(self._leftover_temporaries(), [])
+        # And exactly at the limit the body is carried, not refused.
+        result = runner.run_turn(
+            self.session_dir,
+            "claude",
+            "y" * COMMAND_LINE_BODY_LIMIT,
+            self._argument_builder(""),
+            30.0,
+        )
+        self.assertEqual(result.response_sequence, 2)
+
     # -- the connector composes the command ---------------------------------
 
     def test_a_connector_precheck_runs_inside_the_turn_deadline(self):
@@ -1345,7 +1414,7 @@ class CommandLineBody(unittest.TestCase):
         program's parser needs that - and `vector_tail` is the end of the
         vector itself.
         """
-        argv = (sys.executable, FAKE_PEER, "final-argument") + vector_tail
+        argv = (sys.executable, FAKE_PEER, "last-argument") + vector_tail
 
         def build(deadline):
             return PeerCommand(
@@ -1384,21 +1453,19 @@ class CommandLineBody(unittest.TestCase):
                 self.assertNotIn("STANDARD INPUT WAS NOT EMPTY", response)
 
     def test_a_body_too_big_for_the_command_line_is_refused_unsent(self):
-        """Too big means the whole block, in bytes, refused before sending.
+        """Too big is measured in encoded bytes, and refused before sending.
 
-        The block the kernel builds holds the vector, the environment and the
-        body together, so a body the size of the whole capacity is over it by
-        exactly the rest, and one made of two-byte characters is over it with
-        half as many characters. A NUL byte is refused for a different reason:
-        no argument can carry one at all.
+        The limit is a byte count, not a character count, so a body of
+        two-byte characters reaches it with half as many characters. A NUL
+        byte is refused for a different reason: no argument can carry one.
         """
-        capacity = runner.command_line_capacity()
+        limit = COMMAND_LINE_BODY_LIMIT
         for name, body, expected in (
-            ("the whole capacity in one-byte characters", "x" * capacity, str(capacity)),
+            ("one byte over, in one-byte characters", "x" * (limit + 1), str(limit)),
             (
-                "the whole capacity in two-byte characters",
-                "\u00e9" * (capacity // 2 + 1),
-                str(capacity),
+                "one byte over, in two-byte characters",
+                "\u00e9" * (limit // 2 + 1),
+                str(limit),
             ),
             ("a NUL byte", "before\x00after\n", "NUL"),
         ):

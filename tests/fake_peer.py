@@ -15,12 +15,12 @@ Every mode exists because some check needs it, and there are only two families
 of them.
 
 The first is about what a peer says: a good answer, which is whatever it was
-given handed straight back; no answer at all; and an answer that is nothing but
-whitespace. Between them they are every shape the runner has to tell apart when
-it decides whether there is anything to publish. One more stands in for a
-program that takes its body on the command line rather than standard input: it
-hands back its own final argument, and says so if anything arrived on standard
-input as well.
+given handed straight back; no answer at all; an answer that is nothing but
+whitespace; and, for a harness that takes the message on its command line
+rather than on standard input, the final argument handed straight back, with a
+complaint appended if anything arrived on standard input as well. Between them
+they are every shape the runner has to tell apart when it decides whether there
+is anything to publish, and both ways a body can travel.
 
 The second is about what a peer leaves behind: a program that exits badly, one
 that will not stop, one that starts a child and then will not stop, and two that
@@ -45,9 +45,9 @@ import time
 #: Every supported mode, in the order the docstring above describes them.
 MODES = (
     "plain",
+    "last-argument",
     "empty",
     "whitespace",
-    "final-argument",
     "fail",
     "hang",
     "spawn-child-then-hang",
@@ -147,17 +147,20 @@ def _run(mode: str, extra: list) -> int:
         _emit(echoed)
         return 0
 
+    if mode == "last-argument":
+        # The body travelled as the final argument; hand that back exactly.
+        # Standard input should have carried nothing, and if it did, say so
+        # where a check will see it.
+        _emit(_echoed(extra[-1]) if extra else "")
+        if body:
+            _emit("STDIN WAS NOT EMPTY\n")
+        return 0
+
     if mode == "empty":
         return 0
 
     if mode == "whitespace":
         _emit("\n   \n\n  \n")
-        return 0
-
-    if mode == "final-argument":
-        _emit(_echoed(extra[-1] if extra else ""))
-        if body:
-            _emit("STANDARD INPUT WAS NOT EMPTY\n")
         return 0
 
     if mode == "fail":
