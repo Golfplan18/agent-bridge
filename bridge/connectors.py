@@ -6,10 +6,12 @@ is no registry, no plugin search, no dynamic import, and no base class for a
 connector to inherit. Adding a sixth harness means editing this file, which is
 the point - the set of programs the bridge will start is visible in source.
 
-Two connectors ship in this build, Codex and Claude Code. Each is a module of
-its own offering exactly two operations - answer whether the harness could be
-used right now, and compose the one fixed argument vector a turn runs. The
-other three branches resolve to nothing, so asking for one is an honest failure
+Three connector modules ship in this build. Codex and Claude Code each offer
+exactly two operations - answer whether the harness could be used right now,
+and compose the one fixed argument vector a turn runs. ZCode's module runs the
+same prerequisites and then refuses both, because its installed build cannot
+take the message on standard input; its own docstring holds the evidence. The
+other two branches resolve to nothing, so asking for one is an honest failure
 rather than a silent fallback.
 
 This module also holds what the two connectors share, and the sharing is
@@ -267,23 +269,25 @@ def _switch(harness_id: str) -> Optional[Any]:
     """Resolve one identifier to its connector, or raise for an unknown name.
 
     The branches are written out one by one on purpose: this is the whole list
-    of programs Agent Bridge is willing to start. Three of them still resolve to
-    nothing, because no connector for those harnesses has been written.
+    of programs Agent Bridge is willing to start. Two of them still resolve to
+    nothing, because no connector for those harnesses has been written. ZCode's
+    branch resolves to a module that verifies the program and then refuses to
+    call it, so the refusal names the exact reason instead of the generic one.
 
-    The two that do ship are imported inside this function for one ordinary
+    The three that do ship are imported inside this function for one ordinary
     reason: each of them uses the shapes and the helpers defined above, and a
     module cannot be half-imported into itself. The names are literal and there
-    are two of them; nothing is searched for, and nothing is built from a
+    are three of them; nothing is searched for, and nothing is built from a
     string.
     """
-    from . import claude, codex
+    from . import claude, codex, zcode
 
     if harness_id == "codex":
         return codex
     if harness_id == "claude":
         return claude
     if harness_id == "zcode":
-        return None
+        return zcode
     if harness_id == "hermes":
         return None
     if harness_id == "minimax-code":
