@@ -30,6 +30,17 @@ because a builder can use the whole of it up.
 Running that vector once, safely, inside the deadline is still this function's
 work. Keeping those apart is why the runner never imports a connector.
 
+The body reaches the peer on standard input, except for a connector that has
+declared, and proved, that its harness has no standard-input path. Such a
+connector sets `body_argument` on the command it composes, and this module then
+binds the body to that prefix as one final argument and sends nothing on standard
+input. Three refusals stand in front of that, all before a request is published
+or a program started: a body larger than the fixed limit, a body containing a NUL
+byte, which no argument can carry, and an argument list that together with the
+inherited environment would not fit what the operating system allows a new
+process. Nothing is truncated, split or written to a file to get round any of
+them; the person is told to send a shorter message.
+
 `--review-base` and `--review-head` name the two commits a review request refers
 to. When both are given they are copied onto the published answer, together with
 the number of the request it answers, so that whoever reads the session
@@ -41,13 +52,63 @@ SPDX-License-Identifier: Unlicense
 
 from __future__ import annotations
 
-from typing import Callable, NamedTuple, Optional
+from typing import Callable, NamedTuple, Optional, Tuple
 
 from . import session as session_module
-from .connectors import PeerCommand
+from .connectors import (
+    COMMAND_LINE_BODY_LIMIT,
+    PeerCommand,
+    argument_space_limit,
+    argument_space_used,
+)
 from .errors import BridgeError, Failure
 from .locking import session_lock
 from .peer import Deadline, run_bounded
+
+
+def apply_transport(
+    command: PeerCommand, body: str
+) -> Tuple[Tuple[str, ...], str]:
+    """Where the body goes: the argument vector to run and the standard input.
+
+    For a command without `body_argument` this changes nothing: the vector is
+    the connector's and the body is the standard input. For one with it, the
+    body is bound to the prefix as one final argument and standard input is
+    left empty - after the three refusals below, each of which names what was
+    wrong and what to do, and each of which happens before anything is started
+    or published.
+    """
+    if command.body_argument is None:
+        return command.argv, body
+    if "\x00" in body:
+        raise BridgeError(
+            Failure.USAGE_ERROR,
+            detail="the message contains a NUL byte, which this peer's "
+            "command-line transport cannot carry; remove it and send the "
+            "message again",
+        )
+    size = len(body.encode("utf-8"))
+    if size > COMMAND_LINE_BODY_LIMIT:
+        raise BridgeError(
+            Failure.USAGE_ERROR,
+            detail="the message is {0} bytes and this peer takes it on its "
+            "command line, which Agent Bridge caps at {1} bytes; send a "
+            "shorter message".format(size, COMMAND_LINE_BODY_LIMIT),
+        )
+    argv = command.argv + (command.body_argument + body,)
+    used = argument_space_used(argv, command.env)
+    limit = argument_space_limit()
+    if used > limit:
+        raise BridgeError(
+            Failure.USAGE_ERROR,
+            detail="the message, the command and this environment together "
+            "come to {0} bytes, more than the {1} the operating system allows "
+            "for starting a program once headroom is kept; send a shorter "
+            "message or start Agent Bridge with a smaller environment".format(
+                used, limit
+            ),
+        )
+    return argv, ""
 
 
 class TurnResult(NamedTuple):
@@ -105,6 +166,7 @@ def run_turn(
         deadline.check("composing the peer command")
         command = build_command(deadline)
         deadline.check("composing the peer command")
+        argv, stdin_text = apply_transport(command, body)
 
         # The request is published once there is a command to run and the peer
         # is about to be started. Until then nothing would have been sent, and a
@@ -122,10 +184,10 @@ def run_turn(
         )
 
         call = run_bounded(
-            argv=command.argv,
+            argv=argv,
             cwd=command.cwd,
             env=command.env,
-            stdin_text=body,
+            stdin_text=stdin_text,
             deadline=deadline,
         )
         if call.returncode != 0:

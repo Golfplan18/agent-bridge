@@ -6,8 +6,11 @@ understanding, `run_bounded`, and the care in it is all about two questions:
 what may be started, and what must be gone afterwards.
 
 **What may be started.** A fixed list of arguments, with no shell anywhere. The
-outgoing Markdown goes down the program's standard input and nowhere else, so
-text a peer or a plan may have influenced never becomes part of a command.
+outgoing Markdown goes down the program's standard input, or, for the one kind
+of connector that has proved its harness has no standard-input path, arrives
+bound to an option as a single final argument that the runner composed; either
+way no shell ever sees it, so text a peer or a plan may have influenced never
+becomes part of a command.
 
 **What must be gone afterwards.** The child is started as its own session
 leader, which makes it the leader of a brand new process group containing it and
@@ -77,6 +80,7 @@ SPDX-License-Identifier: Unlicense
 from __future__ import annotations
 
 import contextlib
+import errno
 import os
 import signal
 import subprocess
@@ -457,6 +461,18 @@ def run_bounded(
                         start_new_session=True,
                     )
                 except OSError as exc:
+                    if exc.errno == errno.E2BIG:
+                        # The operating system refused the argument block
+                        # itself, so this is the transport, not a missing
+                        # program, and is named as such.
+                        raise BridgeError(
+                            Failure.USAGE_ERROR,
+                            detail="the operating system refused to start "
+                            "{0} because its arguments and environment "
+                            "together are too long; send a shorter message "
+                            "or start Agent Bridge with a smaller "
+                            "environment".format(argv[0]),
+                        )
                     raise BridgeError(spawn_failure, detail=str(exc))
                 pgid = _own_group(process)
                 with watch.allowing():

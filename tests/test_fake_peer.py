@@ -33,6 +33,14 @@ the harness its version, whether it is signed in, whether the restriction
 switches are there - is bounded by the turn's own deadline, and a builder that
 outruns that deadline never gets a peer started and never publishes a request.
 
+Two are about the one declared exception to the body arriving on standard
+input: a connector that has proved its harness has none may bind the body to a
+prefix as the final argument. A body that begins with hyphens must come back
+exactly as sent, in one piece, with nothing having gone down standard input; and
+a body too large for that transport, or holding a byte no argument can carry,
+must be refused before any program is started and before any request is
+published, because a request on the disk would say something had been sent.
+
 The last group is about the other way something gets into a session: `record`,
 which writes one local message without calling anybody. There are five kinds it
 may write, each with its own envelope, and the list is closed - the point of
@@ -67,7 +75,7 @@ if REPO_ROOT not in sys.path:
     sys.path.insert(0, REPO_ROOT)
 
 from bridge import peer, record, runner, session  # noqa: E402
-from bridge.connectors import PeerCommand  # noqa: E402
+from bridge.connectors import COMMAND_LINE_BODY_LIMIT, PeerCommand  # noqa: E402
 from bridge.errors import BridgeError, Failure  # noqa: E402
 from bridge.locking import lock_path, session_lock  # noqa: E402
 
@@ -283,6 +291,23 @@ class TurnBehavior(unittest.TestCase):
                 argv=argv,
                 cwd=self.temp,
                 env=tuple(os.environ.items()),
+            )
+
+        return build
+
+    def _argument_builder(self, prefix):
+        """A connector that has declared the command-line transport.
+
+        The fake peer's `last-argument` mode hands back its final argument, so
+        whatever the runner bound to the prefix is exactly what comes back.
+        """
+
+        def build(deadline):
+            return PeerCommand(
+                argv=(sys.executable, FAKE_PEER, "last-argument"),
+                cwd=self.temp,
+                env=tuple(os.environ.items()),
+                body_argument=prefix,
             )
 
         return build
@@ -922,6 +947,57 @@ class TurnBehavior(unittest.TestCase):
     def test_whitespace_only_output_publishes_no_response(self):
         self._expect(Failure.EMPTY_RESPONSE, "whitespace", body="Say air.\n")
         self.assertEqual(self._messages(), ["0001-local-to-peer.md"])
+
+    # -- the body on the command line, where a harness has no other way ----
+
+    def test_a_hyphen_led_body_travels_as_one_argument_and_comes_back_whole(
+        self,
+    ):
+        body = (
+            "---\ntitle: bound\n--mode yolo\n-p not an option\n"
+            "--disallowed-tools=Edit is text\n---\n\nAnswer this.\n"
+        )
+        result = runner.run_turn(
+            self.session_dir, "claude", body, self._argument_builder("--prompt="), 30.0
+        )
+        with open(result.response_path, encoding="utf-8") as stream:
+            response = stream.read()
+        self.assertEqual(
+            response,
+            "# Message 0002\nFrom: claude\nTo: codex\n\n## Body\n\n"
+            "--prompt=" + body,
+        )
+        self.assertNotIn("STDIN WAS NOT EMPTY", response)
+        self.assertEqual(self._leftover_temporaries(), [])
+
+    def test_a_body_the_command_line_cannot_carry_is_refused_before_anything(
+        self,
+    ):
+        for name, body in (
+            ("one byte over the limit", "x" * (COMMAND_LINE_BODY_LIMIT + 1)),
+            ("a NUL byte inside", "before\x00after\n"),
+        ):
+            with self.subTest(body=name):
+                with self.assertRaises(BridgeError) as caught:
+                    runner.run_turn(
+                        self.session_dir,
+                        "claude",
+                        body,
+                        self._argument_builder("--prompt="),
+                        30.0,
+                    )
+                self.assertEqual(caught.exception.failure, Failure.USAGE_ERROR)
+                self.assertEqual(self._messages(), [])
+                self.assertEqual(self._leftover_temporaries(), [])
+        # And exactly at the limit the body is carried, not refused.
+        result = runner.run_turn(
+            self.session_dir,
+            "claude",
+            "y" * COMMAND_LINE_BODY_LIMIT,
+            self._argument_builder(""),
+            30.0,
+        )
+        self.assertEqual(result.response_sequence, 2)
 
     # -- the connector composes the command ---------------------------------
 
