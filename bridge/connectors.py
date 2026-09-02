@@ -6,13 +6,16 @@ is no registry, no plugin search, no dynamic import, and no base class for a
 connector to inherit. Adding a sixth harness means editing this file, which is
 the point - the set of programs the bridge will start is visible in source.
 
-Two connectors ship in this build, Codex and Claude Code. Each is a module of
-its own offering exactly two operations - answer whether the harness could be
-used right now, and compose the one fixed argument vector a turn runs. The
-other three branches resolve to nothing, so asking for one is an honest failure
-rather than a silent fallback.
+Three modules are wired in this build. Codex and Claude Code each offer
+exactly two operations - answer whether the harness could be used right now,
+and compose the one fixed argument vector a turn runs. Hermes Agent has the
+same two operations and the same prerequisites, and on the installed version
+both end in a refusal that names its reason: Hermes cannot take the body on
+standard input, so it answers readiness truthfully and starts no turn. The
+other two branches resolve to nothing, so asking for one of them is an honest
+failure rather than a silent fallback.
 
-This module also holds what the two connectors share, and the sharing is
+This module also holds what the connectors share, and the sharing is
 deliberately shallow: a handful of plain functions, called by both, and no
 inheritance. Finding the program, reading its version, describing this
 computer, running one of a harness's own cheap questions inside the turn's
@@ -267,16 +270,21 @@ def _switch(harness_id: str) -> Optional[Any]:
     """Resolve one identifier to its connector, or raise for an unknown name.
 
     The branches are written out one by one on purpose: this is the whole list
-    of programs Agent Bridge is willing to start. Three of them still resolve to
-    nothing, because no connector for those harnesses has been written.
+    of programs Agent Bridge is willing to start. Two of them still resolve to
+    nothing, because no connector for those harnesses has been written. The
+    Hermes branch resolves to a module that runs the readiness questions and
+    then refuses, because the installed Hermes cannot be handed the body on
+    standard input; that refusal is the truthful answer, and it is given by
+    the connector rather than by this switch so that the reason travels with
+    it.
 
-    The two that do ship are imported inside this function for one ordinary
-    reason: each of them uses the shapes and the helpers defined above, and a
-    module cannot be half-imported into itself. The names are literal and there
-    are two of them; nothing is searched for, and nothing is built from a
-    string.
+    The three that are wired are imported inside this function for one
+    ordinary reason: each of them uses the shapes and the helpers defined
+    above, and a module cannot be half-imported into itself. The names are
+    literal and there are three of them; nothing is searched for, and nothing
+    is built from a string.
     """
-    from . import claude, codex
+    from . import claude, codex, hermes
 
     if harness_id == "codex":
         return codex
@@ -285,7 +293,7 @@ def _switch(harness_id: str) -> Optional[Any]:
     if harness_id == "zcode":
         return None
     if harness_id == "hermes":
-        return None
+        return hermes
     if harness_id == "minimax-code":
         return None
     raise BridgeError(Failure.UNKNOWN_HARNESS, detail=harness_id)
