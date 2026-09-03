@@ -48,7 +48,7 @@ Every child starts from a fixed argument vector with no shell. A connector uses 
 3. NUL input and a body too large for the platform argument block are refused before request publication, never truncated or split.
 4. Documentation states that command-line text may be visible to same-user processes and system or vendor logs.
 
-The runner never creates a private prompt file for a target to discover. The canonical request records what was sent; the connector delivers its body through the qualified channel.
+The runner never creates a private prompt file. The canonical request records the original exactly and the connector passes it unchanged.
 
 Adapters start Bridge as a fixed vector:
 
@@ -114,7 +114,7 @@ It runs in a task-owned neutral directory and never touches a real project, inst
 
 ### `run`
 
-`run` reads the session's initiator, target, and optional project, then reads one nonempty Markdown body from standard input. It resolves only that target, repeats cheap prerequisites, validates transport, and determines current warnings. It prints any warnings immediately before publishing the request, then makes exactly one bounded target call, captures one final textual answer, and atomically publishes the response.
+`run` reads the session's initiator, target, and optional project, then reads one nonempty Markdown body from standard input. It resolves only that target, repeats cheap prerequisites, validates transport, and determines current warnings. It prints any warnings immediately before publishing the request, then starts exactly one bounded target CLI invocation, captures its final text, and atomically publishes the response.
 
 Warnings never prompt, wait for acknowledgment, read an approval flag, or persist consent. A readable version outside exercised evidence may proceed with a warning when every required switch and the fixed one-shot transport remain usable.
 
@@ -188,7 +188,7 @@ Numbers increase within the session while the lock is held and are never reused.
 
 ---
 
-## 7. Envelope and inert body
+## 7. Envelope and Bridge-inert body
 
 The runner writes every header. Initiators and targets supply only body text.
 
@@ -228,7 +228,7 @@ From: ora
 <note copied unchanged>
 ```
 
-Header-shaped text below `## Body` remains body text. It cannot change identity, target, project, number, kind, restrictions, authority, routing, or command. Bridge extracts no plan, commit, approval, review result, or instruction.
+Header-shaped text below `## Body` remains body text. It cannot change Bridge identity, target, project, number, kind, restrictions, authority, routing, or become a Bridge command. Bridge extracts no plan, commit, approval, review result, or instruction.
 
 Filenames describe direction rather than repeating caller labels. A response is the next message published while the same run holds the lock. There is no correlation, review, or workflow header.
 
@@ -263,9 +263,11 @@ A connector may remove tools, use an enforced sandbox, withhold the project, or 
 | ZCode | Project-capable | Planning mode, explicit directory, known dangerous tools removed | Plugin/direct-MCP limits, indirect OAuth evidence, visible body argument |
 | Hermes Agent | Courier-only | Neutral directory, safe mode, smallest harmless toolset | Read cannot be separated from write, memory remains, visible body argument |
 | MiniMax Code | Courier-only | Neutral directory and all compatible one-shot, permission, tool, and foreground limits | Surviving tools or configuration are not claimed confined |
-| Qwen Code | Courier-only | Neutral directory and all compatible one-shot, approval, sandbox, tool, extension/MCP, and foreground limits | Surviving tools or configuration are not claimed confined |
+| Qwen Code | Courier-only | Neutral directory and all compatible one-shot, approval, sandbox, tool, extension/MCP, and foreground limits | Input preprocessing below; residual limits remain |
 
 For Codex, `--ignore-user-config` does only what its name understates: it skips `$CODEX_HOME/config.toml`. It does not suppress trusted-project `.codex/config.toml` files and project hooks or rules, system configuration, `managed_config.toml`, `requirements.toml`, cloud-delivered requirements, macOS MDM preferences, or separately sourced user/global hooks and rules. Those surviving layers can add settings the fixed vector does not override, and managed defaults or MDM can override CLI options. Hooks, MCP servers, plugins, network or telemetry settings, and other integrations from surviving configuration may therefore retain routes to external effects outside the read-only shell sandbox. Bridge names that limit in its non-blocking warning. The skipped file's model and effort defaults are also lost, and Bridge does not replace them.
+
+**Qwen Code 0.23.0 input exception.** Selected Qwen may interpret recognized leading `/` commands or unescaped `@` references before the model. It may alter or replace the effective prompt, read and append readable file or resource content, fail in preprocessing, or handle a command without a model call. Both supported headless input modes share this; safe mode cannot disable it and no lossless escape or raw switch exists. Bridge records and passes the original exactly, gives Qwen a task-owned neutral directory with no project, and requires `--max-tool-calls=0`: no model-initiated tool call can execute, and the first such attempt aborts the run. Input preprocessing happens before that budget, so the limit does not stop it. Bridge warns during `check` and before publication without blocking or acknowledgment. The other five prompts remain lossless and unselected Qwen inert. An official raw mode would make the exception removable after qualification.
 
 ### Disposable qualification
 
@@ -275,7 +277,7 @@ Before real project use, a task-owned synthetic Git repository proves:
 2. Local create, modify, delete, Git-ref, and repository-configuration attempts occur only in that disposable repository, whose tracked content, untracked files, `HEAD`, refs, configuration, and clean status are compared afterwards.
 3. No `.git` lock or task-owned child remains.
 4. No prompt deliberately attempts browser or web access, messaging, MCP service calls, credential access or change, publication, deployment, login, purchase, or another real-world effect. Those routes are described from the fixed vector, safe no-turn metadata, and uninvoked tool inventory.
-5. Body transport preserves leading hyphens, Unicode, multiline text, and the complete response.
+5. The exact record and CLI transport preserve leading hyphens, Unicode, multiline text, and the complete response. Qwen uses non-triggering content and claims no raw prompt.
 6. The temporary parent is removed on every exit path.
 
 The test uses no real project, secret, message, production service, or publication. Same-user reads outside the project are not claimed to be confined.

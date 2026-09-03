@@ -27,6 +27,16 @@ proceeds without an acknowledgment prompt, approval switch, or stored consent.
 An untested version may proceed with a warning when its required switches and
 one-shot transport still work.
 
+Bridge records and passes the original Markdown exactly. Qwen Code 0.23.0 alone
+may preprocess recognized leading `/` commands or unescaped `@` references,
+altering the prompt, appending readable content, failing before a model call,
+or handling a command itself. Both headless modes share this; safe mode cannot
+disable it and no raw switch exists. Qwen must run with `--max-tool-calls=0`:
+no model-initiated tool call can execute, and the first such attempt aborts the
+run. Input preprocessing happens before that budget, so the limit does not stop
+it. Bridge warns without blocking during `check` and before publication; the
+other five prompts remain lossless.
+
 A target given a project may load that project's `AGENTS.md`, `CLAUDE.md`,
 or equivalent instructions. Target CLIs may also write their own plaintext
 transcripts. Agent Bridge neither suppresses repository instructions nor hides
