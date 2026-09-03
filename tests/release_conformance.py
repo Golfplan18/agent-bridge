@@ -43,6 +43,14 @@ ADAPTERS = TARGETS
 PROJECT_TARGETS = ("codex", "claude", "zcode")
 COURIER_TARGETS = ("hermes", "minimax", "qwen")
 FAKE_PEER = os.path.join(REPO_ROOT, "tests", "fake_peer.py")
+FOREGROUND_CONVENTION = {
+    "codex": "Codex's command tool",
+    "claude": "Keep the terminal attached",
+    "zcode": "ZCode's terminal tool",
+    "hermes": "Hermes's terminal tool",
+    "minimax": "MiniMax Code's terminal tool",
+    "qwen": "Qwen Code's shell tool",
+}
 
 PRODUCTION_MODULES = {
     "__init__.py",
@@ -182,7 +190,8 @@ def _bridge_command_lines(text: str) -> List[str]:
 def _inspect_adapter(name: str) -> None:
     path = _adapter_path(name)
     text = _read(path)
-    lowered = text.lower()
+    prose = " ".join(text.split())
+    lowered = prose.lower()
 
     _require(
         "initiator label is always `{0}`".format(name) in lowered,
@@ -205,8 +214,52 @@ def _inspect_adapter(name: str) -> None:
         "Bridge-Format: 2" in text,
         "{0} does not require Format 2 when reusing a session".format(path),
     )
+    target_listings = re.findall(
+        r"The target is one of these six literal identifiers:\s*```text\s+([^`]+?)\s+```",
+        text,
+    )
     _require(
-        "Never hide, rewrite, or turn a Bridge failure into success" in text,
+        len(target_listings) == 1 and tuple(target_listings[0].split()) == TARGETS,
+        "{0} does not name all six literal targets".format(path),
+    )
+    _require(
+        "Codex, Claude Code, and ZCode may receive a project" in prose
+        and "Hermes, MiniMax Code, and Qwen Code are courier-only" in prose,
+        "{0} does not preserve the three project-capable and three "
+        "courier-only targets".format(path),
+    )
+    _require(
+        "Only the session's selected target is active" in prose
+        and "other five target programs" in prose,
+        "{0} does not keep unselected targets inert".format(path),
+    )
+    _require(
+        "does not call another adapter" in prose
+        and FOREGROUND_CONVENTION[name] in prose,
+        "{0} does not own its foreground host convention".format(path),
+    )
+    _require(
+        "Surface every Bridge `Warning:` line" in prose
+        and "without asking for acknowledgment" in prose,
+        "{0} does not surface non-blocking Bridge warnings".format(path),
+    )
+    _require(
+        "For ZCode, MiniMax, and Qwen" in prose
+        and "do not confirm live authentication" in prose
+        and "do not report a confirmed sign-in" in prose,
+        "{0} overstates readiness authentication evidence".format(path),
+    )
+    _require(
+        "Qwen Code 0.23.0 alone may preprocess" in prose
+        and "leading `/` commands" in prose
+        and "unescaped `@` references" in prose
+        and "before its zero model-tool-call limit" in prose
+        and "never claim Qwen's model saw that body unchanged" in prose,
+        "{0} omits Qwen's target-side preprocessing boundary".format(path),
+    )
+    _require(
+        "Never hide, rewrite, or turn a Bridge failure into success" in prose
+        and "the full failure, and its next action" in prose,
         "{0} does not preserve Bridge failures".format(path),
     )
 

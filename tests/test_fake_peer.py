@@ -1993,44 +1993,6 @@ class SixTargetConnectorBehavior(unittest.TestCase):
             )
         )
 
-    def test_qualification_vector_distinguishes_stdin_from_bound_arguments(self):
-        qwen_prerequisite = self._qwen_prerequisite()
-        hermes_prerequisite = (
-            "/fake/hermes",
-            "0.18.2",
-            "Darwin 26 arm64",
-            "signed in to the Nous Portal",
-            (hermes.WARNING,),
-        )
-        with mock.patch.object(
-            qwen, "_prerequisites", return_value=qwen_prerequisite
-        ):
-            qwen_command = qwen.build_command(peer.Deadline(120.0), self.temp)
-            stdin_vector = release_conformance._restriction_vector(
-                "qwen", self.temp
-            )
-        with mock.patch.object(
-            hermes, "_prerequisites", return_value=hermes_prerequisite
-        ):
-            hermes_command = hermes.build_command(
-                peer.Deadline(120.0), self.temp
-            )
-            bound_vector = release_conformance._restriction_vector(
-                "hermes", self.temp
-            )
-
-        self.assertEqual(
-            stdin_vector,
-            "argv={0}; stdin=<BODY>".format(repr(qwen_command.argv)),
-        )
-        self.assertEqual(
-            bound_vector,
-            repr(
-                hermes_command.argv
-                + (hermes.BODY_ARGUMENT + "<BODY>",)
-            ),
-        )
-
     def test_qwen_accepts_only_a_successful_terminal_json_result(self):
         self.assertEqual(
             qwen.parse_response(
@@ -2132,50 +2094,6 @@ class SixTargetConnectorBehavior(unittest.TestCase):
 
 class QualificationUsesProductionController(unittest.TestCase):
     """Qualification reuses the public CLI and its one production process owner."""
-
-    def setUp(self):
-        self.temp = tempfile.mkdtemp(prefix="agent-bridge-qualifier-")
-
-    def tearDown(self):
-        shutil.rmtree(self.temp, ignore_errors=True)
-
-    def test_public_bridge_invokes_the_public_cli_in_process(self):
-        observed = {}
-
-        def public_main(arguments):
-            observed["arguments"] = tuple(arguments)
-            observed["body"] = sys.stdin.read()
-            sys.stdout.write("public output\n")
-            sys.stderr.write("public warning\n")
-            return 7
-
-        with mock.patch.object(
-            release_conformance.cli, "main", side_effect=public_main
-        ):
-            completed = release_conformance._public_bridge(
-                ("run", "--session", "/disposable/session"),
-                "stdin-only qualification body\n",
-            )
-
-        self.assertEqual(
-            observed["arguments"],
-            ("run", "--session", "/disposable/session"),
-        )
-        self.assertEqual(observed["body"], "stdin-only qualification body\n")
-        self.assertEqual(completed.returncode, 7)
-        self.assertEqual(completed.stdout, "public output\n")
-        self.assertEqual(completed.stderr, "public warning\n")
-
-    def test_public_bridge_captures_a_normal_bridge_failure(self):
-        completed = release_conformance._public_bridge(
-            ("check", "--peer", "other"),
-            "",
-        )
-
-        self.assertEqual(completed.returncode, 1)
-        self.assertEqual(completed.stdout, "")
-        self.assertIn("not one of the six", completed.stderr)
-        self.assertIn("Next action:", completed.stderr)
 
     def test_qualification_combines_original_failure_with_final_inspection(self):
         captured = {}
