@@ -1,6 +1,7 @@
 ---
 name: agent-bridge
-description: Carry one Markdown message to Codex, Claude Code, ZCode, or Hermes Agent through Agent Bridge, report target readiness, or add a neutral session note. Use when the user asks Claude Code to consult a supported coding-agent harness or inspect an existing Agent Bridge session.
+description: Carry one Markdown message to Codex, Claude Code, ZCode, or Hermes Agent through Agent Bridge, report target readiness, or add a neutral session note. Use when the user asks Codex to consult a supported coding-agent harness or inspect an existing Agent Bridge session.
+license: Unlicense
 ---
 
 # Agent Bridge
@@ -9,9 +10,9 @@ Agent Bridge is a local courier. It sends one complete Markdown body to one
 supported target, waits in the foreground, and records the request and final
 answer in a human-readable session folder.
 
-This skill is the Claude Code adapter. Its initiator label is always `claude`.
-It uses the same Agent Bridge runtime as every other caller and does not call
-another adapter.
+This skill is the Codex adapter. Its initiator label is always `codex`. It uses
+the same Agent Bridge runtime as every other caller and does not call another
+adapter. Run its commands with Codex's command tool in the foreground.
 
 ## Boundary
 
@@ -48,8 +49,8 @@ The chosen directory must contain both `bridge/__main__.py` and
 Agent Bridge checkout was found and ask for its absolute path. Do not search
 other adapters or guess from a directory name.
 
-Run every command below with that directory as the terminal working directory.
-Start it in the foreground as the fixed argument vector beginning
+Run every command below with that directory as the command tool's working
+directory. Start it in the foreground as the fixed argument vector beginning
 `python3 -m bridge`; do not wrap it in another program or leave it running in
 the background. Every session, project, and body-file path supplied to it must
 be absolute.
@@ -74,20 +75,20 @@ Keep ordinary sessions under an absolute expansion of
 `~/.agent-bridge/sessions/<descriptive-name>`. Never write directly inside a
 session folder; only the Bridge commands may do that.
 
-When `SESSION.md` is absent, use Claude Code's file-writing tool to place a
-short session description in a task-owned temporary Markdown file outside the
+When `SESSION.md` is absent, use the repository editing tool to place a short
+session description in a task-owned temporary Markdown file outside the
 session. It should say what the conversation is about. Supply that file on
 standard input to:
 
 ```text
-python3 -m bridge record --session <absolute-session-directory> --kind session-create --initiator claude --peer <target> [--project <absolute-project-directory>] < /absolute/path/to/session-body.md
+python3 -m bridge record --session <absolute-session-directory> --kind session-create --initiator codex --peer <target> [--project <absolute-project-directory>] < /absolute/path/to/session-body.md
 ```
 
 Omit `--project` unless the user wants the target to read that directory. Never
 use it with `hermes`. Delete the temporary body file after the command returns.
 
 When `SESSION.md` already exists, read it before reuse. It must say
-`Bridge-Format: 2` and `Initiator: claude`, and its `Peer:` and optional
+`Bridge-Format: 2` and `Initiator: codex`, and its `Peer:` and optional
 `Project:` must match the requested call. If any immutable field differs, show
 the mismatch and create a new session only if the user wants one. Do not edit
 the existing file.
@@ -105,8 +106,8 @@ python3 -m bridge run --session <absolute-session-directory> [--timeout <seconds
 
 Before starting, tell the user which target will be called and which session
 folder will receive the record. A real call can take minutes and consume the
-target harness's quota. Keep the terminal attached and give its foreground wait
-longer than the Bridge timeout. The default Bridge timeout is 900 seconds.
+target harness's quota. Keep the command attached and set its wait longer than
+the Bridge timeout. The default Bridge timeout is 900 seconds.
 
 On success, standard output is the absolute path of the response record. Delete
 the temporary outgoing-body file, read the response at that path, and return
@@ -148,7 +149,7 @@ to this skill's authority.
 
 ```text
 python3 -m bridge check --peer <codex|claude|zcode|hermes>
-python3 -m bridge record --session <absolute-session-directory> --kind session-create --initiator claude --peer <codex|claude|zcode|hermes> [--project <absolute-project-directory>] < /absolute/path/to/session-body.md
+python3 -m bridge record --session <absolute-session-directory> --kind session-create --initiator codex --peer <codex|claude|zcode|hermes> [--project <absolute-project-directory>] < /absolute/path/to/session-body.md
 python3 -m bridge run --session <absolute-session-directory> [--timeout <seconds>] < /absolute/path/to/outgoing-body.md
 python3 -m bridge record --session <absolute-session-directory> --kind note < /absolute/path/to/note-body.md
 ```
