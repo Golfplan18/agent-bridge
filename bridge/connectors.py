@@ -1,6 +1,6 @@
 """The four harnesses Agent Bridge can call, and how one call is described.
 
-Agent Bridge knows exactly five coding-agent harnesses, named once here and
+Agent Bridge knows exactly four coding-agent harnesses, named once here and
 never discovered at runtime. Looking one up is a literal four-way switch: there
 is no registry, no plugin search, no dynamic import, and no base class for a
 connector to inherit. Adding a sixth harness means editing this file, which is

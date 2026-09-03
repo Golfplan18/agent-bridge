@@ -49,7 +49,6 @@ class Failure(enum.Enum):
     SESSION_NOT_FOUND = "SESSION_NOT_FOUND"
     SESSION_INVALID = "SESSION_INVALID"
     SESSION_EXISTS = "SESSION_EXISTS"
-    PLAN_SEALED = "PLAN_SEALED"
     PUBLICATION_FAILURE = "PUBLICATION_FAILURE"
     PUBLICATION_NOT_FLUSHED = "PUBLICATION_NOT_FLUSHED"
     PUBLICATION_UNCERTAIN = "PUBLICATION_UNCERTAIN"
@@ -111,8 +110,8 @@ _GUIDANCE: Dict[Failure, Tuple[str, str]] = {
     ),
     Failure.TIMEOUT: (
         "The turn reached its deadline before the peer produced an answer.",
-        "Run the turn again with a longer --timeout, or check the peer harness "
-        "by hand first.",
+        "Inspect the visible session and target state before deciding whether "
+        "to retry with a longer --timeout.",
     ),
     Failure.PEER_FAILURE: (
         "The peer harness's program exited with a failure.",
@@ -135,7 +134,7 @@ _GUIDANCE: Dict[Failure, Tuple[str, str]] = {
         "input, and run it again.",
     ),
     Failure.UNKNOWN_HARNESS: (
-        "The named harness is not one of the four Agent Bridge knows about.",
+        "The named target is not one of the four Agent Bridge knows about.",
         "Name one of: codex, claude, zcode, hermes.",
     ),
     Failure.CONNECTOR_UNAVAILABLE: (
@@ -144,9 +143,8 @@ _GUIDANCE: Dict[Failure, Tuple[str, str]] = {
         "Use a harness whose connector ships in this build.",
     ),
     Failure.UNKNOWN_RECORD_KIND: (
-        "That record kind is not one of the five the record command accepts.",
-        "Name one of: session-create, user-correction, plan-approval, "
-        "technical-error, implementation-start.",
+        "That record kind is not one of the two the record command accepts.",
+        "Name one of: session-create, note.",
     ),
     Failure.SESSION_NOT_FOUND: (
         "There is no session record at the given directory.",
@@ -164,12 +162,6 @@ _GUIDANCE: Dict[Failure, Tuple[str, str]] = {
         "another one there would overwrite it.",
         "Continue in the existing session, or choose a new empty --session "
         "directory.",
-    ),
-    Failure.PLAN_SEALED: (
-        "This session already holds an approved PLAN.md, and sealing another "
-        "one would overwrite an approved plan.",
-        "If the user has approved a replacement plan, record it again with "
-        "--replace; otherwise leave the sealed plan alone.",
     ),
     Failure.PUBLICATION_FAILURE: (
         "The message could not be written in full and moved into place, so "

@@ -45,10 +45,9 @@ would say something had been sent; and a peer that is given no project is
 refused one by the command itself, before anything is read or started.
 
 The last group is about the other way something gets into a session: `record`,
-which writes one local message without calling anybody. There are five kinds it
-may write, each with its own envelope, and the list is closed - the point of
-checking all five together with a made-up sixth is that no amount of asking gets
-a sixth kind written.
+which creates the immutable Format 2 header or writes one neutral note. The
+two-kind list is closed, arbitrary valid initiator labels need no registration,
+and legacy Format 1 structure is rejected rather than migrated.
 
 Everything below exercises the real thing. Real processes are started, real
 files are written, real locks are taken out in separate processes, real signals
@@ -200,7 +199,7 @@ PUBLISH_STOP_DRIVER = (
     "try:\n"
     "    session.publish(\n"
     "        target,\n"
-    "        '# Message 0001\\nRecord: user-correction\\nFrom: codex\\n',\n"
+    "        '# Message 0001\\nRecord: note\\nFrom: sample-app\\n',\n"
     "    )\n"
     "except peer.SignalStop:\n"
     "    sys.exit(3)\n"
@@ -246,9 +245,8 @@ class TurnBehavior(unittest.TestCase):
             self.session_dir,
             "session-create",
             "Prove the runner without spending a real harness call.\n",
-            local="codex",
+            initiator="sample-app",
             peer="claude",
-            workflow="planning",
         )
         self.holders = []
         self.drivers = []
@@ -290,10 +288,10 @@ class TurnBehavior(unittest.TestCase):
         """
         argv = (sys.executable, FAKE_PEER, mode) + tuple(extra)
 
-        def build(deadline):
+        def build(deadline, cwd):
             return PeerCommand(
                 argv=argv,
-                cwd=self.temp,
+                cwd=cwd,
                 env=tuple(os.environ.items()),
             )
 
@@ -306,10 +304,10 @@ class TurnBehavior(unittest.TestCase):
         whatever the runner bound to the prefix is exactly what comes back.
         """
 
-        def build(deadline):
+        def build(deadline, cwd):
             return PeerCommand(
                 argv=(sys.executable, FAKE_PEER, "last-argument"),
-                cwd=self.temp,
+                cwd=cwd,
                 env=tuple(os.environ.items()),
                 body_argument=prefix,
             )
@@ -325,10 +323,10 @@ class TurnBehavior(unittest.TestCase):
         everything else uses. This one stands in for a precheck that hangs.
         """
 
-        def build(deadline):
+        def build(deadline, cwd):
             peer.run_bounded(
                 argv=(sys.executable, FAKE_PEER, "hang", str(seconds)),
-                cwd=self.temp,
+                cwd=cwd,
                 env=tuple(os.environ.items()),
                 stdin_text="",
                 deadline=deadline,
@@ -340,11 +338,11 @@ class TurnBehavior(unittest.TestCase):
     def _late_builder(self):
         """A connector that finishes, but only after the deadline has passed."""
 
-        def build(deadline):
+        def build(deadline, cwd):
             time.sleep(max(0.0, deadline.remaining()) + 0.05)
             return PeerCommand(
                 argv=(sys.executable, FAKE_PEER, "plain"),
-                cwd=self.temp,
+                cwd=cwd,
                 env=tuple(os.environ.items()),
             )
 
@@ -436,10 +434,9 @@ class TurnBehavior(unittest.TestCase):
         body = kwargs.pop("body", "Please answer this.\n")
         return runner.run_turn(
             self.session_dir,
-            "claude",
             body,
-            self._builder(mode, *extra),
             timeout,
+            self._builder(mode, *extra),
         )
 
     def _expect(self, failure, mode, *extra, **kwargs):
@@ -451,37 +448,149 @@ class TurnBehavior(unittest.TestCase):
     # -- the ordinary case -------------------------------------------------
 
     def test_round_trip_publishes_request_and_response(self):
-        result = self._turn("plain", body="Consider the plan.\n")
+        result = self._turn("plain", body="Consider the question.\n")
 
         self.assertEqual(result.request_sequence, 1)
         self.assertEqual(result.response_sequence, 2)
         self.assertEqual(
             self._messages(),
-            ["0001-local-to-peer.md", "0002-peer-to-local.md"],
+            ["0001-initiator-to-peer.md", "0002-peer-to-initiator.md"],
         )
 
         with open(
             session.message_path(
-                self.session_dir, 1, session.LOCAL_TO_PEER_SUFFIX
+                self.session_dir, 1, session.INITIATOR_TO_PEER_SUFFIX
             ),
             encoding="utf-8",
         ) as stream:
             request = stream.read()
         self.assertEqual(
             request,
-            "# Message 0001\nFrom: codex\nTo: claude\n\n## Body\n\n"
-            "Consider the plan.\n",
+            "# Message 0001\nFrom: sample-app\nTo: claude\n\n## Body\n\n"
+            "Consider the question.\n",
         )
 
         with open(result.response_path, encoding="utf-8") as stream:
             response = stream.read()
         self.assertEqual(
             response,
-            "# Message 0002\nFrom: claude\nTo: codex\n\n## Body\n\n"
-            "Consider the plan.\n",
+            "# Message 0002\nFrom: claude\nTo: sample-app\n\n## Body\n\n"
+            "Consider the question.\n",
         )
-        self.assertNotIn("Review-", response)
         self.assertEqual(self._leftover_temporaries(), [])
+
+    def test_each_call_starts_fresh_and_sends_only_its_current_body(self):
+        first = self._turn("plain", body="First body with caf\u00e9.\n\n")
+        second = self._turn("plain", body="Second body only.\n")
+
+        with open(first.response_path, encoding="utf-8") as stream:
+            first_text = stream.read()
+        with open(second.response_path, encoding="utf-8") as stream:
+            second_text = stream.read()
+        self.assertIn("First body with caf\u00e9.\n\n", first_text)
+        self.assertNotIn("First body", second_text)
+        self.assertTrue(second_text.endswith("Second body only.\n"))
+        self.assertEqual(
+            self._messages(),
+            [
+                "0001-initiator-to-peer.md",
+                "0002-peer-to-initiator.md",
+                "0003-initiator-to-peer.md",
+                "0004-peer-to-initiator.md",
+            ],
+        )
+
+    def test_runner_uses_the_session_project_and_removes_a_neutral_directory(self):
+        project_session = os.path.join(self.temp, "project-session")
+        record.record(
+            project_session,
+            "session-create",
+            "Project-bound call.\n",
+            initiator="gear-3",
+            peer="zcode",
+            project=self.temp,
+        )
+        observed = []
+
+        def project_builder(deadline, cwd):
+            observed.append(cwd)
+            return PeerCommand(
+                argv=(sys.executable, FAKE_PEER, "plain"),
+                cwd=cwd,
+                env=tuple(os.environ.items()),
+            )
+
+        result = runner.run_turn(
+            project_session, "Use the recorded project.\n", 30.0, project_builder
+        )
+        self.assertEqual(observed, [self.temp])
+        with open(result.response_path, encoding="utf-8") as stream:
+            self.assertIn("From: zcode\nTo: gear-3\n", stream.read())
+
+        neutral = []
+
+        def neutral_builder(deadline, cwd):
+            neutral.append(cwd)
+            self.assertTrue(os.path.isdir(cwd))
+            self.assertEqual(os.listdir(cwd), [])
+            return PeerCommand(
+                argv=(sys.executable, FAKE_PEER, "plain"),
+                cwd=cwd,
+                env=tuple(os.environ.items()),
+            )
+
+        self._turn_with_builder(neutral_builder, "Neutral call.\n")
+        self.assertEqual(len(neutral), 1)
+        self.assertFalse(os.path.exists(neutral[0]))
+
+    def test_public_run_resolves_only_the_target_stored_in_the_session(self):
+        seen = []
+
+        class FakeConnector:
+            COURIER_ONLY = False
+
+            @staticmethod
+            def build_command(deadline, cwd):
+                return PeerCommand(
+                    argv=(sys.executable, FAKE_PEER, "plain"),
+                    cwd=cwd,
+                    env=tuple(os.environ.items()),
+                )
+
+        def resolve(peer_id):
+            seen.append(peer_id)
+            return FakeConnector
+
+        output = io.StringIO()
+        with mock.patch.object(runner.connectors, "resolve", resolve):
+            with mock.patch("sys.stdout", output):
+                with mock.patch("sys.stdin", io.StringIO("Public call.\n")):
+                    self.assertEqual(
+                        cli.main(["run", "--session", self.session_dir]), 0
+                    )
+        self.assertEqual(seen, ["claude"])
+        response_path = output.getvalue().strip()
+        self.assertTrue(response_path.endswith("0002-peer-to-initiator.md"))
+        with open(response_path, encoding="utf-8") as stream:
+            self.assertIn("From: claude\nTo: sample-app\n", stream.read())
+
+    def _turn_with_builder(self, build, body):
+        return runner.run_turn(self.session_dir, body, 30.0, build)
+
+    def test_invalid_body_and_timeout_fail_before_a_builder_or_publication(self):
+        called = []
+
+        def build(deadline, cwd):
+            called.append(cwd)
+            raise AssertionError("invalid input reached the connector")
+
+        for body, timeout in (("   \n", 30.0), ("Body.\n", 0), ("Body.\n", float("nan"))):
+            with self.subTest(body=body, timeout=timeout):
+                with self.assertRaises(BridgeError) as caught:
+                    runner.run_turn(self.session_dir, body, timeout, build)
+                self.assertEqual(caught.exception.failure, Failure.USAGE_ERROR)
+        self.assertEqual(called, [])
+        self.assertEqual(self._messages(), [])
 
     # -- atomic publication -------------------------------------------------
 
@@ -497,7 +606,7 @@ class TurnBehavior(unittest.TestCase):
                     "--session",
                     self.session_dir,
                     "--kind",
-                    "technical-error",
+                    "note",
                 ],
                 cwd=REPO_ROOT,
                 stdin=subprocess.PIPE,
@@ -533,14 +642,14 @@ class TurnBehavior(unittest.TestCase):
             with open(path, encoding="utf-8") as stream:
                 text = stream.read()
             self.assertTrue(text.startswith("# Message "))
-            self.assertIn("Record: technical-error\n", text)
+            self.assertIn("Record: note\n", text)
             self.assertIn("\n## Body\n\n", text)
             self.assertTrue(text.rstrip().endswith("."))
         self.assertEqual(self._leftover_temporaries(), [])
 
     def test_failure_during_publication_leaves_nothing_behind(self):
         target = session.message_path(
-            self.session_dir, 1, session.LOCAL_RECORD_SUFFIX
+            self.session_dir, 1, session.INITIATOR_RECORD_SUFFIX
         )
         with mock.patch("os.replace", side_effect=OSError("forced failure")):
             with self.assertRaises(BridgeError) as caught:
@@ -553,9 +662,9 @@ class TurnBehavior(unittest.TestCase):
     def test_a_rename_that_worked_is_never_reported_as_nothing_published(self):
         """The message is there, so the failure has to say the file is there."""
         target = session.message_path(
-            self.session_dir, 1, session.LOCAL_RECORD_SUFFIX
+            self.session_dir, 1, session.INITIATOR_RECORD_SUFFIX
         )
-        text = "# Message 0001\nRecord: user-correction\nFrom: codex\n"
+        text = "# Message 0001\nRecord: note\nFrom: sample-app\n"
         with mock.patch.object(
             session, "_fsync_directory", side_effect=OSError("forced failure")
         ):
@@ -582,9 +691,9 @@ class TurnBehavior(unittest.TestCase):
         stop is now passed on as itself, and the message stays where it is.
         """
         target = session.message_path(
-            self.session_dir, 1, session.LOCAL_RECORD_SUFFIX
+            self.session_dir, 1, session.INITIATOR_RECORD_SUFFIX
         )
-        text = "# Message 0001\nRecord: user-correction\nFrom: codex\n"
+        text = "# Message 0001\nRecord: note\nFrom: sample-app\n"
         real_replace = os.replace
 
         def replace_then_stop(source, destination):
@@ -605,9 +714,9 @@ class TurnBehavior(unittest.TestCase):
     def test_a_failure_after_the_rename_says_the_message_is_there(self):
         """Which side of the rename it happened on is decided by looking."""
         target = session.message_path(
-            self.session_dir, 1, session.LOCAL_RECORD_SUFFIX
+            self.session_dir, 1, session.INITIATOR_RECORD_SUFFIX
         )
-        text = "# Message 0001\nRecord: technical-error\nFrom: codex\n"
+        text = "# Message 0001\nRecord: note\nFrom: sample-app\n"
         real_replace = os.replace
 
         def replace_then_fail(source, destination):
@@ -640,7 +749,7 @@ class TurnBehavior(unittest.TestCase):
         """
         directory = session.messages_dir(self.session_dir)
         target = session.message_path(
-            self.session_dir, 1, session.LOCAL_RECORD_SUFFIX
+            self.session_dir, 1, session.INITIATOR_RECORD_SUFFIX
         )
         real_replace = os.replace
 
@@ -673,7 +782,7 @@ class TurnBehavior(unittest.TestCase):
         removes it, and the leftover assertions afterwards stay meaningful.
         """
         target = session.message_path(
-            self.session_dir, 1, session.LOCAL_RECORD_SUFFIX
+            self.session_dir, 1, session.INITIATOR_RECORD_SUFFIX
         )
         made = {}
         real_mkstemp = session.tempfile.mkstemp
@@ -732,9 +841,9 @@ class TurnBehavior(unittest.TestCase):
         to go and look.
         """
         target = session.message_path(
-            self.session_dir, 1, session.LOCAL_RECORD_SUFFIX
+            self.session_dir, 1, session.INITIATOR_RECORD_SUFFIX
         )
-        text = "# Message 0001\nRecord: technical-error\nFrom: codex\n"
+        text = "# Message 0001\nRecord: note\nFrom: sample-app\n"
         real_replace = os.replace
         real_stat = os.stat
 
@@ -772,7 +881,7 @@ class TurnBehavior(unittest.TestCase):
     def test_a_stop_before_the_rename_leaves_nothing_and_is_not_a_failure(self):
         """Stopped is stopped: nothing published, and nothing blamed on this."""
         target = session.message_path(
-            self.session_dir, 1, session.LOCAL_RECORD_SUFFIX
+            self.session_dir, 1, session.INITIATOR_RECORD_SUFFIX
         )
         with mock.patch(
             "os.replace", side_effect=peer.SignalStop(signal.SIGHUP)
@@ -803,7 +912,7 @@ class TurnBehavior(unittest.TestCase):
         which is what makes it discriminate rather than merely pass.
         """
         target = session.message_path(
-            self.session_dir, 1, session.LOCAL_RECORD_SUFFIX
+            self.session_dir, 1, session.INITIATOR_RECORD_SUFFIX
         )
         real_unlink = os.unlink
         removed = []
@@ -856,7 +965,7 @@ class TurnBehavior(unittest.TestCase):
         must be exactly as it was found.
         """
         target = session.message_path(
-            self.session_dir, 1, session.LOCAL_RECORD_SUFFIX
+            self.session_dir, 1, session.INITIATOR_RECORD_SUFFIX
         )
         marker = os.path.join(self.temp, "ready-to-be-stopped.txt")
         driver = self._start_driver(PUBLISH_STOP_DRIVER, target, marker)
@@ -900,7 +1009,7 @@ class TurnBehavior(unittest.TestCase):
         self.assertEqual(caught.exception.failure, Failure.BUSY_SESSION)
 
         with self.assertRaises(BridgeError) as caught:
-            record.record(self.session_dir, "user-correction", "Blocked.\n")
+            record.record(self.session_dir, "note", "Blocked.\n")
         self.assertEqual(caught.exception.failure, Failure.BUSY_SESSION)
 
         self.assertEqual(self._messages(), before)
@@ -927,7 +1036,7 @@ class TurnBehavior(unittest.TestCase):
         with session_lock(self.session_dir):
             pass
         path = record.record(
-            self.session_dir, "user-correction", "After the abrupt end.\n"
+            self.session_dir, "note", "After the abrupt end.\n"
         )
         self.assertTrue(os.path.exists(path))
         self.assertEqual(self._leftover_temporaries(), [])
@@ -936,21 +1045,21 @@ class TurnBehavior(unittest.TestCase):
 
     def test_timeout_publishes_no_response(self):
         self._expect(Failure.TIMEOUT, "hang", timeout=1.0)
-        self.assertEqual(self._messages(), ["0001-local-to-peer.md"])
+        self.assertEqual(self._messages(), ["0001-initiator-to-peer.md"])
         self.assertEqual(self._leftover_temporaries(), [])
 
     def test_nonzero_exit_publishes_no_response(self):
         error = self._expect(Failure.PEER_FAILURE, "fail")
         self.assertIn("deliberate failure", str(error))
-        self.assertEqual(self._messages(), ["0001-local-to-peer.md"])
+        self.assertEqual(self._messages(), ["0001-initiator-to-peer.md"])
 
     def test_no_output_at_all_publishes_no_response(self):
         self._expect(Failure.EMPTY_RESPONSE, "empty", body="Say nothing.\n")
-        self.assertEqual(self._messages(), ["0001-local-to-peer.md"])
+        self.assertEqual(self._messages(), ["0001-initiator-to-peer.md"])
 
     def test_whitespace_only_output_publishes_no_response(self):
         self._expect(Failure.EMPTY_RESPONSE, "whitespace", body="Say air.\n")
-        self.assertEqual(self._messages(), ["0001-local-to-peer.md"])
+        self.assertEqual(self._messages(), ["0001-initiator-to-peer.md"])
 
     # -- the body on the command line, where a harness has no other way ----
 
@@ -962,13 +1071,13 @@ class TurnBehavior(unittest.TestCase):
             "--disallowed-tools=Edit is text\n---\n\nAnswer this.\n"
         )
         result = runner.run_turn(
-            self.session_dir, "claude", body, self._argument_builder("--prompt="), 30.0
+            self.session_dir, body, 30.0, self._argument_builder("--prompt=")
         )
         with open(result.response_path, encoding="utf-8") as stream:
             response = stream.read()
         self.assertEqual(
             response,
-            "# Message 0002\nFrom: claude\nTo: codex\n\n## Body\n\n"
+            "# Message 0002\nFrom: claude\nTo: sample-app\n\n## Body\n\n"
             "--prompt=" + body,
         )
         self.assertNotIn("STDIN WAS NOT EMPTY", response)
@@ -985,10 +1094,9 @@ class TurnBehavior(unittest.TestCase):
                 with self.assertRaises(BridgeError) as caught:
                     runner.run_turn(
                         self.session_dir,
-                        "claude",
                         body,
-                        self._argument_builder("--prompt="),
                         30.0,
+                        self._argument_builder("--prompt="),
                     )
                 self.assertEqual(caught.exception.failure, Failure.USAGE_ERROR)
                 self.assertEqual(self._messages(), [])
@@ -996,10 +1104,9 @@ class TurnBehavior(unittest.TestCase):
         # And exactly at the limit the body is carried, not refused.
         result = runner.run_turn(
             self.session_dir,
-            "claude",
             "y" * COMMAND_LINE_BODY_LIMIT,
-            self._argument_builder(""),
             30.0,
+            self._argument_builder(""),
         )
         self.assertEqual(result.response_sequence, 2)
 
@@ -1021,10 +1128,9 @@ class TurnBehavior(unittest.TestCase):
                 with self.assertRaises(BridgeError) as caught:
                     runner.run_turn(
                         self.session_dir,
-                        "claude",
                         "Please answer this.\n",
-                        build,
                         2.0,
+                        build,
                     )
                 self.assertEqual(caught.exception.failure, Failure.TIMEOUT)
                 self.assertEqual(self._messages(), [])
@@ -1195,21 +1301,8 @@ class TurnBehavior(unittest.TestCase):
         )
 
 
-class LocalRecordKinds(unittest.TestCase):
-    """The five things `record` may write into a session, and the sixth it may not.
-
-    `record` is how the part of Agent Bridge that lives inside a harness puts
-    something into the session without calling anybody: the session itself, a
-    correction from the user, an approved plan, a technical failure, and where
-    implementation started. Each kind writes a particular envelope, and each one
-    is checked here against the exact text it must produce, because the envelope
-    is what a later reader - a person, or a fresh task picking the work up - has
-    to be able to trust.
-
-    The sixth is the point of doing all five together. The list of kinds is
-    closed, and a name that is not on it is refused outright rather than being
-    written under some near-enough heading.
-    """
+class FormatTwoRecords(unittest.TestCase):
+    """The immutable session, neutral note, strict reader, and closed kinds."""
 
     def setUp(self):
         self.temp = tempfile.mkdtemp(prefix="agent-bridge-records-")
@@ -1218,14 +1311,13 @@ class LocalRecordKinds(unittest.TestCase):
     def tearDown(self):
         shutil.rmtree(self.temp, ignore_errors=True)
 
-    def _create(self, project=None):
+    def _create(self, project=None, initiator="my-app", peer_id="claude"):
         return record.record(
             self.session_dir,
             "session-create",
-            "Work out what to build, then build it.\n",
-            local="codex",
-            peer="claude",
-            workflow="programming-loop",
+            "A bounded courier conversation.\n",
+            initiator=initiator,
+            peer=peer_id,
             project=project,
         )
 
@@ -1236,7 +1328,7 @@ class LocalRecordKinds(unittest.TestCase):
     def _numbered(self, sequence):
         return self._read(
             session.message_path(
-                self.session_dir, sequence, session.LOCAL_RECORD_SUFFIX
+                self.session_dir, sequence, session.INITIATOR_RECORD_SUFFIX
             )
         )
 
@@ -1250,11 +1342,9 @@ class LocalRecordKinds(unittest.TestCase):
         self.assertEqual(path, session.session_file(self.session_dir))
         self.assertEqual(
             self._read(path),
-            "# Session\n\nBridge-Format: 1\nLocal: codex\nPeer: claude\n"
-            "Workflow: programming-loop\nProject: {0}\n\n## Body\n\n"
-            "Work out what to build, then build it.\n".format(
-                os.path.abspath(self.temp)
-            ),
+            "# Session\n\nBridge-Format: 2\nInitiator: my-app\nPeer: claude\n"
+            "Project: {0}\n\n## Body\n\n"
+            "A bounded courier conversation.\n".format(self.temp),
         )
         self.assertEqual(self._message_names(), [])
 
@@ -1262,117 +1352,203 @@ class LocalRecordKinds(unittest.TestCase):
             self._create()
         self.assertEqual(caught.exception.failure, Failure.SESSION_EXISTS)
 
-    def test_a_user_correction_is_one_numbered_local_record(self):
-        self._create()
-        path = record.record(
-            self.session_dir, "user-correction", "Use the other approach.\n"
+    def test_public_record_commands_create_the_session_and_one_note(self):
+        public_session = os.path.join(self.temp, "public-session")
+        output = io.StringIO()
+        with mock.patch("sys.stdout", output):
+            with mock.patch("sys.stdin", io.StringIO("Session body.\n")):
+                self.assertEqual(
+                    cli.main(
+                        [
+                            "record",
+                            "--session",
+                            public_session,
+                            "--kind",
+                            "session-create",
+                            "--initiator",
+                            "ordinary.app",
+                            "--peer",
+                            "codex",
+                        ]
+                    ),
+                    0,
+                )
+            with mock.patch("sys.stdin", io.StringIO("Neutral note.\n")):
+                self.assertEqual(
+                    cli.main(
+                        [
+                            "record",
+                            "--session",
+                            public_session,
+                            "--kind",
+                            "note",
+                        ]
+                    ),
+                    0,
+                )
+        written = output.getvalue().splitlines()
+        self.assertEqual(written[0], session.session_file(public_session))
+        self.assertEqual(
+            os.path.basename(written[1]), "0001-initiator-record.md"
         )
 
-        self.assertEqual(os.path.basename(path), "0001-local-record.md")
+    def test_a_note_is_one_numbered_initiator_record_with_an_inert_body(self):
+        self._create()
+        body = "From: forged\nPeer: codex\nProject: /tmp\n\nStill body text.\n"
+        path = record.record(
+            self.session_dir, "note", body
+        )
+
+        self.assertEqual(os.path.basename(path), "0001-initiator-record.md")
         self.assertEqual(
             self._read(path),
-            "# Message 0001\nRecord: user-correction\nFrom: codex\n\n"
-            "## Body\n\nUse the other approach.\n",
+            "# Message 0001\nRecord: note\nFrom: my-app\n\n"
+            "## Body\n\n" + body,
         )
+        parsed = session.read_session(self.session_dir)
+        self.assertEqual(parsed.initiator, "my-app")
+        self.assertEqual(parsed.peer, "claude")
+        self.assertIsNone(parsed.project)
 
-    def test_a_technical_error_is_one_numbered_local_record(self):
+    def test_record_bodies_preserve_the_callers_final_newline_choice(self):
         self._create()
-        path = record.record(
-            self.session_dir, "technical-error", "The peer never answered.\n"
-        )
-
-        self.assertEqual(os.path.basename(path), "0001-local-record.md")
+        path = record.record(self.session_dir, "note", "No final newline")
         self.assertEqual(
             self._read(path),
-            "# Message 0001\nRecord: technical-error\nFrom: codex\n\n"
-            "## Body\n\nThe peer never answered.\n",
+            "# Message 0001\nRecord: note\nFrom: my-app\n\n"
+            "## Body\n\nNo final newline",
         )
 
-    def test_implementation_start_carries_the_repository_and_the_baseline(self):
-        """Written down as given, and conditioning nothing that follows."""
-        self._create()
-        path = record.record(
-            self.session_dir,
-            "implementation-start",
-            "The first milestone begins.\n",
-            project=self.temp,
-            baseline="e5f69d273ac5a4f34bf7a068963c6f36f592f0a9",
-        )
-
-        self.assertEqual(
-            self._read(path),
-            "# Message 0001\nRecord: implementation-start\nFrom: codex\n"
-            "Repository-Path: {0}\n"
-            "Baseline: e5f69d273ac5a4f34bf7a068963c6f36f592f0a9\n\n"
-            "## Body\n\nThe first milestone begins.\n".format(
-                os.path.abspath(self.temp)
-            ),
-        )
-
-    def test_plan_approval_seals_the_plan_and_replacing_it_must_be_asked_for(
-        self,
-    ):
-        """An approved plan is not overwritten by accident, or lost on purpose.
-
-        Sealing writes the numbered record first and `PLAN.md` second, so the
-        approved text is in the ordered account of the session either way. A
-        second approval over a sealed plan is refused unless the command says
-        `--replace`, and when it does, the plan it replaced stays readable in
-        the message it was written into.
-        """
-        self._create()
-        first = record.record(
-            self.session_dir, "plan-approval", "The approved plan.\n"
-        )
-
-        self.assertEqual(first, session.plan_file(self.session_dir))
-        self.assertEqual(self._read(first), "The approved plan.\n")
-        self.assertEqual(
-            self._numbered(1),
-            "# Message 0001\nRecord: plan-approval\nFrom: codex\n"
-            "Plan: SEALED\n\n## Body\n\nThe approved plan.\n",
-        )
-
-        with self.assertRaises(BridgeError) as caught:
-            record.record(
-                self.session_dir, "plan-approval", "A different plan.\n"
-            )
-        self.assertEqual(caught.exception.failure, Failure.PLAN_SEALED)
-        self.assertEqual(self._read(first), "The approved plan.\n")
-        self.assertEqual(self._message_names(), ["0001-local-record.md"])
-
-        second = record.record(
-            self.session_dir,
-            "plan-approval",
-            "A different plan.\n",
-            replace=True,
-        )
-
-        self.assertEqual(self._read(second), "A different plan.\n")
-        self.assertEqual(
-            self._numbered(2),
-            "# Message 0002\nRecord: plan-approval\nFrom: codex\n"
-            "Plan: REPLACED\n\n## Body\n\nA different plan.\n",
-        )
-        self.assertIn("The approved plan.", self._numbered(1))
-
-    def test_a_sixth_kind_is_refused_and_writes_nothing(self):
-        """The list of kinds is closed, so a plausible name is still not one."""
+    def test_unknown_kind_is_refused_and_writes_nothing(self):
         self._create()
 
         with self.assertRaises(BridgeError) as caught:
             record.record(
                 self.session_dir,
-                "implementation-finish",
+                "legacy-kind",
                 "Anything at all.\n",
             )
 
         self.assertEqual(
             caught.exception.failure, Failure.UNKNOWN_RECORD_KIND
         )
-        self.assertIn("implementation-finish", str(caught.exception))
+        self.assertIn("legacy-kind", str(caught.exception))
         self.assertEqual(self._message_names(), [])
-        self.assertFalse(os.path.exists(session.plan_file(self.session_dir)))
+
+    def test_unknown_target_is_refused_before_a_session_is_published(self):
+        with self.assertRaises(BridgeError) as caught:
+            self._create(peer_id="other")
+        self.assertEqual(caught.exception.failure, Failure.UNKNOWN_HARNESS)
+        self.assertFalse(os.path.exists(session.session_file(self.session_dir)))
+
+    def test_valid_unregistered_labels_work_and_invalid_labels_publish_nothing(self):
+        labels = ("ora", "gear-3", "vibe_coder.2", "codex")
+        for index, label in enumerate(labels):
+            with self.subTest(label=label):
+                self.session_dir = os.path.join(self.temp, "session-{0}".format(index))
+                self._create(initiator=label)
+                self.assertEqual(session.read_session(self.session_dir).initiator, label)
+        for index, label in enumerate(("", "-bad", "bad label", "caf\u00e9", "bad/label")):
+            with self.subTest(label=label):
+                self.session_dir = os.path.join(self.temp, "invalid-{0}".format(index))
+                with self.assertRaises(BridgeError) as caught:
+                    self._create(initiator=label)
+                self.assertEqual(caught.exception.failure, Failure.USAGE_ERROR)
+                self.assertFalse(os.path.exists(session.session_file(self.session_dir)))
+
+    def test_project_must_be_absolute_and_exist_when_the_session_is_created(self):
+        spaced = os.path.join(self.temp, "spaced ")
+        lined = os.path.join(self.temp, "line\nbreak")
+        os.makedirs(spaced)
+        os.makedirs(lined)
+        for index, project in enumerate((
+            "relative",
+            os.path.join(self.temp, "missing"),
+            spaced,
+            lined,
+        )):
+            with self.subTest(project=project):
+                self.session_dir = os.path.join(self.temp, "project-{0}".format(index))
+                with self.assertRaises(BridgeError) as caught:
+                    self._create(project=project)
+                self.assertEqual(caught.exception.failure, Failure.USAGE_ERROR)
+                self.assertFalse(os.path.exists(session.session_file(self.session_dir)))
+
+    def test_strict_reader_rejects_legacy_duplicate_unknown_and_malformed_sessions(self):
+        variants = {
+            "legacy": (
+                "# Session\n\nBridge-Format: 1\nLocal: codex\nPeer: claude\n"
+                "Workflow: planning\n\n## Body\n\nOld shape.\n"
+            ),
+            "duplicate": (
+                "# Session\n\nBridge-Format: 2\nInitiator: app\nInitiator: other\n"
+                "Peer: claude\n\n## Body\n\nDuplicate.\n"
+            ),
+            "unknown": (
+                "# Session\n\nBridge-Format: 2\nInitiator: app\nPeer: claude\n"
+                "Status: ready\n\n## Body\n\nUnknown.\n"
+            ),
+            "bad target": (
+                "# Session\n\nBridge-Format: 2\nInitiator: app\nPeer: other\n\n"
+                "## Body\n\nBad target.\n"
+            ),
+            "bad project": (
+                "# Session\n\nBridge-Format: 2\nInitiator: app\nPeer: claude\n"
+                "Project: relative\n\n## Body\n\nBad project.\n"
+            ),
+            "empty body": (
+                "# Session\n\nBridge-Format: 2\nInitiator: app\nPeer: claude\n\n"
+                "## Body\n\n   \n"
+            ),
+        }
+        for index, (name, text) in enumerate(variants.items()):
+            with self.subTest(case=name):
+                self.session_dir = os.path.join(self.temp, "invalid-read-{0}".format(index))
+                os.makedirs(session.messages_dir(self.session_dir))
+                with open(session.session_file(self.session_dir), "w", encoding="utf-8") as stream:
+                    stream.write(text)
+                with self.assertRaises(BridgeError) as caught:
+                    session.read_session(self.session_dir)
+                self.assertEqual(caught.exception.failure, Failure.SESSION_INVALID)
+
+    def test_invalid_utf8_session_is_reported_as_session_invalid_by_the_cli(self):
+        os.makedirs(session.messages_dir(self.session_dir))
+        with open(session.session_file(self.session_dir), "wb") as stream:
+            stream.write(b"# Session\n\nBridge-Format: 2\nInitiator: app\xff\n")
+
+        with self.assertRaises(BridgeError) as caught:
+            session.read_session(self.session_dir)
+        self.assertEqual(caught.exception.failure, Failure.SESSION_INVALID)
+
+        captured = io.StringIO()
+        with mock.patch("sys.stderr", captured):
+            with mock.patch("sys.stdin", io.StringIO("Neutral note.\n")):
+                status = cli.main(
+                    [
+                        "record",
+                        "--session",
+                        self.session_dir,
+                        "--kind",
+                        "note",
+                    ]
+                )
+
+        self.assertEqual(status, 1)
+        self.assertIn(
+            "record could not be read as a valid session", captured.getvalue()
+        )
+        self.assertIn("Next action:", captured.getvalue())
+        self.assertNotIn("Traceback", captured.getvalue())
+        self.assertEqual(self._message_names(), [])
+
+    def test_note_refuses_session_creation_arguments(self):
+        self._create()
+        for kwargs in ({"initiator": "other"}, {"peer": "codex"}, {"project": self.temp}):
+            with self.subTest(arguments=kwargs):
+                with self.assertRaises(BridgeError) as caught:
+                    record.record(self.session_dir, "note", "Neutral.\n", **kwargs)
+                self.assertEqual(caught.exception.failure, Failure.USAGE_ERROR)
+        self.assertEqual(self._message_names(), [])
 
 
 class CommandLineBody(unittest.TestCase):
@@ -1395,9 +1571,8 @@ class CommandLineBody(unittest.TestCase):
             self.session_dir,
             "session-create",
             "Prove the command-line transport without a real harness.\n",
-            local="codex",
+            initiator="sample-app",
             peer="hermes",
-            workflow="planning",
         )
 
     def tearDown(self):
@@ -1416,10 +1591,10 @@ class CommandLineBody(unittest.TestCase):
         """
         argv = (sys.executable, FAKE_PEER, "last-argument") + vector_tail
 
-        def build(deadline):
+        def build(deadline, cwd):
             return PeerCommand(
                 argv=argv,
-                cwd=self.temp,
+                cwd=cwd,
                 env=tuple(os.environ.items()),
                 body_argument=prefix,
             )
@@ -1438,16 +1613,15 @@ class CommandLineBody(unittest.TestCase):
             with self.subTest(transport=name):
                 result = runner.run_turn(
                     self.session_dir,
-                    "hermes",
                     body,
-                    self._builder(prefix, *tail),
                     30.0,
+                    self._builder(prefix, *tail),
                 )
                 with open(result.response_path, encoding="utf-8") as stream:
                     response = stream.read()
                 self.assertEqual(
                     response,
-                    "# Message {0:04d}\nFrom: hermes\nTo: codex\n\n## Body\n\n"
+                    "# Message {0:04d}\nFrom: hermes\nTo: sample-app\n\n## Body\n\n"
                     "{1}".format(result.response_sequence, prefix + body),
                 )
                 self.assertNotIn("STANDARD INPUT WAS NOT EMPTY", response)
@@ -1473,10 +1647,9 @@ class CommandLineBody(unittest.TestCase):
                 with self.assertRaises(BridgeError) as caught:
                     runner.run_turn(
                         self.session_dir,
-                        "hermes",
                         body,
-                        self._builder("", "--"),
                         30.0,
+                        self._builder("", "--"),
                     )
                 self.assertEqual(caught.exception.failure, Failure.USAGE_ERROR)
                 self.assertIn(expected, str(caught.exception))
@@ -1485,24 +1658,64 @@ class CommandLineBody(unittest.TestCase):
     def test_a_courier_only_peer_is_refused_a_project_before_anything_starts(
         self,
     ):
-        """Refused by the command line, with nothing read and nothing sent."""
+        """The immutable session is refused before a connector process starts."""
+        project_session = os.path.join(self.temp, "project-session")
+        record.record(
+            project_session,
+            "session-create",
+            "This target cannot receive a project.\n",
+            initiator="sample-app",
+            peer="hermes",
+            project=self.temp,
+        )
         captured = io.StringIO()
         with mock.patch("sys.stderr", captured):
             with mock.patch("sys.stdin", io.StringIO("A question.\n")):
                 status = cli.main(
                     [
                         "run",
-                        "--peer",
-                        "hermes",
                         "--session",
-                        self.session_dir,
-                        "--project",
-                        self.temp,
+                        project_session,
                     ]
                 )
         self.assertEqual(status, 1)
-        self.assertIn("--project is not accepted for hermes", captured.getvalue())
+        self.assertIn("project for hermes", captured.getvalue())
         self.assertIn("Next action:", captured.getvalue())
+        self.assertEqual(
+            sorted(os.listdir(session.messages_dir(project_session))), []
+        )
+
+    def test_command_surface_rejects_removed_run_and_record_arguments(self):
+        removed = (
+            ["run", "--session", self.session_dir, "--peer", "hermes"],
+            ["run", "--session", self.session_dir, "--project", self.temp],
+            ["run", "--session", self.session_dir, "--review-base", "a"],
+            [
+                "record",
+                "--session",
+                self.session_dir,
+                "--kind",
+                "note",
+                "--local",
+                "old",
+            ],
+            [
+                "record",
+                "--session",
+                self.session_dir,
+                "--kind",
+                "note",
+                "--workflow",
+                "old",
+            ],
+        )
+        for argv in removed:
+            with self.subTest(argv=argv):
+                captured = io.StringIO()
+                with mock.patch("sys.stderr", captured):
+                    with mock.patch("sys.stdin", io.StringIO("Body.\n")):
+                        self.assertEqual(cli.main(argv), 1)
+                self.assertIn("unrecognized arguments", captured.getvalue())
         self.assertEqual(self._messages(), [])
 
 

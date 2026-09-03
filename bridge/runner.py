@@ -1,64 +1,23 @@
-"""One bounded turn: send one message, get one answer, publish or fail.
+"""One bounded courier call derived entirely from an immutable session.
 
-This is the whole of what Agent Bridge does at run time. It publishes the
-outgoing text as the next message, starts the peer once, waits for one answer
-inside one deadline, and either publishes that answer or reports exactly what
-went wrong. There is no retry, no queue, no second attempt with a longer wait,
-and nothing that carries on after the function returns.
-
-What gets written down when something goes wrong is the part worth being exact
-about.
-
-Where the call itself did not finish cleanly - the peer exited badly, said
-nothing, or ran past the deadline - nothing at all is published. Whatever text
-was captured may be a fragment of an answer the peer never finished writing, and
-a fragment must not be mistaken for the peer's reply.
-
-Where a request was published at all, it stays put in every failing case,
-because it truthfully records what was sent. The failure itself is written down
-by the workflow afterwards, with `record --kind technical-error`.
-
-The peer command is built here rather than handed in ready-made. Composing the
-fixed argument vector for a harness is a connector's work, but a connector has
-inexpensive prechecks of its own to run first - a version, a sign-in, a
-restriction probe - and those are programs. They belong inside this turn's
-single deadline rather than before it started: there is no second way to start a
-program and no separate budget for one. So this function takes a builder and
-calls it with that deadline, and reads the deadline on both sides of the call,
-because a builder can use the whole of it up.
-
-Running that vector once, safely, inside the deadline is still this function's
-work. Keeping those apart is why the runner never imports a connector.
-
-How the body reaches the program is the connector's declaration and the
-runner's act. Standard input is the transport wherever the program has one, and
-the body is written there. For a program that has none, the connector sets
-`body_argument` on the command it composes, and this module binds the body to
-that prefix as exactly one final argument - never split, never through a shell
-- and sends nothing on standard input. Three refusals stand in front of that,
-all before a request is published or a program started: a body larger than the
-fixed limit; a body containing a NUL byte, which no argument can carry; and an
-argument list that together with the inherited environment would not fit what
-the operating system allows a new process, measured the way the kernel measures
-it and with explicit headroom kept back for what it counts and this code cannot
-see. Nothing is truncated, split or written to a file to get round any of them;
-the person is told to send a shorter message. Because every refusal comes first,
-nothing on the disk ever says a message was sent when none was.
-
-`--review-base` and `--review-head` name the two commits a review request refers
-to. When both are given they are copied onto the published answer, together with
-the number of the request it answers, so that whoever reads the session
-afterwards can see what the peer was asked about. That is all they are:
-provenance, written down once and conditioning nothing.
+The runner validates the body and connector transport before publishing the
+request. It then starts one fresh target process, publishes one final textual
+answer, and exits. A failed target leaves the truthful request and no invented
+response. There is no retry or implicit history.
 
 SPDX-License-Identifier: Unlicense
 """
 
 from __future__ import annotations
 
-from typing import Callable, NamedTuple, Optional, Tuple
+import contextlib
+import math
+import os
+import shutil
+import tempfile
+from typing import Callable, Iterator, NamedTuple, Optional, Tuple
 
-from . import session as session_module
+from . import connectors, session as session_module
 from .connectors import (
     COMMAND_LINE_BODY_LIMIT,
     PeerCommand,
@@ -69,19 +28,63 @@ from .errors import BridgeError, Failure
 from .locking import session_lock
 from .peer import Deadline, run_bounded
 
+NEUTRAL_PREFIX = "agent-bridge-neutral-"
+
+# Tests may replace the production connector builder only by calling this
+# function directly. No command-line, environment, file, or configuration path
+# exposes this seam.
+CommandBuilder = Callable[[Deadline, str], PeerCommand]
+
+
+def _remove_neutral(path: str, during: Optional[BaseException]) -> None:
+    try:
+        shutil.rmtree(path)
+    except OSError as failed:
+        if during is not None:
+            raise BridgeError(
+                Failure.CLEANUP_FAILURE,
+                detail="the neutral working directory {0} could not be removed "
+                "after the command failed ({1}): {2}".format(
+                    path, during, failed
+                ),
+            )
+        raise BridgeError(
+            Failure.CLEANUP_FAILURE,
+            detail="the neutral working directory {0} could not be removed: "
+            "{1}".format(path, failed),
+        )
+
+
+@contextlib.contextmanager
+def _target_directory(project: Optional[str]) -> Iterator[str]:
+    """Yield the immutable project, or a task-owned neutral empty directory."""
+    if project is not None:
+        if not os.path.isdir(project):
+            raise BridgeError(
+                Failure.SESSION_INVALID,
+                detail="the recorded project is not a directory: {0}".format(project),
+            )
+        yield project
+        return
+    try:
+        neutral = tempfile.mkdtemp(prefix=NEUTRAL_PREFIX)
+    except OSError as exc:
+        raise BridgeError(
+            Failure.USAGE_ERROR,
+            detail="no neutral working directory could be made: {0}".format(exc),
+        )
+    try:
+        yield neutral
+    except BaseException as exc:
+        _remove_neutral(neutral, exc)
+        raise
+    _remove_neutral(neutral, None)
+
 
 def apply_transport(
     command: PeerCommand, body: str
 ) -> Tuple[Tuple[str, ...], str]:
-    """Where the body goes: the argument vector to run and the standard input.
-
-    For a command without `body_argument` this changes nothing: the vector is
-    the connector's and the body is the standard input. For one with it, the
-    body is bound to the prefix as one final argument and standard input is
-    left empty - after the three refusals below, each of which names what was
-    wrong and what to do, and each of which happens before anything is started
-    or published.
-    """
+    """Bind the body to standard input or one qualified final argument."""
     if command.body_argument is None:
         return command.argv, body
     if "\x00" in body:
@@ -116,8 +119,6 @@ def apply_transport(
 
 
 class TurnResult(NamedTuple):
-    """What one completed turn produced: the two messages it left behind."""
-
     request_sequence: int
     response_sequence: int
     response_path: str
@@ -125,103 +126,92 @@ class TurnResult(NamedTuple):
 
 def run_turn(
     session_dir: str,
-    peer_id: str,
     body: str,
-    build_command: Callable[[Deadline], PeerCommand],
     timeout_seconds: float,
-    review_base: Optional[str] = None,
-    review_head: Optional[str] = None,
+    build_command: Optional[CommandBuilder] = None,
 ) -> TurnResult:
-    """Perform one bounded turn against a peer harness.
-
-    `build_command` is the connector. It is called once, inside the deadline,
-    with this turn's deadline, and returns the fixed argument vector to run.
-    Anything it starts to answer that call must go through the shared bounded
-    process runner with that same deadline.
-
-    Supplying `review_base` and `review_head` makes this a review request. The
-    only difference that makes is to the answer, which then carries the number
-    of the request it answers and the two commit names the request referred to.
-    Nothing about how the turn runs changes, and nothing is conditioned on them.
-
-    One turn happens in this order, holding the session lock: compose the
-    command, with the deadline read either side; publish the request; run the
-    peer; and publish the answer. Every failure raises. A failure before the
-    request is published leaves no request behind, because nothing was sent, and
-    no failure here publishes an answer.
-    """
-    deadline = Deadline(timeout_seconds)
-    review = review_base is not None and review_head is not None
-
-    record = session_module.read_session(session_dir)
-    if peer_id != record.peer:
+    """Publish one request and one response for the session's fixed target."""
+    try:
+        timeout = float(timeout_seconds)
+    except (TypeError, ValueError):
+        raise BridgeError(Failure.USAGE_ERROR, detail="--timeout must be a number")
+    if not math.isfinite(timeout) or timeout <= 0.0:
+        raise BridgeError(
+            Failure.USAGE_ERROR, detail="--timeout must be greater than zero"
+        )
+    if not body or not body.strip():
         raise BridgeError(
             Failure.USAGE_ERROR,
-            detail="this session's peer is {0}, not {1}".format(
-                record.peer, peer_id
-            ),
+            detail="there was no message to send on standard input",
+        )
+
+    deadline = Deadline(timeout)
+    record = session_module.read_session(session_dir)
+    connector = connectors.resolve(record.peer)
+    if record.project is not None and getattr(connector, "COURIER_ONLY", False):
+        raise BridgeError(
+            Failure.USAGE_ERROR,
+            detail="the session records a project for {0}, which is courier-only; "
+            "include the needed evidence in the body or choose a project-capable "
+            "target".format(record.peer),
         )
 
     with session_lock(session_dir):
-        # The connector composes the argument vector now, and runs its own
-        # prechecks while it is about it. That is why the deadline is read on
-        # both sides of the call: a builder that used the whole of it up must
-        # not then be allowed to start a peer.
-        deadline.check("composing the peer command")
-        command = build_command(deadline)
-        deadline.check("composing the peer command")
-        argv, stdin_text = apply_transport(command, body)
+        with _target_directory(record.project) as cwd:
+            deadline.check("composing the peer command")
+            if build_command is None:
+                command = connector.build_command(deadline, cwd)
+            else:
+                command = build_command(deadline, cwd)
+            deadline.check("composing the peer command")
+            if os.path.abspath(command.cwd) != os.path.abspath(cwd):
+                raise BridgeError(
+                    Failure.SESSION_INVALID,
+                    detail="the connector did not use the session-derived directory",
+                )
+            argv, stdin_text = apply_transport(command, body)
 
-        # The request is published once there is a command to run and the peer
-        # is about to be started. Until then nothing would have been sent, and a
-        # request message on the disk would be saying otherwise.
-        request_sequence = session_module.next_sequence(session_dir)
-        session_module.publish(
-            session_module.message_path(
-                session_dir,
-                request_sequence,
-                session_module.LOCAL_TO_PEER_SUFFIX,
-            ),
-            session_module.local_to_peer_text(
-                request_sequence, record.local, record.peer, body
-            ),
-        )
-
-        call = run_bounded(
-            argv=argv,
-            cwd=command.cwd,
-            env=command.env,
-            stdin_text=stdin_text,
-            deadline=deadline,
-        )
-        if call.returncode != 0:
-            raise BridgeError(
-                Failure.PEER_FAILURE,
-                detail="exit {0}: {1}".format(
-                    call.returncode, call.stderr.strip()
+            request_sequence = session_module.next_sequence(session_dir)
+            session_module.publish(
+                session_module.message_path(
+                    session_dir,
+                    request_sequence,
+                    session_module.INITIATOR_TO_PEER_SUFFIX,
+                ),
+                session_module.initiator_to_peer_text(
+                    request_sequence, record.initiator, record.peer, body
                 ),
             )
-        response = call.stdout
-        if not response.strip():
-            raise BridgeError(Failure.EMPTY_RESPONSE, detail=command.argv[0])
 
-        response_sequence = session_module.next_sequence(session_dir)
-        response_path = session_module.publish(
-            session_module.message_path(
-                session_dir,
-                response_sequence,
-                session_module.PEER_TO_LOCAL_SUFFIX,
-            ),
-            session_module.peer_to_local_text(
-                response_sequence,
-                record.peer,
-                record.local,
-                response,
-                review_request=request_sequence if review else None,
-                review_base=review_base if review else None,
-                review_head=review_head if review else None,
-            ),
-        )
+            call = run_bounded(
+                argv=argv,
+                cwd=command.cwd,
+                env=command.env,
+                stdin_text=stdin_text,
+                deadline=deadline,
+            )
+            if call.returncode != 0:
+                raise BridgeError(
+                    Failure.PEER_FAILURE,
+                    detail="exit {0}: {1}".format(
+                        call.returncode, call.stderr.strip()
+                    ),
+                )
+            response = call.stdout
+            if not response.strip():
+                raise BridgeError(Failure.EMPTY_RESPONSE, detail=command.argv[0])
+
+            response_sequence = session_module.next_sequence(session_dir)
+            response_path = session_module.publish(
+                session_module.message_path(
+                    session_dir,
+                    response_sequence,
+                    session_module.PEER_TO_INITIATOR_SUFFIX,
+                ),
+                session_module.peer_to_initiator_text(
+                    response_sequence, record.peer, record.initiator, response
+                ),
+            )
 
     return TurnResult(
         request_sequence=request_sequence,

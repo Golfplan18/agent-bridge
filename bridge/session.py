@@ -88,38 +88,34 @@ from .peer import SignalStop, stopped_by_signal
 
 SESSION_FILENAME = "SESSION.md"
 MESSAGES_DIRNAME = "messages"
-PLAN_FILENAME = "PLAN.md"
 
 #: Every temporary file this module creates while publishing carries this
 #: prefix, so a check can assert that none of them survived a failure.
 TEMP_PREFIX = ".agent-bridge-publish-"
 
 #: The three canonical message filename shapes.
-LOCAL_TO_PEER_SUFFIX = "-local-to-peer.md"
-PEER_TO_LOCAL_SUFFIX = "-peer-to-local.md"
-LOCAL_RECORD_SUFFIX = "-local-record.md"
-
-#: The workflows a session may declare.
-WORKFLOWS: Tuple[str, ...] = ("planning", "programming-loop", "external-review")
+INITIATOR_TO_PEER_SUFFIX = "-initiator-to-peer.md"
+PEER_TO_INITIATOR_SUFFIX = "-peer-to-initiator.md"
+INITIATOR_RECORD_SUFFIX = "-initiator-record.md"
 
 BODY_HEADING = "## Body"
 
 _SEQUENCE_PATTERN = re.compile(r"^(\d{4,})-")
+_INITIATOR_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*\Z", re.ASCII)
 
 
 class SessionRecord(NamedTuple):
     """What `SESSION.md` said, read fresh from disk.
 
     Written once when the session is created and never changed afterwards, so
-    nothing in here can go stale: the two harnesses taking part, which workflow
-    they are running, and the project when there is one.
+    nothing in here can go stale: the calling application's inert label, the
+    target it selected, and the project when there is one.
     """
 
     directory: str
     bridge_format: str
-    local: str
+    initiator: str
     peer: str
-    workflow: str
     project: Optional[str]
 
 
@@ -132,10 +128,6 @@ def session_file(session_dir: str) -> str:
 
 def messages_dir(session_dir: str) -> str:
     return os.path.join(session_dir, MESSAGES_DIRNAME)
-
-
-def plan_file(session_dir: str) -> str:
-    return os.path.join(session_dir, PLAN_FILENAME)
 
 
 def format_sequence(sequence: int) -> str:
@@ -172,9 +164,9 @@ def _rename_outcome(
     that same identity is the rename having happened, and nothing else is.
 
     Neither half would do on its own. The canonical name merely existing proves
-    nothing, because a replaced plan is written over a file that was already
-    there. The temporary file merely being gone proves nothing either, because
-    the folder it was in could have gone with it while the rename failed.
+    nothing, because another process could have created a file there. The
+    temporary file merely being gone proves nothing either, because the folder
+    it was in could have gone with it while the rename failed.
 
     There are three answers, and the third one is the point of this shape:
 
@@ -400,10 +392,8 @@ def publish(path: str, text: str) -> str:
 
 
 def body_block(body: str) -> str:
-    """The body exactly as supplied, ending in a newline so the file ends."""
-    if body.endswith("\n"):
-        return body
-    return body + "\n"
+    """The body exactly as supplied, including its final-newline choice."""
+    return body
 
 
 def _compose(title: str, header_lines: Sequence[str], body: str) -> str:
@@ -415,84 +405,59 @@ def _compose(title: str, header_lines: Sequence[str], body: str) -> str:
 
 
 def session_text(
-    local: str,
+    initiator: str,
     peer: str,
-    workflow: str,
     body: str,
     project: Optional[str] = None,
 ) -> str:
     """`SESSION.md`, written once and never edited."""
     header_lines = [
         "Bridge-Format: {0}".format(BRIDGE_FORMAT),
-        "Local: {0}".format(local),
+        "Initiator: {0}".format(initiator),
         "Peer: {0}".format(peer),
-        "Workflow: {0}".format(workflow),
     ]
     if project:
         header_lines.append("Project: {0}".format(project))
     return "# Session\n" + _compose("", header_lines, body)
 
 
-def local_to_peer_text(
+def initiator_to_peer_text(
     sequence: int,
-    local: str,
+    initiator: str,
     peer: str,
     body: str,
 ) -> str:
     """A request going out to the peer.
 
-    A request carries nothing but who it is from and who it is for. None of the
-    `Review-Request`, `Review-Base` or `Review-Head` fields ever appear on one.
-    Those three belong to an answer - they say which request it answers and
-    which commits that request named - and no answer has been given yet.
+    A request carries nothing but who it is from and who it is for.
     """
-    header_lines = ["From: {0}".format(local), "To: {0}".format(peer)]
+    header_lines = ["From: {0}".format(initiator), "To: {0}".format(peer)]
     return _compose(
         "# Message {0}".format(format_sequence(sequence)), header_lines, body
     )
 
 
-def peer_to_local_text(
+def peer_to_initiator_text(
     sequence: int,
     peer: str,
-    local: str,
+    initiator: str,
     body: str,
-    review_request: Optional[int] = None,
-    review_base: Optional[str] = None,
-    review_head: Optional[str] = None,
 ) -> str:
-    """A peer's answer, copied through unchanged.
-
-    When the request named two commits, three more header lines are added, and
-    every one of them is a fact the runner already held before it made the call:
-    which request this answers, and the two commits the review request named.
-    The peer supplies none of them. They are provenance - they say what the
-    answer was asked about, so that whoever reads the session afterwards can
-    tell - and they condition nothing at all.
-    """
-    header_lines = ["From: {0}".format(peer), "To: {0}".format(local)]
-    if review_request is not None:
-        header_lines.append(
-            "Review-Request: {0}".format(format_sequence(review_request))
-        )
-        header_lines.append("Review-Base: {0}".format(review_base))
-        header_lines.append("Review-Head: {0}".format(review_head))
+    """A peer's final answer, copied through unchanged."""
+    header_lines = ["From: {0}".format(peer), "To: {0}".format(initiator)]
     return _compose(
         "# Message {0}".format(format_sequence(sequence)), header_lines, body
     )
 
 
-def local_record_text(
+def initiator_record_text(
     sequence: int,
     kind: str,
-    local: str,
+    initiator: str,
     body: str,
-    extra_headers: Optional[Sequence[str]] = None,
 ) -> str:
-    """A local record: no recipient, and never a `Review-` line of any kind."""
-    header_lines = ["Record: {0}".format(kind), "From: {0}".format(local)]
-    if extra_headers:
-        header_lines.extend(extra_headers)
+    """An application-neutral note: no recipient and no interpreted fields."""
+    header_lines = ["Record: {0}".format(kind), "From: {0}".format(initiator)]
     return _compose(
         "# Message {0}".format(format_sequence(sequence)), header_lines, body
     )
@@ -505,37 +470,74 @@ def _normalise(text: str) -> str:
     return text.replace("\r\n", "\n").replace("\r", "\n")
 
 
-def _header_block(text: str, title_prefix: str) -> Dict[str, str]:
-    """Read the header block, and refuse to read one line further.
+def _session_fields(text: str) -> Dict[str, str]:
+    """Parse only the fixed Format 2 session envelope.
 
-    The block starts after the title line and ends at the first blank line or
-    the first line that begins a new heading. Everything below - including
-    everything under `## Body` - is out of reach of this function, which is how
-    body inertness is enforced rather than merely intended.
+    The parser accepts the writer's exact structure, rejects duplicate and
+    unknown fields, and stops structurally before the inert body. Text below
+    `## Body` can therefore look like headers without changing the session.
     """
     lines = _normalise(text).split("\n")
-    if not lines or not lines[0].startswith(title_prefix):
+    if not lines or lines[0] != "# Session":
+        raise BridgeError(
+            Failure.SESSION_INVALID, detail="SESSION.md must start with # Session"
+        )
+    if len(lines) < 7 or lines[1] != "":
         raise BridgeError(
             Failure.SESSION_INVALID,
-            detail="expected a line starting {0!r}".format(title_prefix),
+            detail="SESSION.md does not have the Format 2 header layout",
         )
-    index = 1
-    while index < len(lines) and not lines[index].strip():
-        index += 1
+
     fields = {}  # type: Dict[str, str]
-    while index < len(lines):
+    allowed = {"Bridge-Format", "Initiator", "Peer", "Project"}
+    index = 2
+    while index < len(lines) and lines[index] != "":
         line = lines[index]
-        if not line.strip() or line.startswith("#"):
-            break
         name, separator, value = line.partition(":")
-        if not separator:
+        if not separator or name not in allowed or not value.startswith(" "):
             raise BridgeError(
                 Failure.SESSION_INVALID,
-                detail="header line is not 'Name: value': {0!r}".format(line),
+                detail="invalid Format 2 session header: {0!r}".format(line),
             )
-        fields[name.strip()] = value.strip()
+        if name in fields:
+            raise BridgeError(
+                Failure.SESSION_INVALID,
+                detail="SESSION.md repeats the {0} field".format(name),
+            )
+        parsed = value[1:]
+        if not parsed or parsed != parsed.strip():
+            raise BridgeError(
+                Failure.SESSION_INVALID,
+                detail="SESSION.md has an invalid {0} value".format(name),
+            )
+        fields[name] = parsed
         index += 1
+
+    if index + 2 >= len(lines):
+        raise BridgeError(
+            Failure.SESSION_INVALID, detail="SESSION.md has no body"
+        )
+    if lines[index : index + 3] != ["", BODY_HEADING, ""]:
+        raise BridgeError(
+            Failure.SESSION_INVALID,
+            detail="SESSION.md does not have the Format 2 body layout",
+        )
+    body = "\n".join(lines[index + 3 :])
+    if not body.strip():
+        raise BridgeError(
+            Failure.SESSION_INVALID, detail="SESSION.md has an empty body"
+        )
     return fields
+
+
+def validate_initiator(label: str, failure: Failure = Failure.USAGE_ERROR) -> str:
+    """Return an inert ASCII initiator slug, or reject it in the caller's terms."""
+    if not _INITIATOR_PATTERN.fullmatch(label):
+        raise BridgeError(
+            failure,
+            detail="initiator must be an ASCII slug beginning with a letter or digit",
+        )
+    return label
 
 
 def _read_text(path: str, missing: Failure) -> str:
@@ -544,6 +546,8 @@ def _read_text(path: str, missing: Failure) -> str:
             return stream.read()
     except FileNotFoundError:
         raise BridgeError(missing, detail=path)
+    except UnicodeDecodeError as exc:
+        raise BridgeError(Failure.SESSION_INVALID, detail=str(exc))
     except OSError as exc:
         raise BridgeError(Failure.SESSION_INVALID, detail=str(exc))
 
@@ -553,13 +557,34 @@ def read_session(session_dir: str) -> SessionRecord:
     if not os.path.isdir(session_dir):
         raise BridgeError(Failure.SESSION_NOT_FOUND, detail=session_dir)
     text = _read_text(session_file(session_dir), Failure.SESSION_NOT_FOUND)
-    fields = _header_block(text, "# Session")
-    for required in ("Bridge-Format", "Local", "Peer", "Workflow"):
+    fields = _session_fields(text)
+    for required in ("Bridge-Format", "Initiator", "Peer"):
         if not fields.get(required):
             raise BridgeError(
                 Failure.SESSION_INVALID,
                 detail="SESSION.md has no {0} line".format(required),
             )
+    if fields["Bridge-Format"] != str(BRIDGE_FORMAT):
+        raise BridgeError(
+            Failure.SESSION_INVALID,
+            detail="unsupported Bridge-Format: {0}".format(
+                fields["Bridge-Format"]
+            ),
+        )
+    validate_initiator(fields["Initiator"], failure=Failure.SESSION_INVALID)
+    from .connectors import HARNESS_IDS
+
+    if fields["Peer"] not in HARNESS_IDS:
+        raise BridgeError(
+            Failure.SESSION_INVALID,
+            detail="SESSION.md names an unsupported peer: {0}".format(fields["Peer"]),
+        )
+    project = fields.get("Project") or None
+    if project is not None and not os.path.isabs(project):
+        raise BridgeError(
+            Failure.SESSION_INVALID,
+            detail="SESSION.md Project is not absolute: {0}".format(project),
+        )
     if not os.path.isdir(messages_dir(session_dir)):
         raise BridgeError(
             Failure.SESSION_INVALID, detail=messages_dir(session_dir)
@@ -567,10 +592,9 @@ def read_session(session_dir: str) -> SessionRecord:
     return SessionRecord(
         directory=session_dir,
         bridge_format=fields["Bridge-Format"],
-        local=fields["Local"],
+        initiator=fields["Initiator"],
         peer=fields["Peer"],
-        workflow=fields["Workflow"],
-        project=fields.get("Project") or None,
+        project=project,
     )
 
 

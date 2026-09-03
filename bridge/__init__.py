@@ -10,7 +10,7 @@ SPDX-License-Identifier: Unlicense
 
 #: Version of the on-disk session record format. `SESSION.md` records it as
 #: `Bridge-Format:` so a later reader can tell which layout it is looking at.
-BRIDGE_FORMAT = 1
+BRIDGE_FORMAT = 2
 
 #: Version of this source tree. Nothing has been released, so this is 0.0.0.
 VERSION = "0.0.0"
