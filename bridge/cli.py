@@ -104,7 +104,7 @@ def _check_directory() -> Iterator[str]:
     _remove_neutral(neutral, None)
 
 
-def _check(args: argparse.Namespace) -> str:
+def _check(args: argparse.Namespace) -> connectors.CheckResult:
     connector = connectors.resolve(args.peer)
     with _check_directory() as cwd:
         return connector.check(Deadline(DEFAULT_TIMEOUT_SECONDS), cwd)
@@ -115,6 +115,9 @@ def _run(args: argparse.Namespace) -> str:
         session_dir=args.session,
         body=_read_body(),
         timeout_seconds=args.timeout,
+        warning_writer=lambda warning: sys.stderr.write(
+            "Warning: {0}\n".format(warning)
+        ),
     ).response_path
 
 
@@ -138,7 +141,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 Failure.USAGE_ERROR, detail="name a command: check, run, record"
             )
         if args.command == "check":
-            written = _check(args)
+            checked = _check(args)
+            sys.stdout.write(checked.message + "\n")
+            for warning in checked.warnings:
+                sys.stdout.write("Warning: {0}\n".format(warning))
+            return 0
         elif args.command == "run":
             written = _run(args)
         else:

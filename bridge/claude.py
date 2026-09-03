@@ -1,4 +1,4 @@
-"""Calling Claude Code, and making that one call unable to change anything.
+"""Calling Claude Code with its strongest practical read-only posture.
 
 Claude Code is Anthropic's own command-line program for its coding agent. This
 module is the whole of what Agent Bridge knows about it: which program to start,
@@ -26,6 +26,9 @@ user's, the project's and the local settings files, so a turn is not shaped by
 whatever happens to be configured on the machine. It confines the file tools to
 the working directory the process was started in. And it refuses the
 permission mode that would bypass permission checks altogether.
+Administrator-managed endpoint and remote policy deliberately survive this
+mode, so the connector observes their presence or uncertainty without opening
+policy values and reports that boundary as a warning.
 
 `--strict-mcp-config` says to use only the MCP servers named by `--mcp-config`.
 No `--mcp-config` is passed, so that set is empty: the turn reaches no MCP
@@ -66,14 +69,17 @@ SPDX-License-Identifier: Unlicense
 
 from __future__ import annotations
 
+import errno
 import json
-from typing import Tuple
+import os
+import pwd
+from typing import List, Tuple
 
 from . import connectors
 from .errors import BridgeError, Failure
 from .peer import CompletedCall, Deadline
 
-#: The identifier this connector answers to, out of the five.
+#: The identifier this connector answers to, out of the six.
 HARNESS_ID = "claude"
 
 #: What this connector has actually been tested against, declared in source and
@@ -99,6 +105,135 @@ QUALIFICATION = connectors.Qualification(
 #: inside them. Passed as one comma-separated value so the option cannot go on
 #: swallowing the switches that follow it.
 READ_ONLY_TOOLS = "Read,Glob,Grep"
+
+# Claude Code 2.1.251's own policy loader and current official documentation
+# agree on these macOS sources. Restricted mode deliberately keeps the
+# administrator tier, so their presence is a boundary fact rather than a user
+# preference Agent Bridge may override.
+MANAGED_DIRECTORY = "/Library/Application Support/ClaudeCode"
+MANAGED_SETTINGS = os.path.join(MANAGED_DIRECTORY, "managed-settings.json")
+MANAGED_DROP_INS = os.path.join(MANAGED_DIRECTORY, "managed-settings.d")
+MANAGED_MCP = os.path.join(MANAGED_DIRECTORY, "managed-mcp.json")
+MANAGED_PREFERENCES_DIRECTORY = "/Library/Managed Preferences"
+MANAGED_PREFERENCES_DOMAIN = "com.anthropic.claudecode.plist"
+
+REMOTE_STATUS_PREFIX = "Managed settings (remote): "
+REMOTE_STATUS_WITHOUT_POLICY = (
+    "none configured for this organization",
+    "not fetched \u2014 requires an Enterprise or Team subscription",
+)
+
+
+def _managed_source_paths() -> Tuple[str, str, str, str, str]:
+    """The endpoint-managed paths this exact macOS CLI probes.
+
+    The user name comes from the operating-system account database, matching
+    the CLI's own ``userInfo().username`` lookup rather than an environment
+    variable a caller could replace.
+    """
+    username = pwd.getpwuid(os.getuid()).pw_name
+    return (
+        MANAGED_SETTINGS,
+        MANAGED_DROP_INS,
+        MANAGED_MCP,
+        os.path.join(
+            MANAGED_PREFERENCES_DIRECTORY,
+            username,
+            MANAGED_PREFERENCES_DOMAIN,
+        ),
+        os.path.join(
+            MANAGED_PREFERENCES_DIRECTORY,
+            MANAGED_PREFERENCES_DOMAIN,
+        ),
+    )
+
+
+def _endpoint_managed_settings_fact() -> str:
+    """Describe endpoint policy presence without opening a policy value."""
+    settings, drop_ins, managed_mcp, user_plist, device_plist = (
+        _managed_source_paths()
+    )
+
+    unknown = []  # type: List[str]
+
+    def present_or_unknown(path: str) -> bool:
+        try:
+            os.lstat(path)
+        except OSError as exc:
+            if exc.errno in (errno.ENOENT, errno.ENOTDIR):
+                return False
+            unknown.append(
+                "{0} ({1})".format(path, exc.__class__.__name__)
+            )
+            return False
+        return True
+
+    present = []
+    for path in (settings, managed_mcp, user_plist, device_plist):
+        if present_or_unknown(path):
+            present.append(path)
+
+    if present_or_unknown(drop_ins):
+        if not os.path.isdir(drop_ins):
+            present.append(drop_ins)
+        else:
+            try:
+                names = os.listdir(drop_ins)
+            except OSError as exc:
+                unknown.append(
+                    "{0} ({1})".format(drop_ins, exc.__class__.__name__)
+                )
+            else:
+                present.extend(
+                    os.path.join(drop_ins, name)
+                    for name in sorted(names)
+                    if name.endswith(".json") and not name.startswith(".")
+                )
+
+    facts = []
+    if present:
+        facts.append(
+            "endpoint-managed policy sources are present at {0}".format(
+                ", ".join(present)
+            )
+        )
+    else:
+        facts.append("no endpoint-managed policy source was observed")
+    if unknown:
+        facts.append("inspection was inconclusive at {0}".format(", ".join(unknown)))
+    facts.append("policy values were not opened")
+    return "; ".join(facts)
+
+
+def _remote_managed_settings_fact(
+    program: str, deadline: Deadline, cwd: str
+) -> str:
+    """Describe Claude's no-turn remote-policy status, or its uncertainty."""
+    try:
+        report = connectors.probe((program, "doctor"), cwd, deadline)
+    except BridgeError as error:
+        return (
+            "claude doctor could not inspect remote managed settings ({0}); "
+            "their state is unknown"
+        ).format(error.failure.value)
+    if report.returncode != 0:
+        return (
+            "claude doctor exited {0}, so remote managed-settings state is "
+            "unknown"
+        ).format(report.returncode)
+    states = [
+        line[len(REMOTE_STATUS_PREFIX) :].strip()
+        for line in report.stdout.splitlines()
+        if line.startswith(REMOTE_STATUS_PREFIX)
+    ]
+    if len(states) == 1 and states[0]:
+        return "claude doctor reports remote managed settings: {0}".format(
+            states[0]
+        )
+    return (
+        "claude doctor did not print one readable remote managed-settings "
+        "status, so their state is unknown"
+    )
 
 
 def _signed_in(status: CompletedCall) -> str:
@@ -144,7 +279,9 @@ def _signed_in(status: CompletedCall) -> str:
     return described
 
 
-def _prerequisites(deadline: Deadline, cwd: str) -> Tuple[str, str, str, str]:
+def _prerequisites(
+    deadline: Deadline, cwd: str
+) -> Tuple[str, str, str, str, Tuple[str, ...]]:
     """Everything that has to be true before starting Claude Code is worth doing.
 
     Five questions in order, each one cheap and none of them a model turn: is
@@ -157,27 +294,45 @@ def _prerequisites(deadline: Deadline, cwd: str) -> Tuple[str, str, str, str]:
     program is, which version answered, how this computer describes itself, and
     how the sign-in was made.
     """
+    warnings = []  # type: List[str]
     program = connectors.executable(QUALIFICATION.cli_identity)
     version = connectors.qualified_version(
         connectors.probe((program, "--version"), cwd, deadline).stdout,
         QUALIFICATION,
+        warnings,
     )
-    described = connectors.qualified_platform(QUALIFICATION)
+    described = connectors.qualified_platform(QUALIFICATION, warnings)
+    endpoint_policy = _endpoint_managed_settings_fact()
 
     account = _signed_in(
         connectors.probe(
             (program, "auth", "status", "--json"), cwd, deadline
         )
     )
+    remote_policy = _remote_managed_settings_fact(program, deadline, cwd)
 
     connectors.qualified_restrictions(
-        connectors.probe((program, "--help"), cwd, deadline).stdout,
+        connectors.probe((program, "--help"), cwd, deadline),
         QUALIFICATION,
     )
-    return program, version, described, account
+    warnings.append(
+        "Claude Code's --restricted, strict empty MCP, read-only tool, and "
+        "planning posture still keeps administrator-managed endpoint and "
+        "remote policy, which can add hooks or other external effects; "
+        "{0}; {1}.".format(
+            endpoint_policy, remote_policy
+        )
+    )
+    return (
+        program,
+        version,
+        described,
+        account,
+        tuple(warnings),
+    )
 
 
-def check(deadline: Deadline, cwd: str) -> str:
+def check(deadline: Deadline, cwd: str) -> connectors.CheckResult:
     """Report whether Claude Code could be used right now, spending no turn.
 
     `cwd` is a neutral directory made for this command, so the questions below
@@ -185,9 +340,9 @@ def check(deadline: Deadline, cwd: str) -> str:
     is installed, nobody is logged in, no model or provider is chosen, and
     nothing is written down for next time.
     """
-    program, version, described, account = _prerequisites(deadline, cwd)
+    program, version, described, account, warnings = _prerequisites(deadline, cwd)
     return connectors.readiness(
-        HARNESS_ID, program, version, described, account
+        HARNESS_ID, program, version, described, account, warnings
     )
 
 
@@ -205,7 +360,9 @@ def build_command(deadline: Deadline, cwd: str) -> connectors.PeerCommand:
     Nothing under a message's `## Body` heading is read anywhere in Agent
     Bridge, so no text a peer or a plan wrote can name a directory here.
     """
-    program, _version, _described, _account = _prerequisites(deadline, cwd)
+    program, _version, _described, _account, warnings = _prerequisites(
+        deadline, cwd
+    )
     return connectors.PeerCommand(
         argv=(
             program,
@@ -221,4 +378,5 @@ def build_command(deadline: Deadline, cwd: str) -> connectors.PeerCommand:
         ),
         cwd=cwd,
         env=connectors.environment(),
+        warnings=warnings,
     )

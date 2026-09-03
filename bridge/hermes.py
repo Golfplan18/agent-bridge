@@ -1,4 +1,4 @@
-"""Calling Hermes Agent as a courier, and making that call unable to change anything.
+"""Calling Hermes Agent with its strongest practical courier posture.
 
 Hermes Agent is Nous Research's command-line coding agent. This module is the
 whole of what Agent Bridge knows about it: which program to start, which
@@ -102,13 +102,13 @@ SPDX-License-Identifier: Unlicense
 
 from __future__ import annotations
 
-from typing import Tuple
+from typing import List, Tuple
 
 from . import connectors
 from .errors import BridgeError, Failure
 from .peer import CompletedCall, Deadline
 
-#: The identifier this connector answers to, out of the five.
+#: The identifier this connector answers to, out of the six.
 HARNESS_ID = "hermes"
 
 #: This peer is given no project and answers on what it is sent. The command
@@ -151,6 +151,14 @@ DROPPED_FROM_ENVIRONMENT = ("TERMINAL_CWD",)
 SIGNED_IN_LINE = "logged in"
 NOT_SIGNED_IN_LINE = "not logged in"
 PORTAL_SELECTED_LINE = "using Nous as inference provider"
+
+WARNING = (
+    "Hermes is courier-only because its file toolset cannot separate reads "
+    "from writes, so it receives only a neutral directory and no file tool. "
+    "--safe-mode skips plugins, MCP servers, and shell hooks, but user memory "
+    "can remain. The complete message is carried in one --oneshot argument "
+    "and may be visible to other processes under the same account or to logs."
+)
 
 
 def _environment() -> Tuple[Tuple[str, str], ...]:
@@ -195,7 +203,9 @@ def _signed_in(status: CompletedCall) -> str:
     return "signed in to the Nous Portal, which is the configured provider"
 
 
-def _prerequisites(deadline: Deadline, cwd: str) -> Tuple[str, str, str, str]:
+def _prerequisites(
+    deadline: Deadline, cwd: str
+) -> Tuple[str, str, str, str, Tuple[str, ...]]:
     """Everything that has to be true before starting Hermes is worth doing.
 
     Five questions in order, each one cheap and none of them a model turn: is
@@ -208,25 +218,28 @@ def _prerequisites(deadline: Deadline, cwd: str) -> Tuple[str, str, str, str]:
     program is, which version answered, how this computer describes itself, and
     how the sign-in was made.
     """
+    warnings = []  # type: List[str]
     program = connectors.executable(QUALIFICATION.cli_identity)
     version = connectors.qualified_version(
         connectors.probe((program, "--version"), cwd, deadline).stdout,
         QUALIFICATION,
+        warnings,
     )
-    described = connectors.qualified_platform(QUALIFICATION)
+    described = connectors.qualified_platform(QUALIFICATION, warnings)
 
     account = _signed_in(
         connectors.probe((program, "portal", "info"), cwd, deadline)
     )
 
     connectors.qualified_restrictions(
-        connectors.probe((program, "--help"), cwd, deadline).stdout,
+        connectors.probe((program, "--help"), cwd, deadline),
         QUALIFICATION,
     )
-    return program, version, described, account
+    warnings.append(WARNING)
+    return program, version, described, account, tuple(warnings)
 
 
-def check(deadline: Deadline, cwd: str) -> str:
+def check(deadline: Deadline, cwd: str) -> connectors.CheckResult:
     """Report whether Hermes could be used right now, spending no model turn.
 
     `cwd` is a neutral directory made for this command, so the questions below
@@ -234,9 +247,9 @@ def check(deadline: Deadline, cwd: str) -> str:
     is installed, nobody is logged in, no model or provider is chosen, and
     nothing is written down for next time.
     """
-    program, version, described, account = _prerequisites(deadline, cwd)
+    program, version, described, account, warnings = _prerequisites(deadline, cwd)
     return connectors.readiness(
-        HARNESS_ID, program, version, described, account
+        HARNESS_ID, program, version, described, account, warnings
     )
 
 
@@ -253,7 +266,9 @@ def build_command(deadline: Deadline, cwd: str) -> connectors.PeerCommand:
     appends it as the final argument, behind `--oneshot=`, once it has checked
     the body will fit on a command line at all.
     """
-    program, _version, _described, _account = _prerequisites(deadline, cwd)
+    program, _version, _described, _account, warnings = _prerequisites(
+        deadline, cwd
+    )
     return connectors.PeerCommand(
         argv=(
             program,
@@ -264,4 +279,5 @@ def build_command(deadline: Deadline, cwd: str) -> connectors.PeerCommand:
         cwd=cwd,
         env=_environment(),
         body_argument=BODY_ARGUMENT,
+        warnings=warnings,
     )

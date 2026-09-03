@@ -1,4 +1,4 @@
-"""Calling ZCode, and making that one call unable to change anything.
+"""Calling ZCode with its strongest practical read-only posture.
 
 ZCode is Z.AI's coding agent. Its command-line program is not installed on
 `PATH`: it is a JavaScript bundle shipped inside the desktop application, run by
@@ -86,24 +86,20 @@ strict parser has no entry for them. On this build `--help` is not a reliable
 description of the program. So readiness proves the switches it relies on by
 passing them to a subcommand that spends no turn, not only by reading the help.
 
-**Persistent configuration, verified before every call.** No switch on this
+**Persistent configuration, reported before every call.** No switch on this
 build sheds the user's enabled plugins or MCP servers for one call, and plan
 mode admits non-destructive MCP tools; a probe on this machine showed a peer
 under plan mode and the full deny list still holding nineteen iOS-simulator
-tools from an enabled plugin. So, as the plan requires where a harness exposes
-tools through configuration no per-call switch can shed, both operations read
-ZCode's own `plugins list --json`, which spends no turn, and refuse when any
-enabled plugin declares or resolves an MCP server or carries a hook. Declared
-counts as well as resolved, because a declared server resolves the moment the
-environment variable it wants appears in the environment the bridge inherits;
-a property that depends on a variable's absence is not a property. Skills and
-slash commands are not refused on: the Skill tool is in the deny list, and a
-slash command is not something the model can call. What this check cannot see
-is an MCP server configured directly in the user's configuration file rather
-than by a plugin: ZCode lists those only inside a session, at the cost of a
-turn, and the file itself holds the sign-in key and is never opened here. The
-peer's own tool inventory under disposable qualification is the evidence for
-those.
+tools from an enabled plugin. Both operations therefore read ZCode's own
+`plugins list --json`, which spends no turn, and report any enabled plugin that
+declares or resolves an MCP server or carries a hook. Unreadable inventory is
+also reported rather than treated as proof that none exists. Skills and slash
+commands do not become model-callable routes here: the Skill tool is in the
+deny list, and a slash command is not something the model can call. What this
+check cannot see is an MCP server configured directly in the user's
+configuration file rather than by a plugin: ZCode lists those only inside a
+session, at the cost of a turn, and the file itself holds the sign-in key and
+is never opened here. The warning states that uncertainty plainly.
 
 **Authentication, and what can honestly be said about it.** ZCode has no command
 that reports sign-in without a model turn. `zcode login` is not a status check:
@@ -154,7 +150,7 @@ from . import connectors
 from .errors import BridgeError, Failure
 from .peer import Deadline
 
-#: The identifier this connector answers to, out of the five.
+#: The identifier this connector answers to, out of the six.
 HARNESS_ID = "zcode"
 
 #: The runtime the bundle needs. Found on PATH like any other program; ZCode's
@@ -338,22 +334,19 @@ def _names(value: object) -> List[str]:
     return [item for item in value if isinstance(item, str) and item]
 
 
-def _plugins_verified(
+def _plugin_fact(
     runtime: str, script: str, deadline: Deadline, cwd: str
 ) -> str:
-    """Refuse if an enabled plugin exposes what no per-call switch can remove.
-
-    `plugins list --json` is ZCode's own account of its installed plugins and
-    spends no turn. An enabled plugin that declares or resolves an MCP server
-    would put that server's tools in front of the peer, and plan mode admits
-    the non-destructive ones; a plugin with hooks runs programs of its own
-    during a turn. Either is refused, naming the plugin and what it exposes, so
-    the person knows exactly what to disable in ZCode. A listing that cannot be
-    read is not a pass: nothing is assumed about what it would have said.
-    """
-    listing = connectors.probe(
-        (runtime, script, "plugins", "list", "--json"), cwd, deadline
-    )
+    """Describe exposed plugin routes without turning uncertainty into refusal."""
+    try:
+        listing = connectors.probe(
+            (runtime, script, "plugins", "list", "--json"), cwd, deadline
+        )
+    except BridgeError as error:
+        return (
+            "the plugin inventory could not be inspected ({0}), so enabled "
+            "plugin hooks and MCP servers are unknown"
+        ).format(error.failure.value)
     parsed = None
     if listing.returncode == 0:
         try:
@@ -362,13 +355,12 @@ def _plugins_verified(
             parsed = None
     plugins = parsed.get("plugins") if isinstance(parsed, dict) else None
     if not isinstance(plugins, list):
-        raise BridgeError(
-            Failure.QUALIFICATION_UNSAFE_OR_INCONCLUSIVE,
-            detail="zcode plugins list --json could not be read (exit {0}: "
-            "{1}), so what the enabled plugins expose is unknown".format(
+        return (
+            "zcode plugins list --json could not be read (exit {0}: {1}), "
+            "so enabled plugin hooks and MCP servers are unknown"
+        ).format(
                 listing.returncode,
                 (listing.stderr or listing.stdout).strip()[:160],
-            ),
         )
 
     enabled = 0
@@ -399,20 +391,19 @@ def _plugins_verified(
             )
         )
     if exposing:
-        raise BridgeError(
-            Failure.RESTRICTIONS_UNAVAILABLE,
-            detail="ZCode has no per-call switch that sheds an enabled "
-            "plugin, and these enabled plugins expose what a peer must not "
-            "reach: {0}; disable them in ZCode's Settings under Plugin "
-            "Management, then check again".format("; ".join(exposing)),
-        )
+        return (
+            "enabled plugins expose routes ZCode has no per-call switch to "
+            "shed: {0}"
+        ).format("; ".join(exposing))
     return (
         "no enabled plugin declares an MCP server or a hook ({0} of {1} "
         "installed plugins enabled)".format(enabled, len(plugins))
     )
 
 
-def _prerequisites(deadline: Deadline, cwd: str) -> Tuple[str, str, str, str]:
+def _prerequisites(
+    deadline: Deadline, cwd: str
+) -> Tuple[str, str, str, str, Tuple[str, ...]]:
     """Everything that has to be true before starting ZCode is worth doing.
 
     Seven questions in order, each cheap and none a model turn: is the runtime
@@ -421,24 +412,27 @@ def _prerequisites(deadline: Deadline, cwd: str) -> Tuple[str, str, str, str]:
     sign-in, does any enabled plugin expose what no switch can remove, and are
     the switches the turn relies on really accepted - proven by passing them to
     a subcommand that spends no turn, because this program's help text lists
-    switches its parser rejects. Any of them failing raises, so nothing further
-    happens.
+    switches its parser rejects. Missing software, minimum local sign-in state,
+    or required mechanics raises; plugin exposure or uncertainty and the lack
+    of live OAuth evidence are returned as warnings.
 
     Returns the four facts a readiness report needs and a turn uses: the
     program as it is started, which version answered, how this computer
     describes itself, and what was observed about sign-in and plugins.
     """
+    warnings = []  # type: List[str]
     runtime, script = _program()
     version = connectors.qualified_version(
         connectors.probe((runtime, script, "--version"), cwd, deadline).stdout,
         QUALIFICATION,
+        warnings,
     )
-    described = connectors.qualified_platform(QUALIFICATION)
-    account = _sign_in_facts()
-    plugins = _plugins_verified(runtime, script, deadline, cwd)
+    described = connectors.qualified_platform(QUALIFICATION, warnings)
+    sign_in = _sign_in_facts()
+    plugins = _plugin_fact(runtime, script, deadline, cwd)
 
     connectors.qualified_restrictions(
-        connectors.probe((runtime, script, "--help"), cwd, deadline).stdout,
+        connectors.probe((runtime, script, "--help"), cwd, deadline),
         QUALIFICATION,
     )
     accepted = connectors.probe(
@@ -466,15 +460,25 @@ def _prerequisites(deadline: Deadline, cwd: str) -> Tuple[str, str, str, str]:
                 (accepted.stderr or accepted.stdout).strip()[:160],
             ),
         )
+    warnings.append(
+        "ZCode cannot shed enabled plugins or directly configured MCP "
+        "servers per call, and plan mode may admit non-destructive MCP tools; "
+        "{0}. {1}.".format(plugins, sign_in)
+    )
+    warnings.append(
+        "ZCode receives the complete message in one --prompt argument, which "
+        "may be visible to other processes under the same account or to logs."
+    )
     return (
         "{0} {1}".format(runtime, script),
         version,
         described,
-        "{0}; {1}".format(account, plugins),
+        "minimum local configuration needed to attempt a call is present",
+        tuple(warnings),
     )
 
 
-def check(deadline: Deadline, cwd: str) -> str:
+def check(deadline: Deadline, cwd: str) -> connectors.CheckResult:
     """Report whether ZCode could be used right now, spending no model turn.
 
     `cwd` is a neutral directory made for this command, so the questions are
@@ -482,9 +486,15 @@ def check(deadline: Deadline, cwd: str) -> str:
     installed, nobody is logged in, no model or provider is chosen, and nothing
     is written down for next time.
     """
-    program, version, described, account = _prerequisites(deadline, cwd)
+    program, version, described, account, warnings = _prerequisites(deadline, cwd)
     return connectors.readiness(
-        HARNESS_ID, program, version, described, account
+        HARNESS_ID,
+        program,
+        version,
+        described,
+        account,
+        warnings,
+        authentication_confirmed=False,
     )
 
 
@@ -503,7 +513,9 @@ def build_command(deadline: Deadline, cwd: str) -> connectors.PeerCommand:
     its own refusals, and sends nothing on standard input.
     """
     runtime, script = _program()
-    _prerequisites(deadline, cwd)
+    _program_name, _version, _described, _account, warnings = _prerequisites(
+        deadline, cwd
+    )
     return connectors.PeerCommand(
         argv=(
             runtime,
@@ -519,4 +531,5 @@ def build_command(deadline: Deadline, cwd: str) -> connectors.PeerCommand:
         cwd=cwd,
         env=connectors.environment(),
         body_argument=BODY_ARGUMENT,
+        warnings=warnings,
     )

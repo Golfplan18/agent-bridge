@@ -34,6 +34,7 @@ NEUTRAL_PREFIX = "agent-bridge-neutral-"
 # function directly. No command-line, environment, file, or configuration path
 # exposes this seam.
 CommandBuilder = Callable[[Deadline, str], PeerCommand]
+WarningWriter = Callable[[str], None]
 
 
 def _remove_neutral(path: str, during: Optional[BaseException]) -> None:
@@ -86,6 +87,15 @@ def apply_transport(
 ) -> Tuple[Tuple[str, ...], str]:
     """Bind the body to standard input or one qualified final argument."""
     if command.body_argument is None:
+        if command.stdin_body_limit is not None:
+            size = len(body.encode("utf-8"))
+            if size > command.stdin_body_limit:
+                raise BridgeError(
+                    Failure.USAGE_ERROR,
+                    detail="the message is {0} bytes and this peer silently "
+                    "truncates standard input above {1} bytes; send a shorter "
+                    "message".format(size, command.stdin_body_limit),
+                )
         return command.argv, body
     if "\x00" in body:
         raise BridgeError(
@@ -129,6 +139,7 @@ def run_turn(
     body: str,
     timeout_seconds: float,
     build_command: Optional[CommandBuilder] = None,
+    warning_writer: Optional[WarningWriter] = None,
 ) -> TurnResult:
     """Publish one request and one response for the session's fixed target."""
     try:
@@ -147,14 +158,14 @@ def run_turn(
 
     deadline = Deadline(timeout)
     record = session_module.read_session(session_dir)
-    connector = connectors.resolve(record.peer)
-    if record.project is not None and getattr(connector, "COURIER_ONLY", False):
+    if record.project is not None and connectors.is_courier_only(record.peer):
         raise BridgeError(
             Failure.USAGE_ERROR,
             detail="the session records a project for {0}, which is courier-only; "
             "include the needed evidence in the body or choose a project-capable "
             "target".format(record.peer),
         )
+    connector = connectors.resolve(record.peer)
 
     with session_lock(session_dir):
         with _target_directory(record.project) as cwd:
@@ -172,6 +183,9 @@ def run_turn(
             argv, stdin_text = apply_transport(command, body)
 
             request_sequence = session_module.next_sequence(session_dir)
+            if warning_writer is not None:
+                for warning in command.warnings:
+                    warning_writer(warning)
             session_module.publish(
                 session_module.message_path(
                     session_dir,
@@ -198,6 +212,8 @@ def run_turn(
                     ),
                 )
             response = call.stdout
+            if command.response_parser is not None:
+                response = command.response_parser(response)
             if not response.strip():
                 raise BridgeError(Failure.EMPTY_RESPONSE, detail=command.argv[0])
 

@@ -88,13 +88,10 @@ _GUIDANCE: Dict[Failure, Tuple[str, str]] = {
         "update the connector's declaration in source.",
     ),
     Failure.RESTRICTIONS_UNAVAILABLE: (
-        "The peer harness does not offer the exact switches Agent Bridge needs "
-        "to make it unable to write project files, change Git state, or reach "
-        "a browser, the web, MCP, messaging, credentials, publication or "
-        "deployment - whether by removing those tools or by confining them in "
-        "an enforced sandbox.",
-        "Do not give this harness real project access; report the missing "
-        "restriction so the connector's declaration can be corrected.",
+        "The peer harness does not offer a switch or one-shot input/output "
+        "mechanic required by Agent Bridge's fixed invocation.",
+        "Inspect the named missing mechanic and update or correct the harness "
+        "before checking it again.",
     ),
     Failure.QUALIFICATION_UNSAFE_OR_INCONCLUSIVE: (
         "The disposable qualification run did not clearly prove the harness "
@@ -134,8 +131,8 @@ _GUIDANCE: Dict[Failure, Tuple[str, str]] = {
         "input, and run it again.",
     ),
     Failure.UNKNOWN_HARNESS: (
-        "The named target is not one of the four Agent Bridge knows about.",
-        "Name one of: codex, claude, zcode, hermes.",
+        "The named target is not one of the six Agent Bridge knows about.",
+        "Name one of: codex, claude, zcode, hermes, minimax, qwen.",
     ),
     Failure.CONNECTOR_UNAVAILABLE: (
         "That harness identifier is real, but this build ships no connector "

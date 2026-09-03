@@ -1,4 +1,4 @@
-"""Calling Codex, and making that one call unable to change anything.
+"""Calling Codex with its strongest practical read-only posture.
 
 Codex is OpenAI's own command-line program for its coding agent. This module is
 the whole of what Agent Bridge knows about it: which program to start, which
@@ -22,15 +22,15 @@ incidental.
 
 **The switches, and why none of them is decoration.**
 
-`--ignore-user-config` matters most, and it is required rather than tidy. A
-user's `~/.codex/config.toml` can turn on plugins that drive a browser, plugins
-that drive the computer, an MCP server that runs code, and a program that is run
-whenever a turn ends. Those are exactly the browser, web, MCP and publication
-effects a peer turn must not have, and the read-only sandbox does not reach any
-of them: a plugin that opens a browser is not a shell command the sandbox is
-inspecting. Refusing to load the file is the only thing that does. Signing in
-survives it, because authentication is read from `CODEX_HOME` rather than from
-that file.
+`--ignore-user-config` skips `$CODEX_HOME/config.toml`, including any model or
+effort defaults stored only there. It does not suppress trusted-project
+`.codex/config.toml` files and project hooks or rules, system configuration,
+`managed_config.toml`, `requirements.toml`, cloud-delivered requirements,
+macOS MDM preferences, or separately sourced user/global hooks and rules. The
+fixed vector therefore overrides every compatible high-risk route it can name,
+and the connector reports the surviving configuration boundary rather than
+claiming that the flag removes it. Signing in survives because authentication
+is read from `CODEX_HOME` rather than from that file.
 
 `--sandbox read-only` is Codex's own enforced sandbox, not a request to be
 careful. A shell may still exist inside the turn; what it cannot do is write.
@@ -58,20 +58,20 @@ SPDX-License-Identifier: Unlicense
 
 from __future__ import annotations
 
-from typing import Tuple
+from typing import List, Tuple
 
 from . import connectors
 from .errors import BridgeError, Failure
 from .peer import Deadline
 
-#: The identifier this connector answers to, out of the five.
+#: The identifier this connector answers to, out of the six.
 HARNESS_ID = "codex"
 
 #: What this connector has actually been tested against, declared in source and
 #: never inferred from the machine it is running on. `restrictions` names the
-#: exact switches the vector below passes to hold the boundary: refuse the
-#: user's configuration, run under the enforced read-only sandbox, work outside
-#: a Git repository, and take the working root from the command line.
+#: exact switches the vector below passes to hold the boundary: skip the main
+#: user config, override compatible high-risk routes, use the enforced read-only
+#: sandbox, work outside a Git repository, and name the working root.
 QUALIFICATION = connectors.Qualification(
     cli_identity="codex",
     versions=("0.147.0",),
@@ -80,14 +80,34 @@ QUALIFICATION = connectors.Qualification(
     architectures=("arm64",),
     restrictions=(
         "--ignore-user-config",
+        "-c",
+        "--disable",
         "--sandbox",
         "--skip-git-repo-check",
         "--cd",
     ),
 )
 
+WARNING = (
+    "--ignore-user-config skips only $CODEX_HOME/config.toml, including any "
+    "model and effort defaults stored there; Agent Bridge supplies no "
+    "replacement. Trusted-project .codex/config.toml files and project hooks "
+    "or rules, system configuration, managed_config.toml, requirements.toml, "
+    "cloud-delivered requirements, macOS MDM preferences, and separately "
+    "sourced user/global hooks or rules can still apply. Those layers can add "
+    "settings the fixed vector does not override, while managed defaults or "
+    "MDM can override CLI options. The fixed scalar controls disable known "
+    "web search, notify, "
+    "hooks, apps, plugins, Codex Apps MCP, and agent routes, but named MCP "
+    "servers, plugins, hooks, network, telemetry, or other integrations from "
+    "surviving configuration may still retain external-effect routes outside "
+    "the read-only shell sandbox."
+)
 
-def _prerequisites(deadline: Deadline, cwd: str) -> Tuple[str, str, str]:
+
+def _prerequisites(
+    deadline: Deadline, cwd: str
+) -> Tuple[str, str, str, Tuple[str, ...]]:
     """Everything that has to be true before starting Codex is worth doing.
 
     Five questions in order, each one cheap and none of them a model turn: is
@@ -99,12 +119,14 @@ def _prerequisites(deadline: Deadline, cwd: str) -> Tuple[str, str, str]:
     Returns the three facts a readiness report needs and a turn uses: where the
     program is, which version answered, and how this computer describes itself.
     """
+    warnings = []  # type: List[str]
     program = connectors.executable(QUALIFICATION.cli_identity)
     version = connectors.qualified_version(
         connectors.probe((program, "--version"), cwd, deadline).stdout,
         QUALIFICATION,
+        warnings,
     )
-    described = connectors.qualified_platform(QUALIFICATION)
+    described = connectors.qualified_platform(QUALIFICATION, warnings)
 
     signed_in = connectors.probe((program, "login", "status"), cwd, deadline)
     if signed_in.returncode != 0:
@@ -116,13 +138,14 @@ def _prerequisites(deadline: Deadline, cwd: str) -> Tuple[str, str, str]:
         )
 
     connectors.qualified_restrictions(
-        connectors.probe((program, "exec", "--help"), cwd, deadline).stdout,
+        connectors.probe((program, "exec", "--help"), cwd, deadline),
         QUALIFICATION,
     )
-    return program, version, described
+    warnings.append(WARNING)
+    return program, version, described, tuple(warnings)
 
 
-def check(deadline: Deadline, cwd: str) -> str:
+def check(deadline: Deadline, cwd: str) -> connectors.CheckResult:
     """Report whether Codex could be used right now, spending no model turn.
 
     `cwd` is a neutral directory made for this command, so the questions below
@@ -130,9 +153,9 @@ def check(deadline: Deadline, cwd: str) -> str:
     is installed, nobody is logged in, no model or provider is chosen, and
     nothing is written down for next time.
     """
-    program, version, described = _prerequisites(deadline, cwd)
+    program, version, described, warnings = _prerequisites(deadline, cwd)
     return connectors.readiness(
-        HARNESS_ID, program, version, described, "signed in"
+        HARNESS_ID, program, version, described, "signed in", warnings
     )
 
 
@@ -149,12 +172,28 @@ def build_command(deadline: Deadline, cwd: str) -> connectors.PeerCommand:
     read anywhere in Agent Bridge, so no text a peer or a plan wrote can name a
     directory here.
     """
-    program, _version, _described = _prerequisites(deadline, cwd)
+    program, _version, _described, warnings = _prerequisites(deadline, cwd)
     return connectors.PeerCommand(
         argv=(
             program,
             "exec",
             "--ignore-user-config",
+            "-c",
+            "web_search=disabled",
+            "-c",
+            "notify=[]",
+            "--disable",
+            "hooks",
+            "--disable",
+            "apps",
+            "--disable",
+            "plugins",
+            "-c",
+            "orchestrator.mcp.enabled=false",
+            "-c",
+            "agents.enabled=false",
+            "--disable",
+            "multi_agent_v2",
             "--sandbox",
             "read-only",
             "--skip-git-repo-check",
@@ -164,4 +203,5 @@ def build_command(deadline: Deadline, cwd: str) -> connectors.PeerCommand:
         ),
         cwd=cwd,
         env=connectors.environment(),
+        warnings=warnings,
     )

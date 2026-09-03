@@ -61,6 +61,7 @@ SPDX-License-Identifier: Unlicense
 
 from __future__ import annotations
 
+import contextlib
 import io
 import os
 import re
@@ -77,10 +78,25 @@ REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if REPO_ROOT not in sys.path:
     sys.path.insert(0, REPO_ROOT)
 
-from bridge import cli, peer, record, runner, session  # noqa: E402
+from bridge import (  # noqa: E402
+    claude,
+    cli,
+    codex,
+    connectors,
+    hermes,
+    minimax,
+    peer,
+    qwen,
+    record,
+    runner,
+    session,
+    zcode,
+)
 from bridge.connectors import COMMAND_LINE_BODY_LIMIT, PeerCommand  # noqa: E402
 from bridge.errors import BridgeError, Failure  # noqa: E402
 from bridge.locking import lock_path, session_lock  # noqa: E402
+from bridge.peer import CompletedCall  # noqa: E402
+from tests import release_conformance  # noqa: E402
 
 FAKE_PEER = os.path.join(REPO_ROOT, "tests", "fake_peer.py")
 
@@ -1301,6 +1317,938 @@ class TurnBehavior(unittest.TestCase):
         )
 
 
+class ClaudeManagedSettingsReadiness(unittest.TestCase):
+    """Claude reports managed-policy facts without reading or refusing them."""
+
+    def setUp(self):
+        self.temp = tempfile.mkdtemp(prefix="agent-bridge-claude-policy-")
+        self.paths = (
+            os.path.join(self.temp, "managed-settings.json"),
+            os.path.join(self.temp, "managed-settings.d"),
+            os.path.join(self.temp, "managed-mcp.json"),
+            os.path.join(self.temp, "user.plist"),
+            os.path.join(self.temp, "device.plist"),
+        )
+        self.sources = mock.patch.object(
+            claude, "_managed_source_paths", return_value=self.paths
+        )
+        self.sources.start()
+
+    def tearDown(self):
+        self.sources.stop()
+        shutil.rmtree(self.temp, ignore_errors=True)
+
+    def test_absent_or_empty_endpoint_sources_are_safe_without_reading_values(self):
+        os.mkdir(self.paths[1])
+        with open(os.path.join(self.paths[1], ".ignored.json"), "w") as stream:
+            stream.write("not JSON and deliberately never opened")
+        with open(os.path.join(self.paths[1], "README"), "w") as stream:
+            stream.write("not a policy file")
+
+        fact = claude._endpoint_managed_settings_fact()
+        self.assertIn("no endpoint-managed", fact)
+        self.assertIn("policy values were not opened", fact)
+
+    def test_each_endpoint_policy_shape_is_reported_by_path_alone(self):
+        for index, path in enumerate(self.paths):
+            with self.subTest(path=path):
+                shutil.rmtree(self.temp)
+                os.mkdir(self.temp)
+                if index == 1:
+                    os.mkdir(path)
+                    path = os.path.join(path, "10-hooks.json")
+                with open(path, "w", encoding="utf-8") as stream:
+                    stream.write("a secret value this check must never parse")
+
+                fact = claude._endpoint_managed_settings_fact()
+                self.assertIn(path, fact)
+                self.assertIn("policy values were not opened", fact)
+                self.assertNotIn("a secret value", fact)
+
+    def test_unreadable_endpoint_source_is_reported_as_unknown(self):
+        denied = PermissionError(13, "permission denied", self.paths[0])
+        with mock.patch.object(claude.os, "lstat", side_effect=denied):
+            fact = claude._endpoint_managed_settings_fact()
+        self.assertIn("inspection was inconclusive", fact)
+        self.assertIn(self.paths[0], fact)
+        self.assertIn("policy values were not opened", fact)
+
+    def test_every_readable_doctor_state_is_reported_without_refusal(self):
+        deadline = peer.Deadline(30.0)
+        states = claude.REMOTE_STATUS_WITHOUT_POLICY + (
+            "loaded",
+            "fetch failed \u2014 using stale cache (network error)",
+            "fetch failed \u2014 no policy applied (network error)",
+        )
+        for state in states:
+            report = CompletedCall(
+                0,
+                "Claude Code doctor\n\n{0}{1}\n".format(
+                    claude.REMOTE_STATUS_PREFIX, state
+                ),
+                "",
+            )
+            with self.subTest(state=state):
+                with mock.patch.object(
+                    claude.connectors, "probe", return_value=report
+                ):
+                    self.assertIn(
+                        state,
+                        claude._remote_managed_settings_fact(
+                            "/path/to/claude", deadline, self.temp
+                        ),
+                    )
+
+        with mock.patch.object(
+            claude.connectors,
+            "probe",
+            return_value=CompletedCall(3, "", "doctor unavailable"),
+        ):
+            self.assertIn(
+                "unknown",
+                claude._remote_managed_settings_fact(
+                    "/path/to/claude", deadline, self.temp
+                ),
+            )
+
+    def test_readiness_warns_about_managed_policy_without_inventing_safe_mode(self):
+        calls = (
+            CompletedCall(0, "claude 2.1.251\n", ""),
+            CompletedCall(
+                0,
+                '{"loggedIn": true, "authMethod": "claude.ai", '
+                '"apiProvider": "firstParty"}',
+                "",
+            ),
+            CompletedCall(
+                0,
+                claude.REMOTE_STATUS_PREFIX + "loaded\n",
+                "",
+            ),
+            CompletedCall(0, " ".join(claude.QUALIFICATION.restrictions), ""),
+        )
+        with mock.patch.object(
+            claude.connectors, "executable", return_value="/fake/claude"
+        ), mock.patch.object(
+            claude.connectors,
+            "qualified_platform",
+            return_value="Darwin 26 arm64",
+        ), mock.patch.object(
+            claude, "_endpoint_managed_settings_fact", return_value="endpoint fact"
+        ), mock.patch.object(
+            claude.connectors, "probe", side_effect=calls
+        ):
+            result = claude.check(peer.Deadline(30.0), self.temp)
+
+        self.assertIsInstance(result, connectors.CheckResult)
+        self.assertEqual(len(result.warnings), 1)
+        self.assertIn("endpoint fact", result.warnings[0])
+        self.assertIn("loaded", result.warnings[0])
+        self.assertIn("--restricted", result.warnings[0])
+        self.assertNotIn("--safe-mode", result.warnings[0])
+
+
+class SixTargetConnectorBehavior(unittest.TestCase):
+    """The six literal targets, warning model, and new courier mechanics."""
+
+    TARGETS = ("codex", "claude", "zcode", "hermes", "minimax", "qwen")
+
+    def setUp(self):
+        self.temp = tempfile.mkdtemp(prefix="agent-bridge-connectors-")
+
+    def tearDown(self):
+        shutil.rmtree(self.temp, ignore_errors=True)
+
+    def test_exact_targets_resolve_with_only_the_selected_module_imported(self):
+        self.assertEqual(connectors.HARNESS_IDS, self.TARGETS)
+        source = (
+            "import sys\n"
+            "from bridge import connectors\n"
+            "selected = sys.argv[1]\n"
+            "connector = connectors.resolve(selected)\n"
+            "targets = set(connectors.HARNESS_IDS)\n"
+            "loaded = sorted(name.rsplit('.', 1)[1] for name in sys.modules "
+            "if name.startswith('bridge.') and name.rsplit('.', 1)[1] in targets)\n"
+            "print(connector.HARNESS_ID + ':' + ','.join(loaded))\n"
+        )
+        for selected in self.TARGETS:
+            with self.subTest(selected=selected):
+                completed = subprocess.run(
+                    (sys.executable, "-c", source, selected),
+                    cwd=REPO_ROOT,
+                    text=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    shell=False,
+                    timeout=SHORT_WAIT,
+                )
+                self.assertEqual(completed.returncode, 0, completed.stderr)
+                self.assertEqual(
+                    completed.stdout.strip(),
+                    "{0}:{0}".format(selected),
+                )
+
+        with self.assertRaises(BridgeError) as caught:
+            connectors.resolve("other")
+        self.assertEqual(caught.exception.failure, Failure.UNKNOWN_HARNESS)
+
+    def test_check_and_run_warnings_are_nonblocking_and_precede_publication(self):
+        warnings = ("first concrete boundary", "second concrete boundary")
+
+        class WarnedConnector:
+            @staticmethod
+            def check(deadline, cwd):
+                return connectors.CheckResult("warned target is ready", warnings)
+
+            @staticmethod
+            def build_command(deadline, cwd):
+                return PeerCommand(
+                    argv=(sys.executable, FAKE_PEER, "plain"),
+                    cwd=cwd,
+                    env=tuple(os.environ.items()),
+                    warnings=warnings,
+                )
+
+        checked_out = io.StringIO()
+        checked_err = io.StringIO()
+        with mock.patch.object(connectors, "resolve", return_value=WarnedConnector):
+            with mock.patch("sys.stdout", checked_out), mock.patch(
+                "sys.stderr", checked_err
+            ):
+                self.assertEqual(cli.main(["check", "--peer", "codex"]), 0)
+        self.assertEqual(
+            checked_out.getvalue().splitlines(),
+            [
+                "warned target is ready",
+                "Warning: first concrete boundary",
+                "Warning: second concrete boundary",
+            ],
+        )
+        self.assertEqual(checked_err.getvalue(), "")
+
+        session_dir = os.path.join(self.temp, "warned-run")
+        record.record(
+            session_dir,
+            "session-create",
+            "Warning timing.\n",
+            initiator="ordinary.app",
+            peer="codex",
+        )
+        events = []
+        real_publish = runner.session_module.publish
+
+        class ObservedErrors(io.StringIO):
+            def write(inner_self, text):
+                if text:
+                    events.append(("warning", text))
+                return super().write(text)
+
+        def observed_publish(path, text):
+            events.append(("publish", os.path.basename(path)))
+            return real_publish(path, text)
+
+        run_out = io.StringIO()
+        run_err = ObservedErrors()
+        with mock.patch.object(connectors, "resolve", return_value=WarnedConnector):
+            with mock.patch.object(
+                runner.session_module, "publish", side_effect=observed_publish
+            ):
+                with mock.patch("sys.stdout", run_out), mock.patch(
+                    "sys.stderr", run_err
+                ), mock.patch("sys.stdin", io.StringIO("A warned request.\n")):
+                    self.assertEqual(
+                        cli.main(["run", "--session", session_dir]),
+                        0,
+                    )
+
+        self.assertEqual(
+            events[:3],
+            [
+                ("warning", "Warning: first concrete boundary\n"),
+                ("warning", "Warning: second concrete boundary\n"),
+                ("publish", "0001-initiator-to-peer.md"),
+            ],
+        )
+        self.assertEqual(events[3], ("publish", "0002-peer-to-initiator.md"))
+        self.assertTrue(run_out.getvalue().strip().endswith("0002-peer-to-initiator.md"))
+
+    def test_missing_software_authentication_and_mechanics_remain_failures(self):
+        with mock.patch.object(connectors.shutil, "which", return_value=None):
+            with self.assertRaises(BridgeError) as caught:
+                connectors.executable("missing-peer")
+        self.assertEqual(caught.exception.failure, Failure.MISSING_CLI)
+
+        authentication_checks = (
+            (
+                "claude",
+                lambda: claude._signed_in(
+                    CompletedCall(0, '{"loggedIn": false}', "")
+                ),
+            ),
+            (
+                "hermes",
+                lambda: hermes._signed_in(
+                    CompletedCall(0, "not logged in\n", "")
+                ),
+            ),
+        )
+        for name, check in authentication_checks:
+            with self.subTest(authentication=name):
+                with self.assertRaises(BridgeError) as caught:
+                    check()
+                self.assertEqual(
+                    caught.exception.failure, Failure.AUTHENTICATION_REQUIRED
+                )
+
+        with mock.patch.object(zcode, "_modified", return_value=None):
+            with self.assertRaises(BridgeError) as caught:
+                zcode._sign_in_facts()
+        self.assertEqual(caught.exception.failure, Failure.AUTHENTICATION_REQUIRED)
+
+        codex_calls = (
+            CompletedCall(0, "codex-cli 0.147.0\n", ""),
+            CompletedCall(1, "", "not logged in"),
+        )
+        with mock.patch.object(
+            codex.connectors, "executable", return_value="/fake/codex"
+        ), mock.patch.object(
+            codex.connectors,
+            "qualified_platform",
+            return_value="Darwin 26 arm64",
+        ), mock.patch.object(codex.connectors, "probe", side_effect=codex_calls):
+            with self.assertRaises(BridgeError) as caught:
+                codex.check(peer.Deadline(30.0), self.temp)
+        self.assertEqual(caught.exception.failure, Failure.AUTHENTICATION_REQUIRED)
+
+        qualification = connectors.Qualification(
+            "fake-peer",
+            ("1.2.3",),
+            "Darwin",
+            ("26",),
+            ("arm64",),
+            ("--required",),
+        )
+        with self.assertRaises(BridgeError) as caught:
+            connectors.qualified_version("no readable release", qualification, [])
+        self.assertEqual(caught.exception.failure, Failure.UNREPORTABLE_VERSION)
+
+        for help_call in (
+            CompletedCall(3, "", "help failed"),
+            CompletedCall(0, "--some-other-switch", ""),
+        ):
+            with self.subTest(help=help_call):
+                with self.assertRaises(BridgeError) as caught:
+                    connectors.qualified_restrictions(help_call, qualification)
+                self.assertEqual(
+                    caught.exception.failure, Failure.RESTRICTIONS_UNAVAILABLE
+                )
+
+    def test_existing_connectors_warn_about_surviving_configuration(self):
+        for phrase in (
+            "$CODEX_HOME/config.toml",
+            "Trusted-project .codex/config.toml",
+            "project hooks or rules",
+            "system configuration",
+            "managed_config.toml",
+            "requirements.toml",
+            "cloud-delivered requirements",
+            "macOS MDM",
+            "user/global hooks or rules",
+            "managed defaults",
+            "MCP",
+            "telemetry",
+        ):
+            self.assertIn(phrase, codex.WARNING)
+
+        plugin_listing = CompletedCall(
+            0,
+            '{"plugins":[{"id":"exposed","enabled":true,'
+            '"declaredMcpServerNames":["route"],"hookDetails":[{}]}]}',
+            "",
+        )
+        with mock.patch.object(
+            zcode.connectors, "probe", return_value=plugin_listing
+        ):
+            plugin_fact = zcode._plugin_fact(
+                "/fake/node", "/fake/zcode", peer.Deadline(30.0), self.temp
+            )
+        self.assertIn("exposed", plugin_fact)
+        self.assertIn("MCP server route", plugin_fact)
+        self.assertIn("hook", plugin_fact)
+
+        with mock.patch.object(zcode, "_modified", side_effect=(100.0, 50.0)):
+            sign_in_fact = zcode._sign_in_facts()
+        self.assertIn("sign-in itself is not confirmed", sign_in_fact)
+
+        for phrase in (
+            "courier-only",
+            "user memory can remain",
+            "one --oneshot argument",
+            "visible to other processes",
+        ):
+            self.assertIn(phrase, hermes.WARNING)
+
+    def test_readiness_distinguishes_confirmed_and_unconfirmed_authentication(self):
+        confirmed = (
+            (
+                codex,
+                ("/fake/codex", "0.147.0", "Darwin 26 arm64", ()),
+            ),
+            (
+                claude,
+                (
+                    "/fake/claude",
+                    "2.1.251",
+                    "Darwin 26 arm64",
+                    "signed in through claude.ai",
+                    (),
+                ),
+            ),
+            (
+                hermes,
+                (
+                    "/fake/hermes",
+                    "0.18.2",
+                    "Darwin 26 arm64",
+                    "signed in to the Nous Portal",
+                    (),
+                ),
+            ),
+        )
+        for connector, prerequisite in confirmed:
+            with self.subTest(confirmed=connector.HARNESS_ID), mock.patch.object(
+                connector, "_prerequisites", return_value=prerequisite
+            ):
+                checked = connector.check(peer.Deadline(30.0), self.temp)
+                self.assertTrue(
+                    checked.message.startswith(
+                        "{0} is ready:".format(connector.HARNESS_ID)
+                    ),
+                    checked.message,
+                )
+                self.assertNotIn("authentication is unconfirmed", checked.message)
+
+        unconfirmed = (
+            (zcode, "minimum local configuration is present"),
+            (minimax, "no state-free status command"),
+            (qwen, "no safe status command"),
+        )
+        for connector, authentication in unconfirmed:
+            prerequisite = (
+                "/fake/{0}".format(connector.HARNESS_ID),
+                "1.2.3",
+                "Darwin 26 arm64",
+                authentication,
+                (),
+            )
+            with self.subTest(unconfirmed=connector.HARNESS_ID), mock.patch.object(
+                connector, "_prerequisites", return_value=prerequisite
+            ):
+                checked = connector.check(peer.Deadline(30.0), self.temp)
+                self.assertTrue(
+                    checked.message.startswith(
+                        "{0} mechanics are ready, but live authentication is "
+                        "unconfirmed:".format(connector.HARNESS_ID)
+                    ),
+                    checked.message,
+                )
+                self.assertIn(authentication, checked.message)
+
+    def test_minimax_uses_only_its_two_safe_checks_and_exact_courier_vector(self):
+        probed = []
+
+        def probe(argv, cwd, deadline, env=None):
+            probed.append(tuple(argv))
+            if tuple(argv)[-1] == "--version":
+                return CompletedCall(0, "mcode 0.2.8\n", "")
+            return CompletedCall(
+                0,
+                " ".join(minimax.QUALIFICATION.restrictions),
+                "",
+            )
+
+        with mock.patch.object(
+            minimax.connectors, "executable", return_value="/fake/mcode"
+        ), mock.patch.object(minimax.connectors, "probe", side_effect=probe), mock.patch.object(
+            connectors.platform, "system", return_value="Linux"
+        ), mock.patch.object(
+            connectors.platform, "mac_ver", return_value=("", ("", "", ""), "")
+        ), mock.patch.object(
+            connectors.platform, "release", return_value="6.8.0"
+        ), mock.patch.object(
+            connectors.platform, "machine", return_value="x86_64"
+        ):
+            checked = minimax.check(peer.Deadline(30.0), self.temp)
+
+        self.assertIn(
+            "minimax mechanics are ready, but live authentication is "
+            "unconfirmed: version 0.2.8",
+            checked.message,
+        )
+        self.assertEqual(
+            probed,
+            [
+                ("/fake/mcode", "--version"),
+                ("/fake/mcode", "exec", "--help"),
+            ],
+        )
+        self.assertTrue(all("provider" not in " ".join(call) for call in probed))
+        self.assertGreaterEqual(
+            sum("outside the release evidence" in warning for warning in checked.warnings),
+            2,
+        )
+        self.assertTrue(
+            any("authentication" in warning.lower() for warning in checked.warnings)
+        )
+        for phrase in (
+            "discretionary permission mode",
+            "not a sandbox",
+            "--max-steps=1 limits assistant steps",
+            "does not disable tools",
+            "ask is interactive",
+            "full bypasses",
+            "off disables permission checks",
+        ):
+            self.assertIn(phrase, minimax.WARNING)
+
+        prerequisite = (
+            "/fake/mcode",
+            "0.2.7",
+            "Darwin 26 arm64",
+            "authentication not confirmed",
+            (minimax.WARNING,),
+        )
+        with mock.patch.object(minimax, "_prerequisites", return_value=prerequisite):
+            command = minimax.build_command(peer.Deadline(30.0), self.temp)
+            huge = minimax.build_command(
+                peer.Deadline(
+                    minimax.MAX_NATIVE_TIMEOUT_MILLISECONDS / 1000.0 + 1.0
+                ),
+                self.temp,
+            )
+            astronomical = minimax.build_command(
+                peer.Deadline(1e308), self.temp
+            )
+        self.assertEqual(
+            command.argv,
+            (
+                "/fake/mcode",
+                "exec",
+                "--input",
+                "-",
+                "--input-format",
+                "text",
+                "--cwd",
+                self.temp,
+                "--permission",
+                "smart",
+                "--timeout",
+                "30000ms",
+                "--max-steps",
+                "1",
+                "--output-format",
+                "text",
+            ),
+        )
+        self.assertIsNone(command.body_argument)
+        self.assertEqual(command.warnings, (minimax.WARNING,))
+        self.assertFalse(
+            any(value in command.argv for value in ("ask", "full", "off"))
+        )
+        self.assertNotIn("--timeout", huge.argv)
+        self.assertNotIn("--timeout", astronomical.argv)
+        self.assertIn("--max-steps", huge.argv)
+
+    def _qwen_prerequisite(self):
+        return (
+            "/fake/qwen",
+            "0.23.0",
+            "Darwin 26 arm64",
+            "authentication not confirmed",
+            (qwen.INPUT_WARNING, qwen.BOUNDARY_WARNING),
+        )
+
+    def test_qwen_surfaces_the_input_exception_and_exact_zero_tool_vector(self):
+        with mock.patch.object(
+            qwen, "_prerequisites", return_value=self._qwen_prerequisite()
+        ), mock.patch.dict(
+            os.environ,
+            {
+                "QWEN_SANDBOX": "false",
+                "SANDBOX": "already-inside",
+                "SEATBELT_PROFILE": "permissive-open",
+                "QWEN_SANDBOX_PROXY_COMMAND": "detached proxy command",
+                "NO_BROWSER": "0",
+                "HTTPS_PROXY": "http://provider-proxy.invalid",
+            },
+        ):
+            checked = qwen.check(peer.Deadline(30.0), self.temp)
+            commands = {
+                seconds: qwen.build_command(peer.Deadline(seconds), self.temp)
+                for seconds in (
+                    45.0,
+                    900.0,
+                    12.25,
+                    qwen.MAX_NATIVE_WALL_TIME_SECONDS + 1.0,
+                    1e308,
+                )
+            }
+
+        command = commands[900.0]
+
+        self.assertEqual(
+            checked.warnings,
+            (qwen.INPUT_WARNING, qwen.BOUNDARY_WARNING),
+        )
+        self.assertTrue(
+            checked.message.startswith(
+                "qwen mechanics are ready, but live authentication is unconfirmed:"
+            )
+        )
+        self.assertEqual(command.warnings, checked.warnings)
+        for phrase in (
+            "leading / commands",
+            "unescaped @ references",
+            "both text and stream-json",
+            "alter or replace the effective prompt",
+            "inject readable file or resource content",
+            "complete a command without a model call",
+            "Safe mode does not disable",
+            "no lossless raw escape or switch",
+            "before --max-tool-calls=0",
+            "budget does not stop it",
+            "pre-model command families",
+            "/bug, /config, /update, /import-config, /language, /effort, "
+            "/model, and /doctor",
+            "write diagnostics",
+            "installer rollback",
+            "Other recognized slash-command preprocessing remains enabled",
+        ):
+            self.assertIn(phrase, qwen.INPUT_WARNING)
+        self.assertIn("first such attempt", qwen.BOUNDARY_WARNING)
+        self.assertIn("bundled skills still load", qwen.BOUNDARY_WARNING)
+        self.assertNotIn("extensions, skills", qwen.BOUNDARY_WARNING)
+        self.assertEqual(
+            command.argv,
+            (
+                "/fake/qwen",
+                "--safe-mode",
+                "--sandbox=sandbox-exec",
+                "--chat-recording=false",
+                "--approval-mode=plan",
+                "--disabled-slash-commands="
+                "bug,config,update,import-config,language,effort,model,doctor",
+                "--max-tool-calls=0",
+                "--max-session-turns=1",
+                "--max-wall-time=900s",
+                "--input-format=text",
+                "--output-format=json",
+                "--openai-logging=false",
+            ),
+        )
+        self.assertIn("--max-wall-time=45s", commands[45.0].argv)
+        self.assertIn("--max-wall-time=900s", commands[900.0].argv)
+        self.assertIn("--max-wall-time=13s", commands[12.25].argv)
+        self.assertFalse(
+            any(
+                argument.startswith("--max-wall-time")
+                for argument in commands[
+                    qwen.MAX_NATIVE_WALL_TIME_SECONDS + 1.0
+                ].argv
+            )
+        )
+        self.assertFalse(
+            any(
+                argument.startswith("--max-wall-time")
+                for argument in commands[1e308].argv
+            )
+        )
+        self.assertIsNone(command.body_argument)
+        self.assertIs(command.response_parser, qwen.parse_response)
+        self.assertEqual(command.stdin_body_limit, 8 * 1024 * 1024)
+        environment = dict(command.env)
+        self.assertEqual(
+            environment["QWEN_RUNTIME_DIR"],
+            os.path.join(self.temp, qwen.RUNTIME_DIRECTORY),
+        )
+        self.assertEqual(environment["QWEN_TELEMETRY_ENABLED"], "0")
+        self.assertEqual(environment["QWEN_USAGE_STATISTICS_ENABLED"], "0")
+        self.assertEqual(environment["NODE_DISABLE_COMPILE_CACHE"], "1")
+        self.assertEqual(environment["NO_BROWSER"], "1")
+        self.assertEqual(environment["SEATBELT_PROFILE"], "restrictive-open")
+        self.assertEqual(
+            environment["HTTPS_PROXY"], "http://provider-proxy.invalid"
+        )
+        for name in (
+            "QWEN_SANDBOX",
+            "SANDBOX",
+            "QWEN_SANDBOX_PROXY_COMMAND",
+        ):
+            self.assertNotIn(name, environment)
+        self.assertFalse(
+            any(
+                argument.startswith("--model")
+                or argument.startswith("--provider")
+                for argument in command.argv
+            )
+        )
+
+    def test_qualification_vector_distinguishes_stdin_from_bound_arguments(self):
+        qwen_prerequisite = self._qwen_prerequisite()
+        hermes_prerequisite = (
+            "/fake/hermes",
+            "0.18.2",
+            "Darwin 26 arm64",
+            "signed in to the Nous Portal",
+            (hermes.WARNING,),
+        )
+        with mock.patch.object(
+            qwen, "_prerequisites", return_value=qwen_prerequisite
+        ):
+            qwen_command = qwen.build_command(peer.Deadline(120.0), self.temp)
+            stdin_vector = release_conformance._restriction_vector(
+                "qwen", self.temp
+            )
+        with mock.patch.object(
+            hermes, "_prerequisites", return_value=hermes_prerequisite
+        ):
+            hermes_command = hermes.build_command(
+                peer.Deadline(120.0), self.temp
+            )
+            bound_vector = release_conformance._restriction_vector(
+                "hermes", self.temp
+            )
+
+        self.assertEqual(
+            stdin_vector,
+            "argv={0}; stdin=<BODY>".format(repr(qwen_command.argv)),
+        )
+        self.assertEqual(
+            bound_vector,
+            repr(
+                hermes_command.argv
+                + (hermes.BODY_ARGUMENT + "<BODY>",)
+            ),
+        )
+
+    def test_qwen_accepts_only_a_successful_terminal_json_result(self):
+        self.assertEqual(
+            qwen.parse_response(
+                '[{"type":"assistant","message":"ignored"},'
+                '{"type":"result","subtype":"success","is_error":false,'
+                '"result":"Final caf\\u00e9\\n"}]'
+            ),
+            "Final caf\u00e9\n",
+        )
+        invalid = (
+            "not JSON",
+            "[]",
+            '[{"type":"assistant","message":"not terminal result"}]',
+            '[{"type":"result","subtype":"error","is_error":true,'
+            '"error":{"message":"failed"}}]',
+            '[{"type":"result","subtype":"success","is_error":false}]',
+        )
+        for output in invalid:
+            with self.subTest(output=output):
+                with self.assertRaises(BridgeError) as caught:
+                    qwen.parse_response(output)
+                self.assertEqual(caught.exception.failure, Failure.PEER_FAILURE)
+
+    def test_qwen_oversized_standard_input_is_refused_before_warning_or_request(self):
+        session_dir = os.path.join(self.temp, "qwen-oversized")
+        record.record(
+            session_dir,
+            "session-create",
+            "Qwen input bound.\n",
+            initiator="ordinary.app",
+            peer="qwen",
+        )
+        warned = []
+        with mock.patch.object(
+            qwen, "_prerequisites", return_value=self._qwen_prerequisite()
+        ):
+            with self.assertRaises(BridgeError) as caught:
+                runner.run_turn(
+                    session_dir,
+                    "x" * (qwen.STDIN_BODY_LIMIT + 1),
+                    30.0,
+                    build_command=qwen.build_command,
+                    warning_writer=warned.append,
+                )
+        self.assertEqual(caught.exception.failure, Failure.USAGE_ERROR)
+        self.assertIn("silently truncates", str(caught.exception))
+        self.assertIn(str(qwen.STDIN_BODY_LIMIT), str(caught.exception))
+        self.assertEqual(warned, [])
+        self.assertEqual(os.listdir(session.messages_dir(session_dir)), [])
+
+    def test_qualification_prompts_are_local_only_and_qwen_claims_no_raw_input(self):
+        token = "abc123"
+        evidence = "PROJECT_READ_CANARY={0}".format(token)
+        outside = "/a/path-that-must-not-be-supplied"
+
+        for target in ("codex", "claude", "zcode"):
+            with self.subTest(project_target=target):
+                body = release_conformance._qualification_body(
+                    target, outside, token, evidence
+                )
+                self.assertIn("Inside the supplied disposable repository", body)
+                self.assertIn("Do not attempt any browser or web access", body)
+                self.assertNotIn(outside, body)
+
+        for target in ("hermes", "minimax"):
+            with self.subTest(courier_target=target):
+                body = release_conformance._qualification_body(
+                    target, outside, token, evidence
+                )
+                self.assertIn("Do not try to read a project", body)
+                self.assertIn("Make no file, shell, Git", body)
+                self.assertNotIn(outside, body)
+
+        qwen_body = release_conformance._qualification_body(
+            "qwen", outside, token, evidence
+        )
+        self.assertNotIn("/", qwen_body)
+        self.assertNotIn("@", qwen_body)
+        self.assertNotIn("raw", qwen_body.lower())
+        self.assertNotIn("TRANSPORT_ECHO", qwen_body)
+        self.assertNotIn("LEADING_HYPHEN_ECHO", qwen_body)
+        self.assertIn("Do not try any tool", qwen_body)
+        self.assertNotIn(outside, qwen_body)
+
+        response = "response-qwen-{0}".format(token)
+        response_text = session.peer_to_initiator_text(
+            2,
+            "qwen",
+            "release-qualification",
+            "QUALIFICATION_RESPONSE: {0}\nCOMPLETE: {0}\n".format(response),
+        )
+        self.assertEqual(
+            release_conformance._check_response(
+                "qwen", response_text, token, evidence
+            ),
+            {},
+        )
+
+
+class QualificationUsesProductionController(unittest.TestCase):
+    """Qualification reuses the public CLI and its one production process owner."""
+
+    def setUp(self):
+        self.temp = tempfile.mkdtemp(prefix="agent-bridge-qualifier-")
+
+    def tearDown(self):
+        shutil.rmtree(self.temp, ignore_errors=True)
+
+    def test_public_bridge_invokes_the_public_cli_in_process(self):
+        observed = {}
+
+        def public_main(arguments):
+            observed["arguments"] = tuple(arguments)
+            observed["body"] = sys.stdin.read()
+            sys.stdout.write("public output\n")
+            sys.stderr.write("public warning\n")
+            return 7
+
+        with mock.patch.object(
+            release_conformance.cli, "main", side_effect=public_main
+        ):
+            completed = release_conformance._public_bridge(
+                ("run", "--session", "/disposable/session"),
+                "stdin-only qualification body\n",
+            )
+
+        self.assertEqual(
+            observed["arguments"],
+            ("run", "--session", "/disposable/session"),
+        )
+        self.assertEqual(observed["body"], "stdin-only qualification body\n")
+        self.assertEqual(completed.returncode, 7)
+        self.assertEqual(completed.stdout, "public output\n")
+        self.assertEqual(completed.stderr, "public warning\n")
+
+    def test_public_bridge_captures_a_normal_bridge_failure(self):
+        completed = release_conformance._public_bridge(
+            ("check", "--peer", "other"),
+            "",
+        )
+
+        self.assertEqual(completed.returncode, 1)
+        self.assertEqual(completed.stdout, "")
+        self.assertIn("not one of the six", completed.stderr)
+        self.assertIn("Next action:", completed.stderr)
+
+    def test_qualification_combines_original_failure_with_final_inspection(self):
+        captured = {}
+        real_synthetic = release_conformance._synthetic_repository
+
+        def synthetic(parent, token):
+            project, evidence = real_synthetic(parent, token)
+            captured["parent"] = parent
+            captured["project"] = project
+            return project, evidence
+
+        def create_session(session_dir, peer_id, body, project=None):
+            record.record(
+                session_dir,
+                "session-create",
+                body,
+                initiator="release-qualification",
+                peer=peer_id,
+                project=project,
+            )
+
+        def fail_after_mutation(arguments, body):
+            with open(
+                os.path.join(captured["project"], "unexpected.txt"),
+                "w",
+                encoding="utf-8",
+            ) as stream:
+                stream.write("mutation that final inspection must report\n")
+            with open(
+                os.path.join(captured["project"], ".git", "index.lock"),
+                "w",
+                encoding="utf-8",
+            ) as stream:
+                stream.write("stale lock\n")
+            raise release_conformance.ConformanceError("primary launcher failure")
+
+        output = io.StringIO()
+        with mock.patch.object(
+            release_conformance,
+            "_synthetic_repository",
+            side_effect=synthetic,
+        ), mock.patch.object(
+            release_conformance,
+            "_restriction_vector",
+            return_value="fixed vector",
+        ), mock.patch.object(
+            release_conformance,
+            "_create_session",
+            side_effect=create_session,
+        ), mock.patch.object(
+            release_conformance,
+            "_public_bridge",
+            side_effect=fail_after_mutation,
+        ), mock.patch.object(
+            release_conformance,
+            "_inspect_post_call_state",
+            wraps=release_conformance._inspect_post_call_state,
+        ) as inspected, contextlib.redirect_stdout(output):
+            with self.assertRaises(
+                release_conformance.ConformanceError
+            ) as caught:
+                release_conformance.qualify("codex")
+
+        failure = str(caught.exception)
+        self.assertIn("original failure: primary launcher failure", failure)
+        self.assertIn("repository untracked changed", failure)
+        self.assertIn("synthetic repository is not clean", failure)
+        self.assertIn("Git lock files survived", failure)
+        self.assertEqual(inspected.call_count, 1)
+        self.assertIn("production bounded process-group controller", output.getvalue())
+        self.assertFalse(os.path.exists(captured["parent"]))
+
+
 class FormatTwoRecords(unittest.TestCase):
     """The immutable session, neutral note, strict reader, and closed kinds."""
 
@@ -1658,32 +2606,46 @@ class CommandLineBody(unittest.TestCase):
     def test_a_courier_only_peer_is_refused_a_project_before_anything_starts(
         self,
     ):
-        """The immutable session is refused before a connector process starts."""
-        project_session = os.path.join(self.temp, "project-session")
-        record.record(
-            project_session,
-            "session-create",
-            "This target cannot receive a project.\n",
-            initiator="sample-app",
-            peer="hermes",
-            project=self.temp,
-        )
-        captured = io.StringIO()
-        with mock.patch("sys.stderr", captured):
-            with mock.patch("sys.stdin", io.StringIO("A question.\n")):
-                status = cli.main(
-                    [
-                        "run",
-                        "--session",
-                        project_session,
-                    ]
+        """All three courier targets fail before connector import or publication."""
+        for peer_id in ("hermes", "minimax", "qwen"):
+            with self.subTest(peer=peer_id):
+                project_session = os.path.join(
+                    self.temp, "project-session-{0}".format(peer_id)
                 )
-        self.assertEqual(status, 1)
-        self.assertIn("project for hermes", captured.getvalue())
-        self.assertIn("Next action:", captured.getvalue())
-        self.assertEqual(
-            sorted(os.listdir(session.messages_dir(project_session))), []
-        )
+                record.record(
+                    project_session,
+                    "session-create",
+                    "This target cannot receive a project.\n",
+                    initiator="sample-app",
+                    peer=peer_id,
+                    project=self.temp,
+                )
+                captured = io.StringIO()
+                with mock.patch.object(
+                    runner.connectors,
+                    "resolve",
+                    side_effect=AssertionError(
+                        "courier project refusal reached connector resolution"
+                    ),
+                ):
+                    with mock.patch("sys.stderr", captured), mock.patch(
+                        "sys.stdin", io.StringIO("A question.\n")
+                    ):
+                        status = cli.main(
+                            [
+                                "run",
+                                "--session",
+                                project_session,
+                            ]
+                        )
+                self.assertEqual(status, 1)
+                self.assertIn(
+                    "project for {0}".format(peer_id), captured.getvalue()
+                )
+                self.assertIn("Next action:", captured.getvalue())
+                self.assertEqual(
+                    sorted(os.listdir(session.messages_dir(project_session))), []
+                )
 
     def test_command_surface_rejects_removed_run_and_record_arguments(self):
         removed = (
