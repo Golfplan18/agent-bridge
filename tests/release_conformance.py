@@ -18,6 +18,7 @@ import ast
 import contextlib
 import hashlib
 import io
+import json
 import os
 import re
 import shutil
@@ -508,6 +509,8 @@ QUALIFICATION_OUTCOMES = (
     "SHELL_EFFECT",
 )
 
+QUALIFICATION_EXCERPT_BYTES = 512
+
 
 def _process(
     argv: Sequence[str],
@@ -891,6 +894,10 @@ def _qualification_body(peer: str, project: str, token: str, evidence: str) -> s
         "This body is multiline and contains Unicode: caf\u00e9, \u03a9, \u96ea.\n"
         "{evidence_instruction}\n\n"
         "{effect_instruction}\n"
+        "Return every response field requested anywhere in this message "
+        "exactly once. For a project target, that includes every local-effect "
+        "label above. Also return each field in the following six-line block "
+        "exactly once; do not repeat any field.\n"
         "QUALIFICATION_RESPONSE: {response}\n"
         "LEADING_HYPHEN_ECHO: --- agent-bridge-leading-hyphen-canary\n"
         "TRANSPORT_ECHO: {transport}\n"
@@ -920,6 +927,52 @@ def _field(text: str, name: str) -> str:
     matches = re.findall(r"^{0}:\s*(.+)$".format(re.escape(name)), text, re.MULTILINE)
     _require(len(matches) == 1, "the response does not contain exactly one {0}".format(name))
     return matches[0].strip()
+
+
+def _response_field_names(peer: str) -> Tuple[str, ...]:
+    """The strict response fields relevant to this target's qualification."""
+    fields = (
+        "QUALIFICATION_RESPONSE",
+        "LEADING_HYPHEN_ECHO",
+        "TRANSPORT_ECHO",
+        "READ_EVIDENCE",
+        "BODY_END_ECHO",
+        "COMPLETE",
+    )
+    if peer == "qwen":
+        return ("QUALIFICATION_RESPONSE", "COMPLETE")
+    if peer in PROJECT_TARGETS:
+        return fields[:1] + QUALIFICATION_OUTCOMES + fields[1:]
+    return fields
+
+
+def _response_mismatch_diagnostic(peer: str, response_text: str) -> str:
+    """Bounded evidence for a strict response-field mismatch."""
+    encoded = response_text.encode("utf-8")
+    clipped = encoded[:QUALIFICATION_EXCERPT_BYTES].decode(
+        "utf-8", "replace"
+    )
+    counts = []
+    for name in _response_field_names(peer):
+        count = len(
+            re.findall(
+                r"^{0}:".format(re.escape(name)),
+                response_text,
+                re.MULTILINE,
+            )
+        )
+        counts.append("{0}={1}".format(name, count))
+    suffix = ", truncated" if len(encoded) > QUALIFICATION_EXCERPT_BYTES else ""
+    return (
+        "qualification response diagnostic: bytes={0}; sha256={1}; "
+        "field occurrences: {2}; escaped excerpt={3}{4}"
+    ).format(
+        len(encoded),
+        hashlib.sha256(encoded).hexdigest(),
+        ", ".join(counts),
+        json.dumps(clipped, ensure_ascii=True),
+        suffix,
+    )
 
 
 def _check_response(
@@ -1184,7 +1237,16 @@ def qualify(peer: str) -> None:
             "the public run did not publish exactly one request and one response",
         )
         response_text = _read(response_path)
-        outcomes = _check_response(peer, response_text, token, evidence)
+        try:
+            outcomes = _check_response(peer, response_text, token, evidence)
+        except ConformanceError:
+            # This is deliberately emitted before final inspection and removal
+            # of the disposable parent, so a malformed synthetic answer can be
+            # diagnosed even though qualification still cleans up everything.
+            sys.stderr.write(
+                _response_mismatch_diagnostic(peer, response_text) + "\n"
+            )
+            raise
 
         evidence_lines.extend(
             (

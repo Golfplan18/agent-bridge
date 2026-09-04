@@ -28,7 +28,10 @@ the working directory the process was started in. And it refuses the
 permission mode that would bypass permission checks altogether.
 Administrator-managed endpoint and remote policy deliberately survive this
 mode, so the connector observes their presence or uncertainty without opening
-policy values and reports that boundary as a warning.
+policy values and reports that boundary as a warning. The exact
+``managed-mcp.json`` source is different: this CLI exits when strict MCP is
+combined with it, so its presence or an unreadable pathname is refused before
+request publication.
 
 `--strict-mcp-config` says to use only the MCP servers named by `--mcp-config`.
 No `--mcp-config` is passed, so that set is empty: the turn reaches no MCP
@@ -148,9 +151,41 @@ def _managed_source_paths() -> Tuple[str, str, str, str, str]:
     )
 
 
+def _require_managed_mcp_absent() -> None:
+    """Refuse the exact managed MCP source that strict mode cannot override.
+
+    Claude Code 2.1.251 exits when ``--strict-mcp-config`` is combined with
+    this source. Presence therefore makes the fixed call unusable rather than
+    merely less confined. ``lstat`` establishes presence without following a
+    link or opening policy contents; uncertainty must fail for the same reason.
+    """
+    managed_mcp = _managed_source_paths()[2]
+    try:
+        os.lstat(managed_mcp)
+    except OSError as exc:
+        if exc.errno in (errno.ENOENT, errno.ENOTDIR):
+            return
+        raise BridgeError(
+            Failure.RESTRICTIONS_UNAVAILABLE,
+            detail=(
+                "the managed MCP source at {0} could not be safely inspected "
+                "without opening it ({1}); Claude Code's strict MCP call "
+                "cannot be relied on"
+            ).format(managed_mcp, exc.__class__.__name__),
+        )
+    raise BridgeError(
+        Failure.RESTRICTIONS_UNAVAILABLE,
+        detail=(
+            "the managed MCP source is present at {0}; Claude Code exits when "
+            "--strict-mcp-config is used, so no request was published; policy "
+            "contents were not opened"
+        ).format(managed_mcp),
+    )
+
+
 def _endpoint_managed_settings_fact() -> str:
-    """Describe endpoint policy presence without opening a policy value."""
-    settings, drop_ins, managed_mcp, user_plist, device_plist = (
+    """Describe the other endpoint policy sources without opening values."""
+    settings, drop_ins, _managed_mcp, user_plist, device_plist = (
         _managed_source_paths()
     )
 
@@ -169,7 +204,7 @@ def _endpoint_managed_settings_fact() -> str:
         return True
 
     present = []
-    for path in (settings, managed_mcp, user_plist, device_plist):
+    for path in (settings, user_plist, device_plist):
         if present_or_unknown(path):
             present.append(path)
 
@@ -284,11 +319,12 @@ def _prerequisites(
 ) -> Tuple[str, str, str, str, Tuple[str, ...]]:
     """Everything that has to be true before starting Claude Code is worth doing.
 
-    Five questions in order, each one cheap and none of them a model turn: is
-    the program here, is its version one this connector was tested against, is
-    this computer one it was tested on, is somebody signed in, and does the
-    installed version still have every switch the turn relies on. Any of them
-    failing raises, so nothing further happens.
+    Six questions in order, each one cheap and none of them a model turn: is
+    the program here, is the exact managed MCP source absent, is its version
+    one this connector was tested against, is this computer one it was tested
+    on, is somebody signed in, and does the installed version still have every
+    switch the turn relies on. Any of them failing raises, so nothing further
+    happens.
 
     Returns the four facts a readiness report needs and a turn uses: where the
     program is, which version answered, how this computer describes itself, and
@@ -296,6 +332,7 @@ def _prerequisites(
     """
     warnings = []  # type: List[str]
     program = connectors.executable(QUALIFICATION.cli_identity)
+    _require_managed_mcp_absent()
     version = connectors.qualified_version(
         connectors.probe((program, "--version"), cwd, deadline).stdout,
         QUALIFICATION,

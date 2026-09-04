@@ -11,8 +11,10 @@ SPDX-License-Identifier: Unlicense
 from __future__ import annotations
 
 import contextlib
+import json
 import math
 import os
+import re
 import shutil
 import tempfile
 from typing import Callable, Iterator, NamedTuple, Optional, Tuple
@@ -35,6 +37,75 @@ NEUTRAL_PREFIX = "agent-bridge-neutral-"
 # exposes this seam.
 CommandBuilder = Callable[[Deadline, str], PeerCommand]
 WarningWriter = Callable[[str], None]
+
+# Failure output is useful only when it is safe to show and small enough to
+# read. Remove echoed requests and common credential shapes before shortening
+# each stream's excerpt and escaping control characters. The byte count still
+# describes the original output.
+DIAGNOSTIC_EXCERPT_BYTES = 512
+_CREDENTIAL_LINE = re.compile(
+    r"(?i)(?:(?:api[_-]?key|access[_-]?token|refresh[_-]?token|"
+    r"authorization|password|secret|token)[\\\"']*\s*[:=]|bearer\s+\S+|"
+    r"(?:sk-[A-Za-z0-9_-]{8,}|gh[pousr]_[A-Za-z0-9]{8,})\b)"
+)
+
+
+def _redact_diagnostic(text: str, body: str) -> str:
+    """Suppress raw or JSON-escaped request and credential lines before clipping."""
+    fragments = []
+    for line in body.splitlines():
+        if not line:
+            continue
+        for fragment in (
+            line,
+            json.dumps(line, ensure_ascii=True)[1:-1],
+            json.dumps(line, ensure_ascii=False)[1:-1],
+        ):
+            if fragment not in fragments:
+                fragments.append(fragment)
+
+    redacted_lines = []
+    for line in text.splitlines(keepends=True):
+        ending = "\n" if line.endswith("\n") else ""
+        if any(fragment in line for fragment in fragments):
+            redacted_lines.append("<request body redacted>" + ending)
+        elif _CREDENTIAL_LINE.search(line):
+            redacted_lines.append("<credential line redacted>" + ending)
+        else:
+            redacted_lines.append(line)
+    return "".join(redacted_lines)
+
+
+def _diagnostic_excerpt(text: str, body: str) -> str:
+    """Describe one stream with a bounded, escaped, redacted excerpt."""
+    encoded = text.encode("utf-8")
+    redacted = _redact_diagnostic(text, body).encode("utf-8")
+    clipped = redacted[:DIAGNOSTIC_EXCERPT_BYTES].decode("utf-8", "replace")
+    escaped = json.dumps(clipped, ensure_ascii=True)
+    suffix = ", truncated" if len(redacted) > DIAGNOSTIC_EXCERPT_BYTES else ""
+    return "{0} bytes{1}, excerpt={2}".format(len(encoded), suffix, escaped)
+
+
+def _peer_failure_detail(call, command: PeerCommand, body: str) -> str:
+    """Keep safe evidence from both streams and any structured failure."""
+    parts = ["exit {0}".format(call.returncode)]
+    if command.response_parser is not None and call.stdout.strip():
+        try:
+            command.response_parser(call.stdout)
+        except BridgeError as parsed:
+            if parsed.failure == Failure.PEER_FAILURE:
+                parts.append(
+                    "structured stdout failure: {0}".format(
+                        _diagnostic_excerpt(parsed.detail or str(parsed), body)
+                    )
+                )
+    parts.extend(
+        (
+            "stderr: {0}".format(_diagnostic_excerpt(call.stderr, body)),
+            "stdout: {0}".format(_diagnostic_excerpt(call.stdout, body)),
+        )
+    )
+    return "; ".join(parts)
 
 
 def _remove_neutral(path: str, during: Optional[BaseException]) -> None:
@@ -207,13 +278,17 @@ def run_turn(
             if call.returncode != 0:
                 raise BridgeError(
                     Failure.PEER_FAILURE,
-                    detail="exit {0}: {1}".format(
-                        call.returncode, call.stderr.strip()
-                    ),
+                    detail=_peer_failure_detail(call, command, body),
                 )
             response = call.stdout
             if command.response_parser is not None:
-                response = command.response_parser(response)
+                try:
+                    response = command.response_parser(response)
+                except BridgeError as parsed:
+                    raise BridgeError(
+                        parsed.failure,
+                        detail=_diagnostic_excerpt(parsed.detail or str(parsed), body),
+                    ) from None
             if not response.strip():
                 raise BridgeError(Failure.EMPTY_RESPONSE, detail=command.argv[0])
 

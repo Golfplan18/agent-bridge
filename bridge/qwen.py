@@ -143,7 +143,9 @@ def parse_response(output: str) -> str:
         raise BridgeError(
             Failure.PEER_FAILURE,
             detail="qwen's final JSON result reported failure: {0}".format(
-                str(error or result.get("subtype") or "unknown")[:160]
+                # The runner removes echoed requests and credentials before
+                # shortening this diagnostic; partial echoes cannot be matched.
+                str(error or result.get("subtype") or "unknown")
             ),
         )
     text = result.get("result")

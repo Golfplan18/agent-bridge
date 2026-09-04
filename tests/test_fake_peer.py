@@ -63,6 +63,7 @@ from __future__ import annotations
 
 import contextlib
 import io
+import json
 import os
 import re
 import shutil
@@ -1065,8 +1066,69 @@ class TurnBehavior(unittest.TestCase):
         self.assertEqual(self._leftover_temporaries(), [])
 
     def test_nonzero_exit_publishes_no_response(self):
-        error = self._expect(Failure.PEER_FAILURE, "fail")
-        self.assertIn("deliberate failure", str(error))
+        body = (
+            'PRIVATE REQUEST "confidential caf\u00e9" \\ details '
+            + "request-content " * 50
+            + "PRIVATE END\n"
+        )
+        script = (
+            "import json, sys\n"
+            "body = sys.stdin.read()\n"
+            "prefix = 'vendor wrapper ' + 'p' * 400 + ': '\n"
+            "sys.stdout.write(prefix + body + 'stdout partial\\x00line\\n' + "
+            "'x' * 600 + 'UNBOUNDED TAIL')\n"
+            "sys.stderr.write('fake peer: deliberate failure\\n')\n"
+            "sys.stderr.write('OPENAI_API_KEY=opaqueApiValue\\n')\n"
+            "sys.stderr.write('ANTHROPIC_AUTH_TOKEN=opaqueAuthValue\\n')\n"
+            "sys.stderr.write(prefix + json.dumps(body) + '\\n')\n"
+            "sys.stderr.write('api_key=super-secret-token\\n')\n"
+            "sys.stderr.write('Bearer bearer-secret-value\\n')\n"
+            "sys.stderr.write('Authorization: Bearer header-opaque-secret\\n')\n"
+            "sys.stderr.write(json.dumps({"
+            "'api_key': 'json-secret-token', "
+            "'access_token': 'json-access-value', "
+            "'password': 'quoted-password-value'}) + '\\n')\n"
+            "sys.stderr.write(json.dumps(json.dumps({"
+            "'api_key': 'escaped-opaque-secret'})) + '\\n')\n"
+            "raise SystemExit(3)\n"
+        )
+
+        def build(deadline, cwd):
+            return PeerCommand(
+                argv=(sys.executable, "-c", script),
+                cwd=cwd,
+                env=tuple(os.environ.items()),
+            )
+
+        with self.assertRaises(BridgeError) as caught:
+            runner.run_turn(self.session_dir, body, 30.0, build)
+        error = caught.exception
+        rendered = str(error)
+        self.assertEqual(error.failure, Failure.PEER_FAILURE)
+        self.assertIn("deliberate failure", rendered)
+        self.assertIn("stderr:", rendered)
+        self.assertIn("stdout:", rendered)
+        self.assertIn("stdout partial\\u0000line\\n", rendered)
+        self.assertIn("truncated", rendered)
+        self.assertIn("request body redacted", rendered)
+        for private in (
+            "PRIVATE REQUEST",
+            "confidential",
+            "request-content",
+            "PRIVATE END",
+            "opaqueApiValue",
+            "opaqueAuthValue",
+            "super-secret-token",
+            "bearer-secret-value",
+            "header-opaque-secret",
+            "json-secret-token",
+            "json-access-value",
+            "quoted-password-value",
+            "escaped-opaque-secret",
+        ):
+            self.assertNotIn(private, rendered)
+        self.assertIn("credential line redacted", rendered)
+        self.assertNotIn("UNBOUNDED TAIL", rendered)
         self.assertEqual(self._messages(), ["0001-initiator-to-peer.md"])
 
     def test_no_output_at_all_publishes_no_response(self):
@@ -1318,7 +1380,7 @@ class TurnBehavior(unittest.TestCase):
 
 
 class ClaudeManagedSettingsReadiness(unittest.TestCase):
-    """Claude reports managed-policy facts without reading or refusing them."""
+    """Claude gates managed MCP and warns about other managed policy."""
 
     def setUp(self):
         self.temp = tempfile.mkdtemp(prefix="agent-bridge-claude-policy-")
@@ -1348,6 +1410,7 @@ class ClaudeManagedSettingsReadiness(unittest.TestCase):
         fact = claude._endpoint_managed_settings_fact()
         self.assertIn("no endpoint-managed", fact)
         self.assertIn("policy values were not opened", fact)
+        self.assertIsNone(claude._require_managed_mcp_absent())
 
     def test_each_endpoint_policy_shape_is_reported_by_path_alone(self):
         for index, path in enumerate(self.paths):
@@ -1360,18 +1423,66 @@ class ClaudeManagedSettingsReadiness(unittest.TestCase):
                 with open(path, "w", encoding="utf-8") as stream:
                     stream.write("a secret value this check must never parse")
 
+                if index == 2:
+                    session_dir = os.path.join(self.temp, "session")
+                    record.record(
+                        session_dir,
+                        "session-create",
+                        "Managed MCP must stop before publication.\n",
+                        initiator="ordinary.app",
+                        peer="claude",
+                    )
+                    with mock.patch.object(
+                        claude.connectors,
+                        "executable",
+                        return_value="/fake/claude",
+                    ), mock.patch.object(
+                        claude.connectors,
+                        "probe",
+                        side_effect=AssertionError(
+                            "managed MCP gate reached a Claude probe"
+                        ),
+                    ):
+                        with self.assertRaises(BridgeError) as run_failure:
+                            runner.run_turn(
+                                session_dir,
+                                "No request may be published.\n",
+                                30.0,
+                                build_command=claude.build_command,
+                            )
+                    self.assertEqual(
+                        run_failure.exception.failure,
+                        Failure.RESTRICTIONS_UNAVAILABLE,
+                    )
+                    self.assertIn(path, str(run_failure.exception))
+                    self.assertIn("--strict-mcp-config", str(run_failure.exception))
+                    self.assertNotIn("a secret value", str(run_failure.exception))
+                    self.assertEqual(
+                        os.listdir(session.messages_dir(session_dir)), []
+                    )
+                    continue
+
+                self.assertIsNone(claude._require_managed_mcp_absent())
                 fact = claude._endpoint_managed_settings_fact()
                 self.assertIn(path, fact)
                 self.assertIn("policy values were not opened", fact)
                 self.assertNotIn("a secret value", fact)
 
     def test_unreadable_endpoint_source_is_reported_as_unknown(self):
-        denied = PermissionError(13, "permission denied", self.paths[0])
-        with mock.patch.object(claude.os, "lstat", side_effect=denied):
+        with mock.patch.object(
+            claude.os, "lstat", side_effect=PermissionError(13, "permission denied")
+        ):
             fact = claude._endpoint_managed_settings_fact()
+            with self.assertRaises(BridgeError) as caught:
+                claude._require_managed_mcp_absent()
         self.assertIn("inspection was inconclusive", fact)
         self.assertIn(self.paths[0], fact)
         self.assertIn("policy values were not opened", fact)
+        self.assertEqual(
+            caught.exception.failure, Failure.RESTRICTIONS_UNAVAILABLE
+        )
+        self.assertIn(self.paths[2], str(caught.exception))
+        self.assertIn("could not be safely inspected", str(caught.exception))
 
     def test_every_readable_doctor_state_is_reported_without_refusal(self):
         deadline = peer.Deadline(30.0)
@@ -1994,13 +2105,28 @@ class SixTargetConnectorBehavior(unittest.TestCase):
         )
 
     def test_qwen_accepts_only_a_successful_terminal_json_result(self):
+        body = (
+            'PRIVATE QWEN "confidential caf\u00e9" \\ details '
+            + "request-content " * 50
+            + "PRIVATE END\n"
+        )
+        success_text = (
+            "Final caf\u00e9\n" + body
+            + "Authorization: Bearer successful-header-value\n"
+            + '{"api_key":"successful-response-value"}\n'
+        )
+        success_output = json.dumps([
+            {"type": "assistant", "message": "ignored"},
+            {
+                "type": "result",
+                "subtype": "success",
+                "is_error": False,
+                "result": success_text,
+            },
+        ])
         self.assertEqual(
-            qwen.parse_response(
-                '[{"type":"assistant","message":"ignored"},'
-                '{"type":"result","subtype":"success","is_error":false,'
-                '"result":"Final caf\\u00e9\\n"}]'
-            ),
-            "Final caf\u00e9\n",
+            qwen.parse_response(success_output),
+            success_text,
         )
         invalid = (
             "not JSON",
@@ -2015,6 +2141,119 @@ class SixTargetConnectorBehavior(unittest.TestCase):
                 with self.assertRaises(BridgeError) as caught:
                     qwen.parse_response(output)
                 self.assertEqual(caught.exception.failure, Failure.PEER_FAILURE)
+
+        structured_failure = json.dumps([{
+            "type": "result",
+            "subtype": "error",
+            "is_error": True,
+            "error": {
+                "message": (
+                    "provider quota exhausted\n" + "p" * 120 + body
+                    + '{"api_key":"structured-secret-value"}\n'
+                    + "x" * 600 + "STRUCTURED TAIL"
+                ),
+            },
+        }])
+        credential_failure = json.dumps([{
+            "type": "result", "subtype": "error", "is_error": True,
+            "error": (
+                "provider quota exhausted\n"
+                '{"api_key":"escaped-opaque-secret"}\n'
+            ),
+        }])
+        prefixed_credential_failure = json.dumps([{
+            "type": "result", "subtype": "error", "is_error": True,
+            "error": (
+                "provider quota exhausted\n"
+                "OPENAI_API_KEY=opaqueApiValue\n"
+                "ANTHROPIC_AUTH_TOKEN=opaqueAuthValue\n"
+            ),
+        }])
+        script = (
+            "import sys\n"
+            "sys.stdout.write(sys.argv[1])\n"
+            "sys.stderr.write('qwen exited after its structured result\\n')\n"
+            "raise SystemExit(int(sys.argv[2]))\n"
+        )
+        for name, output, exit_code in (
+            ("failure", structured_failure, 9),
+            ("credentials", credential_failure, 9),
+            ("prefixed-credentials", prefixed_credential_failure, 9),
+            ("success", success_output, 9),
+            ("failure", structured_failure, 0),
+            ("credentials", credential_failure, 0),
+            ("prefixed-credentials", prefixed_credential_failure, 0),
+            ("success", success_output, 0),
+        ):
+            with self.subTest(result=name, exit_code=exit_code):
+                session_dir = os.path.join(
+                    self.temp, "qwen-{0}-{1}".format(name, exit_code)
+                )
+                record.record(
+                    session_dir,
+                    "session-create",
+                    "Qwen parsed result.\n",
+                    initiator="ordinary.app",
+                    peer="qwen",
+                )
+
+                def build(deadline, cwd):
+                    return PeerCommand(
+                        argv=(sys.executable, "-c", script, output, str(exit_code)),
+                        cwd=cwd,
+                        env=tuple(os.environ.items()),
+                        response_parser=qwen.parse_response,
+                    )
+
+                if name == "success" and exit_code == 0:
+                    result = runner.run_turn(session_dir, body, 30.0, build)
+                    with open(result.response_path, "rb") as stream:
+                        self.assertEqual(
+                            stream.read(),
+                            session.peer_to_initiator_text(
+                                2, "qwen", "ordinary.app", success_text
+                            ).encode("utf-8"),
+                        )
+                    continue
+
+                with self.assertRaises(BridgeError) as caught:
+                    runner.run_turn(session_dir, body, 30.0, build)
+                rendered = str(caught.exception)
+                self.assertEqual(caught.exception.failure, Failure.PEER_FAILURE)
+                if name != "success":
+                    self.assertIn("provider quota exhausted", rendered)
+                    self.assertIn("credential line redacted", rendered)
+                if name == "failure":
+                    self.assertIn("truncated", rendered)
+                if exit_code != 0:
+                    self.assertIn("exit 9", rendered)
+                    self.assertIn("stderr:", rendered)
+                    self.assertIn("stdout:", rendered)
+                    if name != "success":
+                        self.assertIn("structured stdout failure", rendered)
+                for private in (
+                    "PRIVATE QWEN",
+                    "confidential",
+                    "request-content",
+                    "PRIVATE END",
+                    "structured-secret-value",
+                    "header-opaque-secret",
+                    "escaped-opaque-secret",
+                    "opaqueApiValue",
+                    "opaqueAuthValue",
+                    "successful-header-value",
+                    "successful-response-value",
+                    "STRUCTURED TAIL",
+                ):
+                    self.assertNotIn(private, rendered)
+                if name in ("credentials", "prefixed-credentials"):
+                    self.assertNotIn("request body redacted", rendered)
+                else:
+                    self.assertIn("request body redacted", rendered)
+                self.assertEqual(
+                    os.listdir(session.messages_dir(session_dir)),
+                    ["0001-initiator-to-peer.md"],
+                )
 
     def test_qwen_oversized_standard_input_is_refused_before_warning_or_request(self):
         session_dir = os.path.join(self.temp, "qwen-oversized")
@@ -2055,6 +2294,11 @@ class SixTargetConnectorBehavior(unittest.TestCase):
                 )
                 self.assertIn("Inside the supplied disposable repository", body)
                 self.assertIn("Do not attempt any browser or web access", body)
+                self.assertIn(
+                    "Return every response field requested anywhere in this "
+                    "message exactly once",
+                    body,
+                )
                 self.assertNotIn(outside, body)
 
         for target in ("hermes", "minimax"):
@@ -2064,6 +2308,11 @@ class SixTargetConnectorBehavior(unittest.TestCase):
                 )
                 self.assertIn("Do not try to read a project", body)
                 self.assertIn("Make no file, shell, Git", body)
+                self.assertIn(
+                    "Return every response field requested anywhere in this "
+                    "message exactly once",
+                    body,
+                )
                 self.assertNotIn(outside, body)
 
         qwen_body = release_conformance._qualification_body(
@@ -2164,6 +2413,98 @@ class QualificationUsesProductionController(unittest.TestCase):
         self.assertIn("Git lock files survived", failure)
         self.assertEqual(inspected.call_count, 1)
         self.assertIn("production bounded process-group controller", output.getvalue())
+        self.assertFalse(os.path.exists(captured["parent"]))
+
+        def malformed_response(arguments, body):
+            session_dir = arguments[arguments.index("--session") + 1]
+            record_data = session.read_session(session_dir)
+            request_path = session.message_path(
+                session_dir, 1, session.INITIATOR_TO_PEER_SUFFIX
+            )
+            session.publish(
+                request_path,
+                session.initiator_to_peer_text(
+                    1, record_data.initiator, record_data.peer, body
+                ),
+            )
+            response_body = (
+                "QUALIFICATION_RESPONSE: duplicate-one\n"
+                "QUALIFICATION_RESPONSE: duplicate-two\n"
+                "COMPLETE: synthetic-complete\n"
+                "CONTROL: \x00 caf\u00e9\n"
+                + "x" * 600
+                + "UNBOUNDED TAIL"
+            )
+            response_text = session.peer_to_initiator_text(
+                2, record_data.peer, record_data.initiator, response_body
+            )
+            response_path = session.message_path(
+                session_dir, 2, session.PEER_TO_INITIATOR_SUFFIX
+            )
+            session.publish(response_path, response_text)
+            captured["response_text"] = response_text
+            return release_conformance._BridgeCall(
+                0, response_path + "\n", "Warning: synthetic warning\n"
+            )
+
+        real_rmtree = release_conformance.shutil.rmtree
+
+        def observed_rmtree(path):
+            self.assertIn(
+                "qualification response diagnostic:", mismatch_errors.getvalue()
+            )
+            return real_rmtree(path)
+
+        mismatch_output = io.StringIO()
+        mismatch_errors = io.StringIO()
+        with mock.patch.object(
+            release_conformance,
+            "_synthetic_repository",
+            side_effect=synthetic,
+        ), mock.patch.object(
+            release_conformance,
+            "_restriction_vector",
+            return_value="fixed vector",
+        ), mock.patch.object(
+            release_conformance,
+            "_create_session",
+            side_effect=create_session,
+        ), mock.patch.object(
+            release_conformance,
+            "_public_bridge",
+            side_effect=malformed_response,
+        ), mock.patch.object(
+            release_conformance.shutil,
+            "rmtree",
+            side_effect=observed_rmtree,
+        ), contextlib.redirect_stdout(mismatch_output), contextlib.redirect_stderr(
+            mismatch_errors
+        ):
+            with self.assertRaises(
+                release_conformance.ConformanceError
+            ) as mismatch_failure:
+                release_conformance.qualify("codex")
+
+        self.assertIn(
+            "does not contain exactly one QUALIFICATION_RESPONSE",
+            str(mismatch_failure.exception),
+        )
+        diagnostic = mismatch_errors.getvalue()
+        response_bytes = captured["response_text"].encode("utf-8")
+        self.assertIn("bytes={0}".format(len(response_bytes)), diagnostic)
+        self.assertIn(
+            "sha256={0}".format(
+                release_conformance.hashlib.sha256(response_bytes).hexdigest()
+            ),
+            diagnostic,
+        )
+        self.assertIn("QUALIFICATION_RESPONSE=2", diagnostic)
+        self.assertIn("CREATE_EFFECT=0", diagnostic)
+        self.assertIn("COMPLETE=1", diagnostic)
+        self.assertIn("\\u0000", diagnostic)
+        self.assertIn("caf\\u00e9", diagnostic)
+        self.assertIn("truncated", diagnostic)
+        self.assertNotIn("UNBOUNDED TAIL", diagnostic)
         self.assertFalse(os.path.exists(captured["parent"]))
 
 
