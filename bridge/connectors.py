@@ -1,19 +1,18 @@
-"""The four harnesses Agent Bridge can call, and how one call is described.
+"""The six target CLIs Agent Bridge can call, and how one call is described.
 
-Agent Bridge knows exactly five coding-agent harnesses, named once here and
-never discovered at runtime. Looking one up is a literal four-way switch: there
-is no registry, no plugin search, no dynamic import, and no base class for a
-connector to inherit. Adding a sixth harness means editing this file, which is
-the point - the set of programs the bridge will start is visible in source.
+Agent Bridge knows exactly six target CLIs, named once here and never
+discovered at runtime. Looking one up is a literal six-way switch: there is no
+registry, plugin search, name-derived import, or connector base class. Adding a
+target means editing this file, which is the point - the set of programs the
+bridge will start is visible in source.
 
-Four connectors ship in this build: Codex, Claude Code, ZCode and Hermes
-Agent. Each is a module of its own offering exactly two operations - answer
-whether the harness could be used right now, and compose the one fixed
-argument vector a turn runs. Two of them, ZCode and Hermes, have programs with
-no standard-input path, so the body reaches them as the final command-line
-argument; Hermes is courier-only besides, because its tools cannot read a file
-without also being able to write one, so it is given no project and answers on
-what it is sent.
+Each target has one hand-written module offering exactly two operations:
+answer whether the target could be used right now, and compose the one fixed
+argument vector a turn runs. ZCode and Hermes have no dependable standard-input
+prompt path, so the body reaches them as one bound command-line option. Hermes,
+MiniMax, and Qwen are courier-only and receive no project. Qwen alone has a
+documented target-side preprocessing exception; Bridge still records and hands
+over its original body unchanged.
 
 This module also holds what the connectors share, and the sharing is
 deliberately shallow: a handful of plain functions, called by each, and no
@@ -38,17 +37,28 @@ import os
 import platform
 import re
 import shutil
-from typing import Any, Iterable, NamedTuple, Optional, Sequence, Tuple
+from typing import (
+    Any,
+    Callable,
+    Iterable,
+    List,
+    NamedTuple,
+    Optional,
+    Sequence,
+    Tuple,
+)
 
 from .errors import BridgeError, Failure
 from .peer import CompletedCall, Deadline, run_bounded
 
-#: The four harness identifiers, fixed and ordered. Nothing else is a harness.
+#: The six target identifiers, fixed and ordered. Nothing else is a target.
 HARNESS_IDS: Tuple[str, ...] = (
     "codex",
     "claude",
     "zcode",
     "hermes",
+    "minimax",
+    "qwen",
 )
 
 
@@ -62,18 +72,15 @@ class Qualification(NamedTuple):
 
     `versions` lists exact tested versions. A range belongs here only when
     evidence covers every release inside it. `architectures` is left empty when
-    the restriction surface does not depend on the processor. `restrictions` is
-    the fixed set of switches that must be present for the harness to be called
-    at all - the ones that make the peer unable to write project files, unable
-    to alter Git state, and unable to cause a browser, web-fetch, MCP,
-    messaging, credential, publication or deployment effect.
+    the fixed mechanics do not depend on the processor. `restrictions` is the
+    set of switches that must be present for the harness to be called at all:
+    the connector's one-shot input and output mechanics and every compatible
+    control its fixed practical posture relies on.
 
-    Those are properties, not an inventory. A connector may reach them by
-    removing the tools, by confining them in the harness's own enforced
-    permission or sandbox mode, or by both, and qualification proves the
-    resulting behaviour rather than checking off a list of absent tools. A
-    harness that leaves a shell or Git harmlessly available is not thereby
-    unqualified; one whose peer can mutate anything or reach outside is.
+    This list is not a claim of complete confinement. A connector may remove
+    tools, use an enforced sandbox or permission posture, withhold a project,
+    or combine them. Any surviving configuration, tool, same-user access, or
+    external-effect route is described in a concrete non-blocking warning.
     """
 
     cli_identity: str
@@ -109,13 +116,27 @@ class PeerCommand(NamedTuple):
     supports, less explicit headroom, is refused before any request is
     published, and is never truncated, split or spilled to a file; so is a
     body holding a NUL byte, which no argument can carry. Under either
-    transport prompt text never passes through a shell.
+    transport prompt text never passes through a shell. `warnings` are the
+    concrete limits a successful check and run must surface. `response_parser`
+    extracts final text when the fixed output is structured. `stdin_encoder`
+    wraps the unchanged body in a vendor input frame before publication when
+    the selected CLI requires one; it never changes the canonical request.
     """
 
     argv: Tuple[str, ...]
     cwd: str
     env: Tuple[Tuple[str, str], ...]
     body_argument: Optional[str] = None
+    warnings: Tuple[str, ...] = ()
+    response_parser: Optional[Callable[[str], str]] = None
+    stdin_encoder: Optional[Callable[[str], str]] = None
+
+
+class CheckResult(NamedTuple):
+    """One successful readiness sentence and its informational warnings."""
+
+    message: str
+    warnings: Tuple[str, ...] = ()
 
 
 #: The most a body may be when it travels on the command line, in encoded
@@ -164,11 +185,10 @@ def argument_space_used(
     return used + pointer * (count + 2)
 
 
-# -- what both connectors do the same way -----------------------------------
+# -- what all connectors do the same way ------------------------------------
 
-#: Any dotted release number. Both shipped harnesses print theirs surrounded by
-#: wording of their own - `codex-cli 0.147.0`, `2.1.251 (Claude Code)` - and the
-#: wording is the vendor's to change, so only the number is read out of it.
+#: Any dotted release number. Target CLIs surround theirs with wording of their
+#: own, so only the number is read out of it.
 _VERSION = re.compile(r"\d+\.\d+\.\d+")
 
 
@@ -198,7 +218,10 @@ def executable(program: str) -> str:
 
 
 def probe(
-    argv: Sequence[str], cwd: str, deadline: Deadline
+    argv: Sequence[str],
+    cwd: str,
+    deadline: Deadline,
+    env: Optional[Iterable[Tuple[str, str]]] = None,
 ) -> CompletedCall:
     """Ask a harness one of its own cheap questions, inside the turn's deadline.
 
@@ -211,14 +234,18 @@ def probe(
     return run_bounded(
         argv=tuple(argv),
         cwd=cwd,
-        env=environment(),
+        env=tuple(env) if env is not None else environment(),
         stdin_text="",
         deadline=deadline,
     )
 
 
-def qualified_version(printed: str, qualification: Qualification) -> str:
-    """The installed version, once it is one this connector was tested against.
+def qualified_version(
+    printed: str,
+    qualification: Qualification,
+    warnings: List[str],
+) -> str:
+    """Read the installed version and warn when it is outside exercised evidence.
 
     A version that cannot be read at all is a different problem from one that
     can be read and is untested, and the two are reported differently, because
@@ -234,19 +261,22 @@ def qualified_version(printed: str, qualification: Qualification) -> str:
         )
     version = found.group(0)
     if version not in qualification.versions:
-        raise BridgeError(
-            Failure.UNQUALIFIED_VERSION,
-            detail="{0} {1}; tested against {2}".format(
+        warnings.append(
+            "{0} reported version {1}; this connector was exercised against "
+            "{2}. The required one-shot and restriction mechanics are present, "
+            "but this version is outside the release evidence.".format(
                 qualification.cli_identity,
                 version,
                 ", ".join(qualification.versions),
-            ),
+            )
         )
     return version
 
 
-def qualified_platform(qualification: Qualification) -> str:
-    """This computer, once it is one this connector was tested on.
+def qualified_platform(
+    qualification: Qualification, warnings: List[str]
+) -> str:
+    """Describe this computer and warn when it is outside exercised evidence.
 
     The family is what Python calls the operating system, so macOS is `Darwin`.
     The major version is macOS's own where there is one, because that is the
@@ -260,20 +290,35 @@ def qualified_platform(qualification: Qualification) -> str:
     major = release.split(".")[0]
     machine = platform.machine()
     described = "{0} {1} {2}".format(family, major, machine)
-    if (
+    untested = (
         family != qualification.os_family
         or major not in qualification.os_major_versions
-    ):
-        raise BridgeError(Failure.UNQUALIFIED_PLATFORM, detail=described)
-    if qualification.architectures and machine not in (
-        qualification.architectures
-    ):
-        raise BridgeError(Failure.UNQUALIFIED_PLATFORM, detail=described)
+        or (
+            bool(qualification.architectures)
+            and machine not in qualification.architectures
+        )
+    )
+    if untested:
+        qualified_platforms = "{0} major {1}".format(
+            qualification.os_family,
+            "/".join(qualification.os_major_versions),
+        )
+        if qualification.architectures:
+            qualified_platforms += " on {0}".format(
+                "/".join(qualification.architectures)
+            )
+        warnings.append(
+            "{0} is running on {1}; this connector was exercised on {2}. "
+            "The required one-shot and restriction mechanics are present, but "
+            "this platform is outside the release evidence.".format(
+                qualification.cli_identity, described, qualified_platforms
+            )
+        )
     return described
 
 
 def qualified_restrictions(
-    help_text: str, qualification: Qualification
+    help_call: CompletedCall, qualification: Qualification
 ) -> None:
     """Prove every restriction switch this connector passes really exists.
 
@@ -287,6 +332,16 @@ def qualified_restrictions(
     which is loud; a switch that is gone is the quiet failure worth catching
     here.
     """
+    if help_call.returncode != 0:
+        raise BridgeError(
+            Failure.RESTRICTIONS_UNAVAILABLE,
+            detail="{0}'s help command exited {1}: {2}".format(
+                qualification.cli_identity,
+                help_call.returncode,
+                (help_call.stderr or help_call.stdout).strip()[:160],
+            ),
+        )
+    help_text = "{0}\n{1}".format(help_call.stdout, help_call.stderr)
     missing = [
         switch
         for switch in qualification.restrictions
@@ -307,57 +362,93 @@ def readiness(
     version: str,
     described_platform: str,
     authentication: str,
-) -> str:
-    """The one sentence `check` prints when a peer really can be used.
+    warnings: Sequence[str] = (),
+    authentication_confirmed: bool = True,
+) -> CheckResult:
+    """The truthful mechanics and authentication state printed by ``check``.
 
     Written here rather than in each connector so that readiness reads the same
     way whichever harness was asked: where the program is, which version it is,
-    what this computer is, and what the harness itself said about being signed
-    in.
+    what this computer is, and whether live authentication was actually
+    established. Some CLIs expose no safe state-free authentication check; for
+    those, successful readiness means the fixed call mechanics are present and
+    the selected bounded call will report an authentication failure honestly.
     """
-    return (
-        "{0} is ready: version {1} at {2}, on {3}, {4}, and every restriction "
-        "switch this connector passes is present in the program's own "
-        "help.".format(
-            harness_id, version, program, described_platform, authentication
-        )
+    if authentication_confirmed:
+        state = "{0} is ready".format(harness_id)
+    else:
+        state = (
+            "{0} mechanics are ready, but live authentication is unconfirmed"
+        ).format(harness_id)
+    return CheckResult(
+        message=(
+            "{0}: version {1} at {2}, on {3}, {4}, and every "
+            "required fixed-vector switch is present.".format(
+                state, version, program, described_platform, authentication
+            )
+        ),
+        warnings=tuple(warnings),
     )
 
 
-# -- the four-way switch ---------------------------------------------------
+# -- the six-way switch ----------------------------------------------------
+
+
+def is_courier_only(harness_id: str) -> bool:
+    """Answer from literals only, without importing or inspecting a connector."""
+    return (
+        harness_id == "hermes"
+        or harness_id == "minimax"
+        or harness_id == "qwen"
+    )
 
 
 def _switch(harness_id: str) -> Optional[Any]:
     """Resolve one identifier to its connector, or raise for an unknown name.
 
     The branches are written out one by one on purpose: this is the whole list
-    of programs Agent Bridge is willing to start, and every one of the four
-    now resolves to a module.
+    of programs Agent Bridge is willing to start, and every one of the six
+    resolves to a module.
 
     They are imported inside this function for one ordinary reason: each of
     them uses the shapes and the helpers defined above, and a module cannot be
-    half-imported into itself. The names are literal and there are four of
-    them; nothing is searched for, and nothing is built from a string.
+    half-imported into itself. The names are literal and there are six of them;
+    nothing is searched for, and nothing is built from a string. Matching the
+    branch before its import is what leaves all five unselected connectors
+    wholly inert.
     """
-    from . import claude, codex, hermes, zcode
-
     if harness_id == "codex":
+        from . import codex
+
         return codex
     if harness_id == "claude":
+        from . import claude
+
         return claude
     if harness_id == "zcode":
+        from . import zcode
+
         return zcode
     if harness_id == "hermes":
+        from . import hermes
+
         return hermes
+    if harness_id == "minimax":
+        from . import minimax
+
+        return minimax
+    if harness_id == "qwen":
+        from . import qwen
+
+        return qwen
     raise BridgeError(Failure.UNKNOWN_HARNESS, detail=harness_id)
 
 
 def resolve(harness_id: str) -> Any:
-    """Return the connector for one of the four harnesses.
+    """Return the connector for one of the six literal targets.
 
-    Raises UNKNOWN_HARNESS for a name that is not one of the four. Every one of
-    the four now ships a connector, so CONNECTOR_UNAVAILABLE is reserved for a
-    build in which one does not.
+    Raises UNKNOWN_HARNESS for any other name. Every fixed target ships a
+    connector, so CONNECTOR_UNAVAILABLE is reserved for an incomplete build.
     """
     connector = _switch(harness_id)
     if connector is None:

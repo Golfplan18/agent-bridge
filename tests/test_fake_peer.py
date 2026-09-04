@@ -45,10 +45,9 @@ would say something had been sent; and a peer that is given no project is
 refused one by the command itself, before anything is read or started.
 
 The last group is about the other way something gets into a session: `record`,
-which writes one local message without calling anybody. There are five kinds it
-may write, each with its own envelope, and the list is closed - the point of
-checking all five together with a made-up sixth is that no amount of asking gets
-a sixth kind written.
+which creates the immutable Format 2 header or writes one neutral note. The
+two-kind list is closed, arbitrary valid initiator labels need no registration,
+and legacy Format 1 structure is rejected rather than migrated.
 
 Everything below exercises the real thing. Real processes are started, real
 files are written, real locks are taken out in separate processes, real signals
@@ -62,7 +61,9 @@ SPDX-License-Identifier: Unlicense
 
 from __future__ import annotations
 
+import contextlib
 import io
+import json
 import os
 import re
 import shutil
@@ -78,10 +79,25 @@ REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if REPO_ROOT not in sys.path:
     sys.path.insert(0, REPO_ROOT)
 
-from bridge import cli, peer, record, runner, session  # noqa: E402
+from bridge import (  # noqa: E402
+    claude,
+    cli,
+    codex,
+    connectors,
+    hermes,
+    minimax,
+    peer,
+    qwen,
+    record,
+    runner,
+    session,
+    zcode,
+)
 from bridge.connectors import COMMAND_LINE_BODY_LIMIT, PeerCommand  # noqa: E402
 from bridge.errors import BridgeError, Failure  # noqa: E402
 from bridge.locking import lock_path, session_lock  # noqa: E402
+from bridge.peer import CompletedCall  # noqa: E402
+from tests import release_conformance  # noqa: E402
 
 FAKE_PEER = os.path.join(REPO_ROOT, "tests", "fake_peer.py")
 
@@ -200,7 +216,7 @@ PUBLISH_STOP_DRIVER = (
     "try:\n"
     "    session.publish(\n"
     "        target,\n"
-    "        '# Message 0001\\nRecord: user-correction\\nFrom: codex\\n',\n"
+    "        '# Message 0001\\nRecord: note\\nFrom: sample-app\\n',\n"
     "    )\n"
     "except peer.SignalStop:\n"
     "    sys.exit(3)\n"
@@ -246,9 +262,8 @@ class TurnBehavior(unittest.TestCase):
             self.session_dir,
             "session-create",
             "Prove the runner without spending a real harness call.\n",
-            local="codex",
+            initiator="sample-app",
             peer="claude",
-            workflow="planning",
         )
         self.holders = []
         self.drivers = []
@@ -290,10 +305,10 @@ class TurnBehavior(unittest.TestCase):
         """
         argv = (sys.executable, FAKE_PEER, mode) + tuple(extra)
 
-        def build(deadline):
+        def build(deadline, cwd):
             return PeerCommand(
                 argv=argv,
-                cwd=self.temp,
+                cwd=cwd,
                 env=tuple(os.environ.items()),
             )
 
@@ -306,10 +321,10 @@ class TurnBehavior(unittest.TestCase):
         whatever the runner bound to the prefix is exactly what comes back.
         """
 
-        def build(deadline):
+        def build(deadline, cwd):
             return PeerCommand(
                 argv=(sys.executable, FAKE_PEER, "last-argument"),
-                cwd=self.temp,
+                cwd=cwd,
                 env=tuple(os.environ.items()),
                 body_argument=prefix,
             )
@@ -325,10 +340,10 @@ class TurnBehavior(unittest.TestCase):
         everything else uses. This one stands in for a precheck that hangs.
         """
 
-        def build(deadline):
+        def build(deadline, cwd):
             peer.run_bounded(
                 argv=(sys.executable, FAKE_PEER, "hang", str(seconds)),
-                cwd=self.temp,
+                cwd=cwd,
                 env=tuple(os.environ.items()),
                 stdin_text="",
                 deadline=deadline,
@@ -340,11 +355,11 @@ class TurnBehavior(unittest.TestCase):
     def _late_builder(self):
         """A connector that finishes, but only after the deadline has passed."""
 
-        def build(deadline):
+        def build(deadline, cwd):
             time.sleep(max(0.0, deadline.remaining()) + 0.05)
             return PeerCommand(
                 argv=(sys.executable, FAKE_PEER, "plain"),
-                cwd=self.temp,
+                cwd=cwd,
                 env=tuple(os.environ.items()),
             )
 
@@ -436,10 +451,9 @@ class TurnBehavior(unittest.TestCase):
         body = kwargs.pop("body", "Please answer this.\n")
         return runner.run_turn(
             self.session_dir,
-            "claude",
             body,
-            self._builder(mode, *extra),
             timeout,
+            self._builder(mode, *extra),
         )
 
     def _expect(self, failure, mode, *extra, **kwargs):
@@ -451,37 +465,149 @@ class TurnBehavior(unittest.TestCase):
     # -- the ordinary case -------------------------------------------------
 
     def test_round_trip_publishes_request_and_response(self):
-        result = self._turn("plain", body="Consider the plan.\n")
+        result = self._turn("plain", body="Consider the question.\n")
 
         self.assertEqual(result.request_sequence, 1)
         self.assertEqual(result.response_sequence, 2)
         self.assertEqual(
             self._messages(),
-            ["0001-local-to-peer.md", "0002-peer-to-local.md"],
+            ["0001-initiator-to-peer.md", "0002-peer-to-initiator.md"],
         )
 
         with open(
             session.message_path(
-                self.session_dir, 1, session.LOCAL_TO_PEER_SUFFIX
+                self.session_dir, 1, session.INITIATOR_TO_PEER_SUFFIX
             ),
             encoding="utf-8",
         ) as stream:
             request = stream.read()
         self.assertEqual(
             request,
-            "# Message 0001\nFrom: codex\nTo: claude\n\n## Body\n\n"
-            "Consider the plan.\n",
+            "# Message 0001\nFrom: sample-app\nTo: claude\n\n## Body\n\n"
+            "Consider the question.\n",
         )
 
         with open(result.response_path, encoding="utf-8") as stream:
             response = stream.read()
         self.assertEqual(
             response,
-            "# Message 0002\nFrom: claude\nTo: codex\n\n## Body\n\n"
-            "Consider the plan.\n",
+            "# Message 0002\nFrom: claude\nTo: sample-app\n\n## Body\n\n"
+            "Consider the question.\n",
         )
-        self.assertNotIn("Review-", response)
         self.assertEqual(self._leftover_temporaries(), [])
+
+    def test_each_call_starts_fresh_and_sends_only_its_current_body(self):
+        first = self._turn("plain", body="First body with caf\u00e9.\n\n")
+        second = self._turn("plain", body="Second body only.\n")
+
+        with open(first.response_path, encoding="utf-8") as stream:
+            first_text = stream.read()
+        with open(second.response_path, encoding="utf-8") as stream:
+            second_text = stream.read()
+        self.assertIn("First body with caf\u00e9.\n\n", first_text)
+        self.assertNotIn("First body", second_text)
+        self.assertTrue(second_text.endswith("Second body only.\n"))
+        self.assertEqual(
+            self._messages(),
+            [
+                "0001-initiator-to-peer.md",
+                "0002-peer-to-initiator.md",
+                "0003-initiator-to-peer.md",
+                "0004-peer-to-initiator.md",
+            ],
+        )
+
+    def test_runner_uses_the_session_project_and_removes_a_neutral_directory(self):
+        project_session = os.path.join(self.temp, "project-session")
+        record.record(
+            project_session,
+            "session-create",
+            "Project-bound call.\n",
+            initiator="gear-3",
+            peer="zcode",
+            project=self.temp,
+        )
+        observed = []
+
+        def project_builder(deadline, cwd):
+            observed.append(cwd)
+            return PeerCommand(
+                argv=(sys.executable, FAKE_PEER, "plain"),
+                cwd=cwd,
+                env=tuple(os.environ.items()),
+            )
+
+        result = runner.run_turn(
+            project_session, "Use the recorded project.\n", 30.0, project_builder
+        )
+        self.assertEqual(observed, [self.temp])
+        with open(result.response_path, encoding="utf-8") as stream:
+            self.assertIn("From: zcode\nTo: gear-3\n", stream.read())
+
+        neutral = []
+
+        def neutral_builder(deadline, cwd):
+            neutral.append(cwd)
+            self.assertTrue(os.path.isdir(cwd))
+            self.assertEqual(os.listdir(cwd), [])
+            return PeerCommand(
+                argv=(sys.executable, FAKE_PEER, "plain"),
+                cwd=cwd,
+                env=tuple(os.environ.items()),
+            )
+
+        self._turn_with_builder(neutral_builder, "Neutral call.\n")
+        self.assertEqual(len(neutral), 1)
+        self.assertFalse(os.path.exists(neutral[0]))
+
+    def test_public_run_resolves_only_the_target_stored_in_the_session(self):
+        seen = []
+
+        class FakeConnector:
+            COURIER_ONLY = False
+
+            @staticmethod
+            def build_command(deadline, cwd):
+                return PeerCommand(
+                    argv=(sys.executable, FAKE_PEER, "plain"),
+                    cwd=cwd,
+                    env=tuple(os.environ.items()),
+                )
+
+        def resolve(peer_id):
+            seen.append(peer_id)
+            return FakeConnector
+
+        output = io.StringIO()
+        with mock.patch.object(runner.connectors, "resolve", resolve):
+            with mock.patch("sys.stdout", output):
+                with mock.patch("sys.stdin", io.StringIO("Public call.\n")):
+                    self.assertEqual(
+                        cli.main(["run", "--session", self.session_dir]), 0
+                    )
+        self.assertEqual(seen, ["claude"])
+        response_path = output.getvalue().strip()
+        self.assertTrue(response_path.endswith("0002-peer-to-initiator.md"))
+        with open(response_path, encoding="utf-8") as stream:
+            self.assertIn("From: claude\nTo: sample-app\n", stream.read())
+
+    def _turn_with_builder(self, build, body):
+        return runner.run_turn(self.session_dir, body, 30.0, build)
+
+    def test_invalid_body_and_timeout_fail_before_a_builder_or_publication(self):
+        called = []
+
+        def build(deadline, cwd):
+            called.append(cwd)
+            raise AssertionError("invalid input reached the connector")
+
+        for body, timeout in (("   \n", 30.0), ("Body.\n", 0), ("Body.\n", float("nan"))):
+            with self.subTest(body=body, timeout=timeout):
+                with self.assertRaises(BridgeError) as caught:
+                    runner.run_turn(self.session_dir, body, timeout, build)
+                self.assertEqual(caught.exception.failure, Failure.USAGE_ERROR)
+        self.assertEqual(called, [])
+        self.assertEqual(self._messages(), [])
 
     # -- atomic publication -------------------------------------------------
 
@@ -497,7 +623,7 @@ class TurnBehavior(unittest.TestCase):
                     "--session",
                     self.session_dir,
                     "--kind",
-                    "technical-error",
+                    "note",
                 ],
                 cwd=REPO_ROOT,
                 stdin=subprocess.PIPE,
@@ -533,14 +659,14 @@ class TurnBehavior(unittest.TestCase):
             with open(path, encoding="utf-8") as stream:
                 text = stream.read()
             self.assertTrue(text.startswith("# Message "))
-            self.assertIn("Record: technical-error\n", text)
+            self.assertIn("Record: note\n", text)
             self.assertIn("\n## Body\n\n", text)
             self.assertTrue(text.rstrip().endswith("."))
         self.assertEqual(self._leftover_temporaries(), [])
 
     def test_failure_during_publication_leaves_nothing_behind(self):
         target = session.message_path(
-            self.session_dir, 1, session.LOCAL_RECORD_SUFFIX
+            self.session_dir, 1, session.INITIATOR_RECORD_SUFFIX
         )
         with mock.patch("os.replace", side_effect=OSError("forced failure")):
             with self.assertRaises(BridgeError) as caught:
@@ -553,9 +679,9 @@ class TurnBehavior(unittest.TestCase):
     def test_a_rename_that_worked_is_never_reported_as_nothing_published(self):
         """The message is there, so the failure has to say the file is there."""
         target = session.message_path(
-            self.session_dir, 1, session.LOCAL_RECORD_SUFFIX
+            self.session_dir, 1, session.INITIATOR_RECORD_SUFFIX
         )
-        text = "# Message 0001\nRecord: user-correction\nFrom: codex\n"
+        text = "# Message 0001\nRecord: note\nFrom: sample-app\n"
         with mock.patch.object(
             session, "_fsync_directory", side_effect=OSError("forced failure")
         ):
@@ -582,9 +708,9 @@ class TurnBehavior(unittest.TestCase):
         stop is now passed on as itself, and the message stays where it is.
         """
         target = session.message_path(
-            self.session_dir, 1, session.LOCAL_RECORD_SUFFIX
+            self.session_dir, 1, session.INITIATOR_RECORD_SUFFIX
         )
-        text = "# Message 0001\nRecord: user-correction\nFrom: codex\n"
+        text = "# Message 0001\nRecord: note\nFrom: sample-app\n"
         real_replace = os.replace
 
         def replace_then_stop(source, destination):
@@ -605,9 +731,9 @@ class TurnBehavior(unittest.TestCase):
     def test_a_failure_after_the_rename_says_the_message_is_there(self):
         """Which side of the rename it happened on is decided by looking."""
         target = session.message_path(
-            self.session_dir, 1, session.LOCAL_RECORD_SUFFIX
+            self.session_dir, 1, session.INITIATOR_RECORD_SUFFIX
         )
-        text = "# Message 0001\nRecord: technical-error\nFrom: codex\n"
+        text = "# Message 0001\nRecord: note\nFrom: sample-app\n"
         real_replace = os.replace
 
         def replace_then_fail(source, destination):
@@ -640,7 +766,7 @@ class TurnBehavior(unittest.TestCase):
         """
         directory = session.messages_dir(self.session_dir)
         target = session.message_path(
-            self.session_dir, 1, session.LOCAL_RECORD_SUFFIX
+            self.session_dir, 1, session.INITIATOR_RECORD_SUFFIX
         )
         real_replace = os.replace
 
@@ -673,7 +799,7 @@ class TurnBehavior(unittest.TestCase):
         removes it, and the leftover assertions afterwards stay meaningful.
         """
         target = session.message_path(
-            self.session_dir, 1, session.LOCAL_RECORD_SUFFIX
+            self.session_dir, 1, session.INITIATOR_RECORD_SUFFIX
         )
         made = {}
         real_mkstemp = session.tempfile.mkstemp
@@ -732,9 +858,9 @@ class TurnBehavior(unittest.TestCase):
         to go and look.
         """
         target = session.message_path(
-            self.session_dir, 1, session.LOCAL_RECORD_SUFFIX
+            self.session_dir, 1, session.INITIATOR_RECORD_SUFFIX
         )
-        text = "# Message 0001\nRecord: technical-error\nFrom: codex\n"
+        text = "# Message 0001\nRecord: note\nFrom: sample-app\n"
         real_replace = os.replace
         real_stat = os.stat
 
@@ -772,7 +898,7 @@ class TurnBehavior(unittest.TestCase):
     def test_a_stop_before_the_rename_leaves_nothing_and_is_not_a_failure(self):
         """Stopped is stopped: nothing published, and nothing blamed on this."""
         target = session.message_path(
-            self.session_dir, 1, session.LOCAL_RECORD_SUFFIX
+            self.session_dir, 1, session.INITIATOR_RECORD_SUFFIX
         )
         with mock.patch(
             "os.replace", side_effect=peer.SignalStop(signal.SIGHUP)
@@ -803,7 +929,7 @@ class TurnBehavior(unittest.TestCase):
         which is what makes it discriminate rather than merely pass.
         """
         target = session.message_path(
-            self.session_dir, 1, session.LOCAL_RECORD_SUFFIX
+            self.session_dir, 1, session.INITIATOR_RECORD_SUFFIX
         )
         real_unlink = os.unlink
         removed = []
@@ -856,7 +982,7 @@ class TurnBehavior(unittest.TestCase):
         must be exactly as it was found.
         """
         target = session.message_path(
-            self.session_dir, 1, session.LOCAL_RECORD_SUFFIX
+            self.session_dir, 1, session.INITIATOR_RECORD_SUFFIX
         )
         marker = os.path.join(self.temp, "ready-to-be-stopped.txt")
         driver = self._start_driver(PUBLISH_STOP_DRIVER, target, marker)
@@ -900,7 +1026,7 @@ class TurnBehavior(unittest.TestCase):
         self.assertEqual(caught.exception.failure, Failure.BUSY_SESSION)
 
         with self.assertRaises(BridgeError) as caught:
-            record.record(self.session_dir, "user-correction", "Blocked.\n")
+            record.record(self.session_dir, "note", "Blocked.\n")
         self.assertEqual(caught.exception.failure, Failure.BUSY_SESSION)
 
         self.assertEqual(self._messages(), before)
@@ -927,7 +1053,7 @@ class TurnBehavior(unittest.TestCase):
         with session_lock(self.session_dir):
             pass
         path = record.record(
-            self.session_dir, "user-correction", "After the abrupt end.\n"
+            self.session_dir, "note", "After the abrupt end.\n"
         )
         self.assertTrue(os.path.exists(path))
         self.assertEqual(self._leftover_temporaries(), [])
@@ -936,21 +1062,82 @@ class TurnBehavior(unittest.TestCase):
 
     def test_timeout_publishes_no_response(self):
         self._expect(Failure.TIMEOUT, "hang", timeout=1.0)
-        self.assertEqual(self._messages(), ["0001-local-to-peer.md"])
+        self.assertEqual(self._messages(), ["0001-initiator-to-peer.md"])
         self.assertEqual(self._leftover_temporaries(), [])
 
     def test_nonzero_exit_publishes_no_response(self):
-        error = self._expect(Failure.PEER_FAILURE, "fail")
-        self.assertIn("deliberate failure", str(error))
-        self.assertEqual(self._messages(), ["0001-local-to-peer.md"])
+        body = (
+            'PRIVATE REQUEST "confidential caf\u00e9" \\ details '
+            + "request-content " * 50
+            + "PRIVATE END\n"
+        )
+        script = (
+            "import json, sys\n"
+            "body = sys.stdin.read()\n"
+            "prefix = 'vendor wrapper ' + 'p' * 400 + ': '\n"
+            "sys.stdout.write(prefix + body + 'stdout partial\\x00line\\n' + "
+            "'x' * 600 + 'UNBOUNDED TAIL')\n"
+            "sys.stderr.write('fake peer: deliberate failure\\n')\n"
+            "sys.stderr.write('OPENAI_API_KEY=opaqueApiValue\\n')\n"
+            "sys.stderr.write('ANTHROPIC_AUTH_TOKEN=opaqueAuthValue\\n')\n"
+            "sys.stderr.write(prefix + json.dumps(body) + '\\n')\n"
+            "sys.stderr.write('api_key=super-secret-token\\n')\n"
+            "sys.stderr.write('Bearer bearer-secret-value\\n')\n"
+            "sys.stderr.write('Authorization: Bearer header-opaque-secret\\n')\n"
+            "sys.stderr.write(json.dumps({"
+            "'api_key': 'json-secret-token', "
+            "'access_token': 'json-access-value', "
+            "'password': 'quoted-password-value'}) + '\\n')\n"
+            "sys.stderr.write(json.dumps(json.dumps({"
+            "'api_key': 'escaped-opaque-secret'})) + '\\n')\n"
+            "raise SystemExit(3)\n"
+        )
+
+        def build(deadline, cwd):
+            return PeerCommand(
+                argv=(sys.executable, "-c", script),
+                cwd=cwd,
+                env=tuple(os.environ.items()),
+            )
+
+        with self.assertRaises(BridgeError) as caught:
+            runner.run_turn(self.session_dir, body, 30.0, build)
+        error = caught.exception
+        rendered = str(error)
+        self.assertEqual(error.failure, Failure.PEER_FAILURE)
+        self.assertIn("deliberate failure", rendered)
+        self.assertIn("stderr:", rendered)
+        self.assertIn("stdout:", rendered)
+        self.assertIn("stdout partial\\u0000line\\n", rendered)
+        self.assertIn("truncated", rendered)
+        self.assertIn("request body redacted", rendered)
+        for private in (
+            "PRIVATE REQUEST",
+            "confidential",
+            "request-content",
+            "PRIVATE END",
+            "opaqueApiValue",
+            "opaqueAuthValue",
+            "super-secret-token",
+            "bearer-secret-value",
+            "header-opaque-secret",
+            "json-secret-token",
+            "json-access-value",
+            "quoted-password-value",
+            "escaped-opaque-secret",
+        ):
+            self.assertNotIn(private, rendered)
+        self.assertIn("credential line redacted", rendered)
+        self.assertNotIn("UNBOUNDED TAIL", rendered)
+        self.assertEqual(self._messages(), ["0001-initiator-to-peer.md"])
 
     def test_no_output_at_all_publishes_no_response(self):
         self._expect(Failure.EMPTY_RESPONSE, "empty", body="Say nothing.\n")
-        self.assertEqual(self._messages(), ["0001-local-to-peer.md"])
+        self.assertEqual(self._messages(), ["0001-initiator-to-peer.md"])
 
     def test_whitespace_only_output_publishes_no_response(self):
         self._expect(Failure.EMPTY_RESPONSE, "whitespace", body="Say air.\n")
-        self.assertEqual(self._messages(), ["0001-local-to-peer.md"])
+        self.assertEqual(self._messages(), ["0001-initiator-to-peer.md"])
 
     # -- the body on the command line, where a harness has no other way ----
 
@@ -962,13 +1149,13 @@ class TurnBehavior(unittest.TestCase):
             "--disallowed-tools=Edit is text\n---\n\nAnswer this.\n"
         )
         result = runner.run_turn(
-            self.session_dir, "claude", body, self._argument_builder("--prompt="), 30.0
+            self.session_dir, body, 30.0, self._argument_builder("--prompt=")
         )
         with open(result.response_path, encoding="utf-8") as stream:
             response = stream.read()
         self.assertEqual(
             response,
-            "# Message 0002\nFrom: claude\nTo: codex\n\n## Body\n\n"
+            "# Message 0002\nFrom: claude\nTo: sample-app\n\n## Body\n\n"
             "--prompt=" + body,
         )
         self.assertNotIn("STDIN WAS NOT EMPTY", response)
@@ -985,10 +1172,9 @@ class TurnBehavior(unittest.TestCase):
                 with self.assertRaises(BridgeError) as caught:
                     runner.run_turn(
                         self.session_dir,
-                        "claude",
                         body,
-                        self._argument_builder("--prompt="),
                         30.0,
+                        self._argument_builder("--prompt="),
                     )
                 self.assertEqual(caught.exception.failure, Failure.USAGE_ERROR)
                 self.assertEqual(self._messages(), [])
@@ -996,10 +1182,9 @@ class TurnBehavior(unittest.TestCase):
         # And exactly at the limit the body is carried, not refused.
         result = runner.run_turn(
             self.session_dir,
-            "claude",
             "y" * COMMAND_LINE_BODY_LIMIT,
-            self._argument_builder(""),
             30.0,
+            self._argument_builder(""),
         )
         self.assertEqual(result.response_sequence, 2)
 
@@ -1021,10 +1206,9 @@ class TurnBehavior(unittest.TestCase):
                 with self.assertRaises(BridgeError) as caught:
                     runner.run_turn(
                         self.session_dir,
-                        "claude",
                         "Please answer this.\n",
-                        build,
                         2.0,
+                        build,
                     )
                 self.assertEqual(caught.exception.failure, Failure.TIMEOUT)
                 self.assertEqual(self._messages(), [])
@@ -1195,21 +1379,1205 @@ class TurnBehavior(unittest.TestCase):
         )
 
 
-class LocalRecordKinds(unittest.TestCase):
-    """The five things `record` may write into a session, and the sixth it may not.
+class ClaudeManagedSettingsReadiness(unittest.TestCase):
+    """Claude gates managed MCP and warns about other managed policy."""
 
-    `record` is how the part of Agent Bridge that lives inside a harness puts
-    something into the session without calling anybody: the session itself, a
-    correction from the user, an approved plan, a technical failure, and where
-    implementation started. Each kind writes a particular envelope, and each one
-    is checked here against the exact text it must produce, because the envelope
-    is what a later reader - a person, or a fresh task picking the work up - has
-    to be able to trust.
+    def setUp(self):
+        self.temp = tempfile.mkdtemp(prefix="agent-bridge-claude-policy-")
+        self.paths = (
+            os.path.join(self.temp, "managed-settings.json"),
+            os.path.join(self.temp, "managed-settings.d"),
+            os.path.join(self.temp, "managed-mcp.json"),
+            os.path.join(self.temp, "user.plist"),
+            os.path.join(self.temp, "device.plist"),
+        )
+        self.sources = mock.patch.object(
+            claude, "_managed_source_paths", return_value=self.paths
+        )
+        self.sources.start()
 
-    The sixth is the point of doing all five together. The list of kinds is
-    closed, and a name that is not on it is refused outright rather than being
-    written under some near-enough heading.
-    """
+    def tearDown(self):
+        self.sources.stop()
+        shutil.rmtree(self.temp, ignore_errors=True)
+
+    def test_absent_or_empty_endpoint_sources_are_safe_without_reading_values(self):
+        os.mkdir(self.paths[1])
+        with open(os.path.join(self.paths[1], ".ignored.json"), "w") as stream:
+            stream.write("not JSON and deliberately never opened")
+        with open(os.path.join(self.paths[1], "README"), "w") as stream:
+            stream.write("not a policy file")
+
+        fact = claude._endpoint_managed_settings_fact()
+        self.assertIn("no endpoint-managed", fact)
+        self.assertIn("policy values were not opened", fact)
+        self.assertIsNone(claude._require_managed_mcp_absent())
+
+    def test_each_endpoint_policy_shape_is_reported_by_path_alone(self):
+        for index, path in enumerate(self.paths):
+            with self.subTest(path=path):
+                shutil.rmtree(self.temp)
+                os.mkdir(self.temp)
+                if index == 1:
+                    os.mkdir(path)
+                    path = os.path.join(path, "10-hooks.json")
+                with open(path, "w", encoding="utf-8") as stream:
+                    stream.write("a secret value this check must never parse")
+
+                if index == 2:
+                    session_dir = os.path.join(self.temp, "session")
+                    record.record(
+                        session_dir,
+                        "session-create",
+                        "Managed MCP must stop before publication.\n",
+                        initiator="ordinary.app",
+                        peer="claude",
+                    )
+                    with mock.patch.object(
+                        claude.connectors,
+                        "executable",
+                        return_value="/fake/claude",
+                    ), mock.patch.object(
+                        claude.connectors,
+                        "probe",
+                        side_effect=AssertionError(
+                            "managed MCP gate reached a Claude probe"
+                        ),
+                    ):
+                        with self.assertRaises(BridgeError) as run_failure:
+                            runner.run_turn(
+                                session_dir,
+                                "No request may be published.\n",
+                                30.0,
+                                build_command=claude.build_command,
+                            )
+                    self.assertEqual(
+                        run_failure.exception.failure,
+                        Failure.RESTRICTIONS_UNAVAILABLE,
+                    )
+                    self.assertIn(path, str(run_failure.exception))
+                    self.assertIn("--strict-mcp-config", str(run_failure.exception))
+                    self.assertNotIn("a secret value", str(run_failure.exception))
+                    self.assertEqual(
+                        os.listdir(session.messages_dir(session_dir)), []
+                    )
+                    continue
+
+                self.assertIsNone(claude._require_managed_mcp_absent())
+                fact = claude._endpoint_managed_settings_fact()
+                self.assertIn(path, fact)
+                self.assertIn("policy values were not opened", fact)
+                self.assertNotIn("a secret value", fact)
+
+    def test_unreadable_endpoint_source_is_reported_as_unknown(self):
+        with mock.patch.object(
+            claude.os, "lstat", side_effect=PermissionError(13, "permission denied")
+        ):
+            fact = claude._endpoint_managed_settings_fact()
+            with self.assertRaises(BridgeError) as caught:
+                claude._require_managed_mcp_absent()
+        self.assertIn("inspection was inconclusive", fact)
+        self.assertIn(self.paths[0], fact)
+        self.assertIn("policy values were not opened", fact)
+        self.assertEqual(
+            caught.exception.failure, Failure.RESTRICTIONS_UNAVAILABLE
+        )
+        self.assertIn(self.paths[2], str(caught.exception))
+        self.assertIn("could not be safely inspected", str(caught.exception))
+
+    def test_every_readable_doctor_state_is_reported_without_refusal(self):
+        deadline = peer.Deadline(30.0)
+        states = claude.REMOTE_STATUS_WITHOUT_POLICY + (
+            "loaded",
+            "fetch failed \u2014 using stale cache (network error)",
+            "fetch failed \u2014 no policy applied (network error)",
+        )
+        for state in states:
+            report = CompletedCall(
+                0,
+                "Claude Code doctor\n\n{0}{1}\n".format(
+                    claude.REMOTE_STATUS_PREFIX, state
+                ),
+                "",
+            )
+            with self.subTest(state=state):
+                with mock.patch.object(
+                    claude.connectors, "probe", return_value=report
+                ):
+                    self.assertIn(
+                        state,
+                        claude._remote_managed_settings_fact(
+                            "/path/to/claude", deadline, self.temp
+                        ),
+                    )
+
+        with mock.patch.object(
+            claude.connectors,
+            "probe",
+            return_value=CompletedCall(3, "", "doctor unavailable"),
+        ):
+            self.assertIn(
+                "unknown",
+                claude._remote_managed_settings_fact(
+                    "/path/to/claude", deadline, self.temp
+                ),
+            )
+
+    def test_readiness_warns_about_managed_policy_without_inventing_safe_mode(self):
+        calls = (
+            CompletedCall(0, "claude 2.1.251\n", ""),
+            CompletedCall(
+                0,
+                '{"loggedIn": true, "authMethod": "claude.ai", '
+                '"apiProvider": "firstParty"}',
+                "",
+            ),
+            CompletedCall(
+                0,
+                claude.REMOTE_STATUS_PREFIX + "loaded\n",
+                "",
+            ),
+            CompletedCall(0, " ".join(claude.QUALIFICATION.restrictions), ""),
+        )
+        with mock.patch.object(
+            claude.connectors, "executable", return_value="/fake/claude"
+        ), mock.patch.object(
+            claude.connectors,
+            "qualified_platform",
+            return_value="Darwin 26 arm64",
+        ), mock.patch.object(
+            claude, "_endpoint_managed_settings_fact", return_value="endpoint fact"
+        ), mock.patch.object(
+            claude.connectors, "probe", side_effect=calls
+        ):
+            result = claude.check(peer.Deadline(30.0), self.temp)
+
+        self.assertIsInstance(result, connectors.CheckResult)
+        self.assertEqual(len(result.warnings), 1)
+        self.assertIn("endpoint fact", result.warnings[0])
+        self.assertIn("loaded", result.warnings[0])
+        self.assertIn("--restricted", result.warnings[0])
+        self.assertNotIn("--safe-mode", result.warnings[0])
+
+
+class SixTargetConnectorBehavior(unittest.TestCase):
+    """The six literal targets, warning model, and new courier mechanics."""
+
+    TARGETS = ("codex", "claude", "zcode", "hermes", "minimax", "qwen")
+
+    def setUp(self):
+        self.temp = tempfile.mkdtemp(prefix="agent-bridge-connectors-")
+
+    def tearDown(self):
+        shutil.rmtree(self.temp, ignore_errors=True)
+
+    def test_exact_targets_resolve_with_only_the_selected_module_imported(self):
+        self.assertEqual(connectors.HARNESS_IDS, self.TARGETS)
+        source = (
+            "import sys\n"
+            "from bridge import connectors\n"
+            "selected = sys.argv[1]\n"
+            "connector = connectors.resolve(selected)\n"
+            "targets = set(connectors.HARNESS_IDS)\n"
+            "loaded = sorted(name.rsplit('.', 1)[1] for name in sys.modules "
+            "if name.startswith('bridge.') and name.rsplit('.', 1)[1] in targets)\n"
+            "print(connector.HARNESS_ID + ':' + ','.join(loaded))\n"
+        )
+        for selected in self.TARGETS:
+            with self.subTest(selected=selected):
+                completed = subprocess.run(
+                    (sys.executable, "-c", source, selected),
+                    cwd=REPO_ROOT,
+                    text=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    shell=False,
+                    timeout=SHORT_WAIT,
+                )
+                self.assertEqual(completed.returncode, 0, completed.stderr)
+                self.assertEqual(
+                    completed.stdout.strip(),
+                    "{0}:{0}".format(selected),
+                )
+
+        with self.assertRaises(BridgeError) as caught:
+            connectors.resolve("other")
+        self.assertEqual(caught.exception.failure, Failure.UNKNOWN_HARNESS)
+
+    def test_check_and_run_warnings_are_nonblocking_and_precede_publication(self):
+        warnings = ("first concrete boundary", "second concrete boundary")
+
+        class WarnedConnector:
+            @staticmethod
+            def check(deadline, cwd):
+                return connectors.CheckResult("warned target is ready", warnings)
+
+            @staticmethod
+            def build_command(deadline, cwd):
+                return PeerCommand(
+                    argv=(sys.executable, FAKE_PEER, "plain"),
+                    cwd=cwd,
+                    env=tuple(os.environ.items()),
+                    warnings=warnings,
+                )
+
+        checked_out = io.StringIO()
+        checked_err = io.StringIO()
+        with mock.patch.object(connectors, "resolve", return_value=WarnedConnector):
+            with mock.patch("sys.stdout", checked_out), mock.patch(
+                "sys.stderr", checked_err
+            ):
+                self.assertEqual(cli.main(["check", "--peer", "codex"]), 0)
+        self.assertEqual(
+            checked_out.getvalue().splitlines(),
+            [
+                "warned target is ready",
+                "Warning: first concrete boundary",
+                "Warning: second concrete boundary",
+            ],
+        )
+        self.assertEqual(checked_err.getvalue(), "")
+
+        session_dir = os.path.join(self.temp, "warned-run")
+        record.record(
+            session_dir,
+            "session-create",
+            "Warning timing.\n",
+            initiator="ordinary.app",
+            peer="codex",
+        )
+        events = []
+        real_publish = runner.session_module.publish
+
+        class ObservedErrors(io.StringIO):
+            def write(inner_self, text):
+                if text:
+                    events.append(("warning", text))
+                return super().write(text)
+
+        def observed_publish(path, text):
+            events.append(("publish", os.path.basename(path)))
+            return real_publish(path, text)
+
+        run_out = io.StringIO()
+        run_err = ObservedErrors()
+        with mock.patch.object(connectors, "resolve", return_value=WarnedConnector):
+            with mock.patch.object(
+                runner.session_module, "publish", side_effect=observed_publish
+            ):
+                with mock.patch("sys.stdout", run_out), mock.patch(
+                    "sys.stderr", run_err
+                ), mock.patch("sys.stdin", io.StringIO("A warned request.\n")):
+                    self.assertEqual(
+                        cli.main(["run", "--session", session_dir]),
+                        0,
+                    )
+
+        self.assertEqual(
+            events[:3],
+            [
+                ("warning", "Warning: first concrete boundary\n"),
+                ("warning", "Warning: second concrete boundary\n"),
+                ("publish", "0001-initiator-to-peer.md"),
+            ],
+        )
+        self.assertEqual(events[3], ("publish", "0002-peer-to-initiator.md"))
+        self.assertTrue(run_out.getvalue().strip().endswith("0002-peer-to-initiator.md"))
+
+    def test_missing_software_authentication_and_mechanics_remain_failures(self):
+        with mock.patch.object(connectors.shutil, "which", return_value=None):
+            with self.assertRaises(BridgeError) as caught:
+                connectors.executable("missing-peer")
+        self.assertEqual(caught.exception.failure, Failure.MISSING_CLI)
+
+        authentication_checks = (
+            (
+                "claude",
+                lambda: claude._signed_in(
+                    CompletedCall(0, '{"loggedIn": false}', "")
+                ),
+            ),
+            (
+                "hermes",
+                lambda: hermes._signed_in(
+                    CompletedCall(0, "not logged in\n", "")
+                ),
+            ),
+        )
+        for name, check in authentication_checks:
+            with self.subTest(authentication=name):
+                with self.assertRaises(BridgeError) as caught:
+                    check()
+                self.assertEqual(
+                    caught.exception.failure, Failure.AUTHENTICATION_REQUIRED
+                )
+
+        with mock.patch.object(zcode, "_modified", return_value=None):
+            with self.assertRaises(BridgeError) as caught:
+                zcode._sign_in_facts()
+        self.assertEqual(caught.exception.failure, Failure.AUTHENTICATION_REQUIRED)
+
+        codex_calls = (
+            CompletedCall(0, "codex-cli 0.147.0\n", ""),
+            CompletedCall(1, "", "not logged in"),
+        )
+        with mock.patch.object(
+            codex.connectors, "executable", return_value="/fake/codex"
+        ), mock.patch.object(
+            codex.connectors,
+            "qualified_platform",
+            return_value="Darwin 26 arm64",
+        ), mock.patch.object(codex.connectors, "probe", side_effect=codex_calls):
+            with self.assertRaises(BridgeError) as caught:
+                codex.check(peer.Deadline(30.0), self.temp)
+        self.assertEqual(caught.exception.failure, Failure.AUTHENTICATION_REQUIRED)
+
+        qualification = connectors.Qualification(
+            "fake-peer",
+            ("1.2.3",),
+            "Darwin",
+            ("26",),
+            ("arm64",),
+            ("--required",),
+        )
+        with self.assertRaises(BridgeError) as caught:
+            connectors.qualified_version("no readable release", qualification, [])
+        self.assertEqual(caught.exception.failure, Failure.UNREPORTABLE_VERSION)
+
+        for help_call in (
+            CompletedCall(3, "", "help failed"),
+            CompletedCall(0, "--some-other-switch", ""),
+        ):
+            with self.subTest(help=help_call):
+                with self.assertRaises(BridgeError) as caught:
+                    connectors.qualified_restrictions(help_call, qualification)
+                self.assertEqual(
+                    caught.exception.failure, Failure.RESTRICTIONS_UNAVAILABLE
+                )
+
+    def test_existing_connectors_warn_about_surviving_configuration(self):
+        for phrase in (
+            "$CODEX_HOME/config.toml",
+            "Trusted-project .codex/config.toml",
+            "project hooks or rules",
+            "system configuration",
+            "managed_config.toml",
+            "requirements.toml",
+            "cloud-delivered requirements",
+            "macOS MDM",
+            "user/global hooks or rules",
+            "managed defaults",
+            "MCP",
+            "telemetry",
+        ):
+            self.assertIn(phrase, codex.WARNING)
+
+        plugin_listing = CompletedCall(
+            0,
+            '{"plugins":[{"id":"exposed","enabled":true,'
+            '"declaredMcpServerNames":["route"],"hookDetails":[{}]}]}',
+            "",
+        )
+        with mock.patch.object(
+            zcode.connectors, "probe", return_value=plugin_listing
+        ):
+            plugin_fact = zcode._plugin_fact(
+                "/fake/node", "/fake/zcode", peer.Deadline(30.0), self.temp
+            )
+        self.assertIn("exposed", plugin_fact)
+        self.assertIn("MCP server route", plugin_fact)
+        self.assertIn("hook", plugin_fact)
+
+        with mock.patch.object(zcode, "_modified", side_effect=(100.0, 50.0)):
+            sign_in_fact = zcode._sign_in_facts()
+        self.assertIn("sign-in itself is not confirmed", sign_in_fact)
+
+        for phrase in (
+            "courier-only",
+            "user memory can remain",
+            "one --oneshot argument",
+            "visible to other processes",
+        ):
+            self.assertIn(phrase, hermes.WARNING)
+
+    def test_readiness_distinguishes_confirmed_and_unconfirmed_authentication(self):
+        confirmed = (
+            (
+                codex,
+                ("/fake/codex", "0.147.0", "Darwin 26 arm64", ()),
+            ),
+            (
+                claude,
+                (
+                    "/fake/claude",
+                    "2.1.251",
+                    "Darwin 26 arm64",
+                    "signed in through claude.ai",
+                    (),
+                ),
+            ),
+            (
+                hermes,
+                (
+                    "/fake/hermes",
+                    "0.18.2",
+                    "Darwin 26 arm64",
+                    "signed in to the Nous Portal",
+                    (),
+                ),
+            ),
+        )
+        for connector, prerequisite in confirmed:
+            with self.subTest(confirmed=connector.HARNESS_ID), mock.patch.object(
+                connector, "_prerequisites", return_value=prerequisite
+            ):
+                checked = connector.check(peer.Deadline(30.0), self.temp)
+                self.assertTrue(
+                    checked.message.startswith(
+                        "{0} is ready:".format(connector.HARNESS_ID)
+                    ),
+                    checked.message,
+                )
+                self.assertNotIn("authentication is unconfirmed", checked.message)
+
+        unconfirmed = (
+            (zcode, "minimum local configuration is present"),
+            (minimax, "no state-free status command"),
+            (qwen, "no safe status command"),
+        )
+        for connector, authentication in unconfirmed:
+            prerequisite = (
+                "/fake/{0}".format(connector.HARNESS_ID),
+                "1.2.3",
+                "Darwin 26 arm64",
+                authentication,
+                (),
+            )
+            with self.subTest(unconfirmed=connector.HARNESS_ID), mock.patch.object(
+                connector, "_prerequisites", return_value=prerequisite
+            ):
+                checked = connector.check(peer.Deadline(30.0), self.temp)
+                self.assertTrue(
+                    checked.message.startswith(
+                        "{0} mechanics are ready, but live authentication is "
+                        "unconfirmed:".format(connector.HARNESS_ID)
+                    ),
+                    checked.message,
+                )
+                self.assertIn(authentication, checked.message)
+
+    def test_minimax_uses_only_its_two_safe_checks_and_exact_courier_vector(self):
+        probed = []
+
+        def probe(argv, cwd, deadline, env=None):
+            probed.append(tuple(argv))
+            if tuple(argv)[-1] == "--version":
+                return CompletedCall(0, "mcode 0.2.8\n", "")
+            return CompletedCall(
+                0,
+                " ".join(minimax.QUALIFICATION.restrictions),
+                "",
+            )
+
+        with mock.patch.object(
+            minimax.connectors, "executable", return_value="/fake/mcode"
+        ), mock.patch.object(minimax.connectors, "probe", side_effect=probe), mock.patch.object(
+            connectors.platform, "system", return_value="Linux"
+        ), mock.patch.object(
+            connectors.platform, "mac_ver", return_value=("", ("", "", ""), "")
+        ), mock.patch.object(
+            connectors.platform, "release", return_value="6.8.0"
+        ), mock.patch.object(
+            connectors.platform, "machine", return_value="x86_64"
+        ):
+            checked = minimax.check(peer.Deadline(30.0), self.temp)
+
+        self.assertIn(
+            "minimax mechanics are ready, but live authentication is "
+            "unconfirmed: version 0.2.8",
+            checked.message,
+        )
+        self.assertEqual(
+            probed,
+            [
+                ("/fake/mcode", "--version"),
+                ("/fake/mcode", "exec", "--help"),
+            ],
+        )
+        self.assertTrue(all("provider" not in " ".join(call) for call in probed))
+        self.assertGreaterEqual(
+            sum("outside the release evidence" in warning for warning in checked.warnings),
+            2,
+        )
+        self.assertTrue(
+            any("authentication" in warning.lower() for warning in checked.warnings)
+        )
+        for phrase in (
+            "discretionary permission mode",
+            "not a sandbox",
+            "--max-steps=1 limits assistant steps",
+            "does not disable tools",
+            "ask is interactive",
+            "full bypasses",
+            "off disables permission checks",
+        ):
+            self.assertIn(phrase, minimax.WARNING)
+
+        prerequisite = (
+            "/fake/mcode",
+            "0.2.7",
+            "Darwin 26 arm64",
+            "authentication not confirmed",
+            (minimax.WARNING,),
+        )
+        with mock.patch.object(minimax, "_prerequisites", return_value=prerequisite):
+            command = minimax.build_command(peer.Deadline(30.0), self.temp)
+            huge = minimax.build_command(
+                peer.Deadline(
+                    minimax.MAX_NATIVE_TIMEOUT_MILLISECONDS / 1000.0 + 1.0
+                ),
+                self.temp,
+            )
+            astronomical = minimax.build_command(
+                peer.Deadline(1e308), self.temp
+            )
+        self.assertEqual(
+            command.argv,
+            (
+                "/fake/mcode",
+                "exec",
+                "--input",
+                "-",
+                "--input-format",
+                "text",
+                "--cwd",
+                self.temp,
+                "--permission",
+                "smart",
+                "--timeout",
+                "30000ms",
+                "--max-steps",
+                "1",
+                "--output-format",
+                "text",
+            ),
+        )
+        self.assertIsNone(command.body_argument)
+        self.assertEqual(command.warnings, (minimax.WARNING,))
+        self.assertFalse(
+            any(value in command.argv for value in ("ask", "full", "off"))
+        )
+        self.assertNotIn("--timeout", huge.argv)
+        self.assertNotIn("--timeout", astronomical.argv)
+        self.assertIn("--max-steps", huge.argv)
+
+    def _qwen_prerequisite(self):
+        return (
+            "/fake/qwen",
+            "0.23.0",
+            "Darwin 26 arm64",
+            "authentication not confirmed",
+            (qwen.INPUT_WARNING, qwen.BOUNDARY_WARNING),
+        )
+
+    def test_qwen_surfaces_the_input_exception_and_exact_zero_tool_vector(self):
+        probed = []
+
+        def probe(argv, cwd, deadline, env=None):
+            probed.append((tuple(argv), dict(env)))
+            return CompletedCall(
+                0,
+                "0.23.0\n" if argv[-1] == "--version"
+                else " ".join(qwen.QUALIFICATION.restrictions),
+                "",
+            )
+
+        with mock.patch.object(
+            connectors, "executable", return_value="/fake/qwen"
+        ), mock.patch.object(
+            connectors, "probe", side_effect=probe
+        ), mock.patch.object(
+            connectors, "qualified_platform", return_value="Darwin 26 arm64"
+        ), mock.patch.dict(
+            os.environ,
+            {
+                "QWEN_SANDBOX": "false",
+                "SANDBOX": "already-inside",
+                "SEATBELT_PROFILE": "permissive-open",
+                "QWEN_SANDBOX_PROXY_COMMAND": "detached proxy command",
+                "QWEN_CODE_RELAUNCH_ARGS": '["--prompt","unapproved turn"]',
+                "NO_BROWSER": "0",
+                "HTTPS_PROXY": "http://provider-proxy.invalid",
+            },
+        ):
+            checked = qwen.check(peer.Deadline(30.0), self.temp)
+            commands = {
+                seconds: qwen.build_command(peer.Deadline(seconds), self.temp)
+                for seconds in (
+                    45.0,
+                    900.0,
+                    12.25,
+                    qwen.MAX_NATIVE_WALL_TIME_SECONDS + 1.0,
+                    1e308,
+                )
+            }
+
+        command = commands[900.0]
+
+        self.assertEqual(
+            checked.warnings,
+            (qwen.INPUT_WARNING, qwen.BOUNDARY_WARNING),
+        )
+        self.assertTrue(
+            checked.message.startswith(
+                "qwen mechanics are ready, but live authentication is unconfirmed:"
+            )
+        )
+        self.assertEqual(command.warnings, checked.warnings)
+        for phrase in (
+            "leading / commands",
+            "unescaped @ references",
+            "both text and stream-json",
+            "alter or replace the effective prompt",
+            "inject readable file or resource content",
+            "complete a command without a model call",
+            "Safe mode does not disable",
+            "no lossless raw escape or switch",
+            "before --max-tool-calls=0",
+            "budget does not stop it",
+            "pre-model command families",
+            "/bug, /config, /update, /import-config, /language, /effort, "
+            "/model, and /doctor",
+            "write diagnostics",
+            "installer rollback",
+            "Other recognized slash-command preprocessing remains enabled",
+        ):
+            self.assertIn(phrase, qwen.INPUT_WARNING)
+        self.assertIn("first such attempt", qwen.BOUNDARY_WARNING)
+        self.assertIn("bundled skills still load", qwen.BOUNDARY_WARNING)
+        self.assertNotIn("extensions, skills", qwen.BOUNDARY_WARNING)
+        for phrase in (
+            "Safe mode still loads settings and .env",
+            "restore SANDBOX and bypass the sandbox",
+            "restore QWEN_SANDBOX_PROXY_COMMAND",
+            "detached shell outside the sandbox and Bridge's process group",
+            "Missing or empty values cannot pin those routes off",
+        ):
+            self.assertIn(phrase, qwen.BOUNDARY_WARNING)
+        self.assertEqual(
+            command.argv,
+            (
+                "/fake/qwen",
+                "--safe-mode",
+                "--sandbox=sandbox-exec",
+                "--chat-recording=false",
+                "--approval-mode=plan",
+                "--disabled-slash-commands="
+                "bug,config,update,import-config,language,effort,model,doctor",
+                "--max-tool-calls=0",
+                "--max-session-turns=1",
+                "--max-wall-time=900s",
+                "--input-format=stream-json",
+                "--output-format=stream-json",
+                "--openai-logging=false",
+            ),
+        )
+        self.assertIn("--max-wall-time=45s", commands[45.0].argv)
+        self.assertIn("--max-wall-time=900s", commands[900.0].argv)
+        self.assertIn("--max-wall-time=13s", commands[12.25].argv)
+        self.assertFalse(
+            any(
+                argument.startswith("--max-wall-time")
+                for argument in commands[
+                    qwen.MAX_NATIVE_WALL_TIME_SECONDS + 1.0
+                ].argv
+            )
+        )
+        self.assertFalse(
+            any(
+                argument.startswith("--max-wall-time")
+                for argument in commands[1e308].argv
+            )
+        )
+        self.assertIsNone(command.body_argument)
+        self.assertIs(command.response_parser, qwen.parse_response)
+        self.assertIs(command.stdin_encoder, qwen.encode_request)
+        environment = dict(command.env)
+        self.assertEqual(
+            environment["QWEN_RUNTIME_DIR"],
+            os.path.join(self.temp, qwen.RUNTIME_DIRECTORY),
+        )
+        self.assertEqual(environment["QWEN_TELEMETRY_ENABLED"], "0")
+        self.assertEqual(environment["QWEN_USAGE_STATISTICS_ENABLED"], "0")
+        self.assertEqual(environment["NODE_DISABLE_COMPILE_CACHE"], "1")
+        self.assertEqual(environment["NO_BROWSER"], "1")
+        self.assertEqual(environment["SEATBELT_PROFILE"], "restrictive-open")
+        self.assertEqual(environment["QWEN_SANDBOX"], "sandbox-exec")
+        self.assertEqual(
+            environment["HTTPS_PROXY"], "http://provider-proxy.invalid"
+        )
+        for name in (
+            "SANDBOX",
+            "QWEN_SANDBOX_PROXY_COMMAND",
+            "QWEN_CODE_RELAUNCH_ARGS",
+        ):
+            self.assertNotIn(name, environment)
+        self.assertEqual(len(probed), 12)
+        for argv, probe_env in probed:
+            self.assertIn(argv, (("/fake/qwen", "--version"), ("/fake/qwen", "--help")))
+            self.assertNotIn("QWEN_CODE_RELAUNCH_ARGS", probe_env)
+            self.assertNotIn("SANDBOX", probe_env)
+            self.assertNotIn("QWEN_SANDBOX_PROXY_COMMAND", probe_env)
+            self.assertEqual(probe_env["QWEN_SANDBOX"], "sandbox-exec")
+            self.assertEqual(probe_env["SEATBELT_PROFILE"], "restrictive-open")
+        self.assertFalse(
+            any(
+                argument.startswith("--model")
+                or argument.startswith("--provider")
+                for argument in command.argv
+            )
+        )
+
+    def test_qwen_accepts_only_a_successful_terminal_json_result(self):
+        body = (
+            'PRIVATE QWEN "confidential caf\u00e9" \\ details '
+            + "request-content " * 50
+            + "PRIVATE END\n"
+        )
+        success_text = (
+            "Final caf\u00e9\n" + body
+            + "Authorization: Bearer successful-header-value\n"
+            + '{"api_key":"successful-response-value"}\n'
+        )
+        success_output = "\n".join(json.dumps(message) for message in (
+            {"type": "assistant", "message": "ignored"},
+            {
+                "type": "result",
+                "subtype": "success",
+                "is_error": False,
+                "result": success_text,
+            },
+        )) + "\n"
+        self.assertEqual(
+            qwen.parse_response(success_output),
+            success_text,
+        )
+        invalid = (
+            "not JSON",
+            "[]",
+            '{"type":"assistant","message":"not terminal result"}',
+            '{"type":"result","subtype":"error","is_error":true,'
+            '"error":{"message":"failed"}}',
+            '{"type":"result","subtype":"success","is_error":false}',
+            success_output + success_output,
+            success_output + '{"type":"assistant","message":"too late"}\n',
+        )
+        for output in invalid:
+            with self.subTest(output=output):
+                with self.assertRaises(BridgeError) as caught:
+                    qwen.parse_response(output)
+                self.assertEqual(caught.exception.failure, Failure.PEER_FAILURE)
+
+        structured_failure = json.dumps({
+            "type": "result",
+            "subtype": "error",
+            "is_error": True,
+            "error": {
+                "message": (
+                    "provider quota exhausted\n" + "p" * 120 + body
+                    + '{"api_key":"structured-secret-value"}\n'
+                    + "x" * 600 + "STRUCTURED TAIL"
+                ),
+            },
+        }) + "\n"
+        credential_failure = json.dumps({
+            "type": "result", "subtype": "error", "is_error": True,
+            "error": (
+                "provider quota exhausted\n"
+                '{"api_key":"escaped-opaque-secret"}\n'
+            ),
+        }) + "\n"
+        prefixed_credential_failure = json.dumps({
+            "type": "result", "subtype": "error", "is_error": True,
+            "error": (
+                "provider quota exhausted\n"
+                "OPENAI_API_KEY=opaqueApiValue\n"
+                "ANTHROPIC_AUTH_TOKEN=opaqueAuthValue\n"
+            ),
+        }) + "\n"
+        script = (
+            "import sys\n"
+            "sys.stdout.write(sys.argv[1])\n"
+            "sys.stderr.write('qwen exited after its structured result\\n')\n"
+            "raise SystemExit(int(sys.argv[2]))\n"
+        )
+        for name, output, exit_code in (
+            ("failure", structured_failure, 9),
+            ("credentials", credential_failure, 9),
+            ("prefixed-credentials", prefixed_credential_failure, 9),
+            ("success", success_output, 9),
+            ("failure", structured_failure, 0),
+            ("credentials", credential_failure, 0),
+            ("prefixed-credentials", prefixed_credential_failure, 0),
+            ("success", success_output, 0),
+        ):
+            with self.subTest(result=name, exit_code=exit_code):
+                session_dir = os.path.join(
+                    self.temp, "qwen-{0}-{1}".format(name, exit_code)
+                )
+                record.record(
+                    session_dir,
+                    "session-create",
+                    "Qwen parsed result.\n",
+                    initiator="ordinary.app",
+                    peer="qwen",
+                )
+
+                def build(deadline, cwd):
+                    return PeerCommand(
+                        argv=(sys.executable, "-c", script, output, str(exit_code)),
+                        cwd=cwd,
+                        env=tuple(os.environ.items()),
+                        response_parser=qwen.parse_response,
+                        stdin_encoder=qwen.encode_request,
+                    )
+
+                if name == "success" and exit_code == 0:
+                    result = runner.run_turn(session_dir, body, 30.0, build)
+                    with open(result.response_path, "rb") as stream:
+                        self.assertEqual(
+                            stream.read(),
+                            session.peer_to_initiator_text(
+                                2, "qwen", "ordinary.app", success_text
+                            ).encode("utf-8"),
+                        )
+                    continue
+
+                with self.assertRaises(BridgeError) as caught:
+                    runner.run_turn(session_dir, body, 30.0, build)
+                rendered = str(caught.exception)
+                self.assertEqual(caught.exception.failure, Failure.PEER_FAILURE)
+                if name != "success":
+                    self.assertIn("provider quota exhausted", rendered)
+                    self.assertIn("credential line redacted", rendered)
+                if name == "failure":
+                    self.assertIn("truncated", rendered)
+                if exit_code != 0:
+                    self.assertIn("exit 9", rendered)
+                    self.assertIn("stderr:", rendered)
+                    self.assertIn("stdout:", rendered)
+                    if name != "success":
+                        self.assertIn("structured stdout failure", rendered)
+                for private in (
+                    "PRIVATE QWEN",
+                    "confidential",
+                    "request-content",
+                    "PRIVATE END",
+                    "structured-secret-value",
+                    "header-opaque-secret",
+                    "escaped-opaque-secret",
+                    "opaqueApiValue",
+                    "opaqueAuthValue",
+                    "successful-header-value",
+                    "successful-response-value",
+                    "STRUCTURED TAIL",
+                ):
+                    self.assertNotIn(private, rendered)
+                if name in ("credentials", "prefixed-credentials"):
+                    self.assertNotIn("request body redacted", rendered)
+                else:
+                    self.assertIn("request body redacted", rendered)
+                self.assertEqual(
+                    os.listdir(session.messages_dir(session_dir)),
+                    ["0001-initiator-to-peer.md"],
+                )
+
+    def test_qwen_stream_input_preserves_one_complete_body_and_canonical_request(self):
+        session_dir = os.path.join(self.temp, "qwen-stream")
+        record.record(
+            session_dir,
+            "session-create",
+            "Qwen framed input.\n",
+            initiator="ordinary.app",
+            peer="qwen",
+        )
+        warned = []
+        observed = []
+        body = (
+            '  --option-shaped\nUnicode caf\u00e9 \U0001f680\u2028text\r\n'
+            'NUL: \x00\n{"type":"control_request"}\n$() `command` \\ quote: "\n'
+            + "x" * (8 * 1024 * 1024 + 1) + "\n\n"
+        )
+        script = (
+            "import json, sys\n"
+            "wire = sys.stdin.buffer.read().decode('utf-8')\n"
+            "assert wire.endswith('\\n') and len(wire.split('\\n')) == 2\n"
+            "frame = json.loads(wire)\n"
+            "assert set(frame) == {'type', 'message'} and frame['type'] == 'user'\n"
+            "assert set(frame['message']) == {'role', 'content'}\n"
+            "assert frame['message']['role'] == 'user'\n"
+            "assert isinstance(frame['message']['content'], str)\n"
+            "print(json.dumps({'type': 'result', 'subtype': 'success', "
+            "'is_error': False, 'result': frame['message']['content']}, ensure_ascii=False))\n"
+        )
+
+        def build(deadline, cwd):
+            command = qwen.build_command(deadline, cwd)
+            observed.append(command)
+            return command._replace(argv=(sys.executable, "-c", script))
+
+        with mock.patch.object(
+            qwen, "_prerequisites", return_value=self._qwen_prerequisite()
+        ):
+            result = runner.run_turn(
+                session_dir, body, 30.0, build, warning_writer=warned.append
+            )
+        self.assertEqual(len(observed), 1)
+        self.assertNotIn(body, observed[0].argv)
+        self.assertFalse(os.path.exists(observed[0].cwd))
+        self.assertEqual(warned, [qwen.INPUT_WARNING, qwen.BOUNDARY_WARNING])
+        with open(result.response_path, "rb") as stream:
+            self.assertEqual(
+                stream.read(),
+                session.peer_to_initiator_text(2, "qwen", "ordinary.app", body).encode("utf-8"),
+            )
+        with open(session.message_path(session_dir, 1, session.INITIATOR_TO_PEER_SUFFIX), "rb") as stream:
+            self.assertEqual(
+                stream.read(),
+                session.initiator_to_peer_text(1, "ordinary.app", "qwen", body).encode("utf-8"),
+            )
+        self.assertEqual(
+            sorted(os.listdir(session.messages_dir(session_dir))),
+            ["0001-initiator-to-peer.md", "0002-peer-to-initiator.md"],
+        )
+
+    def test_qualification_prompts_are_local_only_and_qwen_claims_no_raw_input(self):
+        token = "abc123"
+        evidence = "PROJECT_READ_CANARY={0}".format(token)
+        outside = "/a/path-that-must-not-be-supplied"
+
+        for target in ("codex", "claude", "zcode"):
+            with self.subTest(project_target=target):
+                body = release_conformance._qualification_body(
+                    target, outside, token, evidence
+                )
+                self.assertIn("Inside the supplied disposable repository", body)
+                self.assertIn("Do not attempt any browser or web access", body)
+                self.assertIn(
+                    "Return every response field requested anywhere in this "
+                    "message exactly once",
+                    body,
+                )
+                self.assertNotIn(outside, body)
+
+        for target in ("hermes", "minimax"):
+            with self.subTest(courier_target=target):
+                body = release_conformance._qualification_body(
+                    target, outside, token, evidence
+                )
+                self.assertIn("Do not try to read a project", body)
+                self.assertIn("Make no file, shell, Git", body)
+                self.assertIn(
+                    "Return every response field requested anywhere in this "
+                    "message exactly once",
+                    body,
+                )
+                self.assertNotIn(outside, body)
+
+        qwen_body = release_conformance._qualification_body(
+            "qwen", outside, token, evidence
+        )
+        self.assertNotIn("/", qwen_body)
+        self.assertNotIn("@", qwen_body)
+        self.assertNotIn("raw", qwen_body.lower())
+        self.assertNotIn("TRANSPORT_ECHO", qwen_body)
+        self.assertNotIn("LEADING_HYPHEN_ECHO", qwen_body)
+        self.assertIn("Do not try any tool", qwen_body)
+        self.assertNotIn(outside, qwen_body)
+
+        response = "response-qwen-{0}".format(token)
+        response_text = session.peer_to_initiator_text(
+            2,
+            "qwen",
+            "release-qualification",
+            "QUALIFICATION_RESPONSE: {0}\nCOMPLETE: {0}\n".format(response),
+        )
+        self.assertEqual(
+            release_conformance._check_response(
+                "qwen", response_text, token, evidence
+            ),
+            {},
+        )
+
+
+class QualificationUsesProductionController(unittest.TestCase):
+    """Qualification reuses the public CLI and its one production process owner."""
+
+    def test_qualification_combines_original_failure_with_final_inspection(self):
+        captured = {}
+        real_synthetic = release_conformance._synthetic_repository
+
+        def synthetic(parent, token):
+            project, evidence = real_synthetic(parent, token)
+            captured["parent"] = parent
+            captured["project"] = project
+            return project, evidence
+
+        def create_session(session_dir, peer_id, body, project=None):
+            record.record(
+                session_dir,
+                "session-create",
+                body,
+                initiator="release-qualification",
+                peer=peer_id,
+                project=project,
+            )
+
+        def fail_after_mutation(arguments, body):
+            with open(
+                os.path.join(captured["project"], "unexpected.txt"),
+                "w",
+                encoding="utf-8",
+            ) as stream:
+                stream.write("mutation that final inspection must report\n")
+            with open(
+                os.path.join(captured["project"], ".git", "index.lock"),
+                "w",
+                encoding="utf-8",
+            ) as stream:
+                stream.write("stale lock\n")
+            raise release_conformance.ConformanceError("primary launcher failure")
+
+        output = io.StringIO()
+        with mock.patch.object(
+            release_conformance,
+            "_synthetic_repository",
+            side_effect=synthetic,
+        ), mock.patch.object(
+            release_conformance,
+            "_restriction_vector",
+            return_value="fixed vector",
+        ), mock.patch.object(
+            release_conformance,
+            "_create_session",
+            side_effect=create_session,
+        ), mock.patch.object(
+            release_conformance,
+            "_public_bridge",
+            side_effect=fail_after_mutation,
+        ), mock.patch.object(
+            release_conformance,
+            "_inspect_post_call_state",
+            wraps=release_conformance._inspect_post_call_state,
+        ) as inspected, contextlib.redirect_stdout(output):
+            with self.assertRaises(
+                release_conformance.ConformanceError
+            ) as caught:
+                release_conformance.qualify("codex")
+
+        failure = str(caught.exception)
+        self.assertIn("original failure: primary launcher failure", failure)
+        self.assertIn("repository untracked changed", failure)
+        self.assertIn("synthetic repository is not clean", failure)
+        self.assertIn("Git lock files survived", failure)
+        self.assertEqual(inspected.call_count, 1)
+        self.assertIn("production bounded process-group controller", output.getvalue())
+        self.assertFalse(os.path.exists(captured["parent"]))
+
+        def malformed_response(arguments, body):
+            session_dir = arguments[arguments.index("--session") + 1]
+            record_data = session.read_session(session_dir)
+            request_path = session.message_path(
+                session_dir, 1, session.INITIATOR_TO_PEER_SUFFIX
+            )
+            session.publish(
+                request_path,
+                session.initiator_to_peer_text(
+                    1, record_data.initiator, record_data.peer, body
+                ),
+            )
+            response_body = (
+                "QUALIFICATION_RESPONSE: duplicate-one\n"
+                "QUALIFICATION_RESPONSE: duplicate-two\n"
+                "COMPLETE: synthetic-complete\n"
+                "CONTROL: \x00 caf\u00e9\n"
+                + "x" * 600
+                + "UNBOUNDED TAIL"
+            )
+            response_text = session.peer_to_initiator_text(
+                2, record_data.peer, record_data.initiator, response_body
+            )
+            response_path = session.message_path(
+                session_dir, 2, session.PEER_TO_INITIATOR_SUFFIX
+            )
+            session.publish(response_path, response_text)
+            captured["response_text"] = response_text
+            return release_conformance._BridgeCall(
+                0, response_path + "\n", "Warning: synthetic warning\n"
+            )
+
+        real_rmtree = release_conformance.shutil.rmtree
+
+        def observed_rmtree(path):
+            self.assertIn(
+                "qualification response diagnostic:", mismatch_errors.getvalue()
+            )
+            return real_rmtree(path)
+
+        mismatch_output = io.StringIO()
+        mismatch_errors = io.StringIO()
+        with mock.patch.object(
+            release_conformance,
+            "_synthetic_repository",
+            side_effect=synthetic,
+        ), mock.patch.object(
+            release_conformance,
+            "_restriction_vector",
+            return_value="fixed vector",
+        ), mock.patch.object(
+            release_conformance,
+            "_create_session",
+            side_effect=create_session,
+        ), mock.patch.object(
+            release_conformance,
+            "_public_bridge",
+            side_effect=malformed_response,
+        ), mock.patch.object(
+            release_conformance.shutil,
+            "rmtree",
+            side_effect=observed_rmtree,
+        ), contextlib.redirect_stdout(mismatch_output), contextlib.redirect_stderr(
+            mismatch_errors
+        ):
+            with self.assertRaises(
+                release_conformance.ConformanceError
+            ) as mismatch_failure:
+                release_conformance.qualify("codex")
+
+        self.assertIn(
+            "does not contain exactly one QUALIFICATION_RESPONSE",
+            str(mismatch_failure.exception),
+        )
+        diagnostic = mismatch_errors.getvalue()
+        response_bytes = captured["response_text"].encode("utf-8")
+        self.assertIn("bytes={0}".format(len(response_bytes)), diagnostic)
+        self.assertIn(
+            "sha256={0}".format(
+                release_conformance.hashlib.sha256(response_bytes).hexdigest()
+            ),
+            diagnostic,
+        )
+        self.assertIn("QUALIFICATION_RESPONSE=2", diagnostic)
+        self.assertIn("CREATE_EFFECT=0", diagnostic)
+        self.assertIn("COMPLETE=1", diagnostic)
+        self.assertIn("\\u0000", diagnostic)
+        self.assertIn("caf\\u00e9", diagnostic)
+        self.assertIn("truncated", diagnostic)
+        self.assertNotIn("UNBOUNDED TAIL", diagnostic)
+        self.assertFalse(os.path.exists(captured["parent"]))
+
+
+class FormatTwoRecords(unittest.TestCase):
+    """The immutable session, neutral note, strict reader, and closed kinds."""
 
     def setUp(self):
         self.temp = tempfile.mkdtemp(prefix="agent-bridge-records-")
@@ -1218,14 +2586,13 @@ class LocalRecordKinds(unittest.TestCase):
     def tearDown(self):
         shutil.rmtree(self.temp, ignore_errors=True)
 
-    def _create(self, project=None):
+    def _create(self, project=None, initiator="my-app", peer_id="claude"):
         return record.record(
             self.session_dir,
             "session-create",
-            "Work out what to build, then build it.\n",
-            local="codex",
-            peer="claude",
-            workflow="programming-loop",
+            "A bounded courier conversation.\n",
+            initiator=initiator,
+            peer=peer_id,
             project=project,
         )
 
@@ -1236,7 +2603,7 @@ class LocalRecordKinds(unittest.TestCase):
     def _numbered(self, sequence):
         return self._read(
             session.message_path(
-                self.session_dir, sequence, session.LOCAL_RECORD_SUFFIX
+                self.session_dir, sequence, session.INITIATOR_RECORD_SUFFIX
             )
         )
 
@@ -1250,11 +2617,9 @@ class LocalRecordKinds(unittest.TestCase):
         self.assertEqual(path, session.session_file(self.session_dir))
         self.assertEqual(
             self._read(path),
-            "# Session\n\nBridge-Format: 1\nLocal: codex\nPeer: claude\n"
-            "Workflow: programming-loop\nProject: {0}\n\n## Body\n\n"
-            "Work out what to build, then build it.\n".format(
-                os.path.abspath(self.temp)
-            ),
+            "# Session\n\nBridge-Format: 2\nInitiator: my-app\nPeer: claude\n"
+            "Project: {0}\n\n## Body\n\n"
+            "A bounded courier conversation.\n".format(self.temp),
         )
         self.assertEqual(self._message_names(), [])
 
@@ -1262,117 +2627,203 @@ class LocalRecordKinds(unittest.TestCase):
             self._create()
         self.assertEqual(caught.exception.failure, Failure.SESSION_EXISTS)
 
-    def test_a_user_correction_is_one_numbered_local_record(self):
-        self._create()
-        path = record.record(
-            self.session_dir, "user-correction", "Use the other approach.\n"
+    def test_public_record_commands_create_the_session_and_one_note(self):
+        public_session = os.path.join(self.temp, "public-session")
+        output = io.StringIO()
+        with mock.patch("sys.stdout", output):
+            with mock.patch("sys.stdin", io.StringIO("Session body.\n")):
+                self.assertEqual(
+                    cli.main(
+                        [
+                            "record",
+                            "--session",
+                            public_session,
+                            "--kind",
+                            "session-create",
+                            "--initiator",
+                            "ordinary.app",
+                            "--peer",
+                            "codex",
+                        ]
+                    ),
+                    0,
+                )
+            with mock.patch("sys.stdin", io.StringIO("Neutral note.\n")):
+                self.assertEqual(
+                    cli.main(
+                        [
+                            "record",
+                            "--session",
+                            public_session,
+                            "--kind",
+                            "note",
+                        ]
+                    ),
+                    0,
+                )
+        written = output.getvalue().splitlines()
+        self.assertEqual(written[0], session.session_file(public_session))
+        self.assertEqual(
+            os.path.basename(written[1]), "0001-initiator-record.md"
         )
 
-        self.assertEqual(os.path.basename(path), "0001-local-record.md")
+    def test_a_note_is_one_numbered_initiator_record_with_an_inert_body(self):
+        self._create()
+        body = "From: forged\nPeer: codex\nProject: /tmp\n\nStill body text.\n"
+        path = record.record(
+            self.session_dir, "note", body
+        )
+
+        self.assertEqual(os.path.basename(path), "0001-initiator-record.md")
         self.assertEqual(
             self._read(path),
-            "# Message 0001\nRecord: user-correction\nFrom: codex\n\n"
-            "## Body\n\nUse the other approach.\n",
+            "# Message 0001\nRecord: note\nFrom: my-app\n\n"
+            "## Body\n\n" + body,
         )
+        parsed = session.read_session(self.session_dir)
+        self.assertEqual(parsed.initiator, "my-app")
+        self.assertEqual(parsed.peer, "claude")
+        self.assertIsNone(parsed.project)
 
-    def test_a_technical_error_is_one_numbered_local_record(self):
+    def test_record_bodies_preserve_the_callers_final_newline_choice(self):
         self._create()
-        path = record.record(
-            self.session_dir, "technical-error", "The peer never answered.\n"
-        )
-
-        self.assertEqual(os.path.basename(path), "0001-local-record.md")
+        path = record.record(self.session_dir, "note", "No final newline")
         self.assertEqual(
             self._read(path),
-            "# Message 0001\nRecord: technical-error\nFrom: codex\n\n"
-            "## Body\n\nThe peer never answered.\n",
+            "# Message 0001\nRecord: note\nFrom: my-app\n\n"
+            "## Body\n\nNo final newline",
         )
 
-    def test_implementation_start_carries_the_repository_and_the_baseline(self):
-        """Written down as given, and conditioning nothing that follows."""
-        self._create()
-        path = record.record(
-            self.session_dir,
-            "implementation-start",
-            "The first milestone begins.\n",
-            project=self.temp,
-            baseline="e5f69d273ac5a4f34bf7a068963c6f36f592f0a9",
-        )
-
-        self.assertEqual(
-            self._read(path),
-            "# Message 0001\nRecord: implementation-start\nFrom: codex\n"
-            "Repository-Path: {0}\n"
-            "Baseline: e5f69d273ac5a4f34bf7a068963c6f36f592f0a9\n\n"
-            "## Body\n\nThe first milestone begins.\n".format(
-                os.path.abspath(self.temp)
-            ),
-        )
-
-    def test_plan_approval_seals_the_plan_and_replacing_it_must_be_asked_for(
-        self,
-    ):
-        """An approved plan is not overwritten by accident, or lost on purpose.
-
-        Sealing writes the numbered record first and `PLAN.md` second, so the
-        approved text is in the ordered account of the session either way. A
-        second approval over a sealed plan is refused unless the command says
-        `--replace`, and when it does, the plan it replaced stays readable in
-        the message it was written into.
-        """
-        self._create()
-        first = record.record(
-            self.session_dir, "plan-approval", "The approved plan.\n"
-        )
-
-        self.assertEqual(first, session.plan_file(self.session_dir))
-        self.assertEqual(self._read(first), "The approved plan.\n")
-        self.assertEqual(
-            self._numbered(1),
-            "# Message 0001\nRecord: plan-approval\nFrom: codex\n"
-            "Plan: SEALED\n\n## Body\n\nThe approved plan.\n",
-        )
-
-        with self.assertRaises(BridgeError) as caught:
-            record.record(
-                self.session_dir, "plan-approval", "A different plan.\n"
-            )
-        self.assertEqual(caught.exception.failure, Failure.PLAN_SEALED)
-        self.assertEqual(self._read(first), "The approved plan.\n")
-        self.assertEqual(self._message_names(), ["0001-local-record.md"])
-
-        second = record.record(
-            self.session_dir,
-            "plan-approval",
-            "A different plan.\n",
-            replace=True,
-        )
-
-        self.assertEqual(self._read(second), "A different plan.\n")
-        self.assertEqual(
-            self._numbered(2),
-            "# Message 0002\nRecord: plan-approval\nFrom: codex\n"
-            "Plan: REPLACED\n\n## Body\n\nA different plan.\n",
-        )
-        self.assertIn("The approved plan.", self._numbered(1))
-
-    def test_a_sixth_kind_is_refused_and_writes_nothing(self):
-        """The list of kinds is closed, so a plausible name is still not one."""
+    def test_unknown_kind_is_refused_and_writes_nothing(self):
         self._create()
 
         with self.assertRaises(BridgeError) as caught:
             record.record(
                 self.session_dir,
-                "implementation-finish",
+                "legacy-kind",
                 "Anything at all.\n",
             )
 
         self.assertEqual(
             caught.exception.failure, Failure.UNKNOWN_RECORD_KIND
         )
-        self.assertIn("implementation-finish", str(caught.exception))
+        self.assertIn("legacy-kind", str(caught.exception))
         self.assertEqual(self._message_names(), [])
-        self.assertFalse(os.path.exists(session.plan_file(self.session_dir)))
+
+    def test_unknown_target_is_refused_before_a_session_is_published(self):
+        with self.assertRaises(BridgeError) as caught:
+            self._create(peer_id="other")
+        self.assertEqual(caught.exception.failure, Failure.UNKNOWN_HARNESS)
+        self.assertFalse(os.path.exists(session.session_file(self.session_dir)))
+
+    def test_valid_unregistered_labels_work_and_invalid_labels_publish_nothing(self):
+        labels = ("ora", "gear-3", "vibe_coder.2", "codex")
+        for index, label in enumerate(labels):
+            with self.subTest(label=label):
+                self.session_dir = os.path.join(self.temp, "session-{0}".format(index))
+                self._create(initiator=label)
+                self.assertEqual(session.read_session(self.session_dir).initiator, label)
+        for index, label in enumerate(("", "-bad", "bad label", "caf\u00e9", "bad/label")):
+            with self.subTest(label=label):
+                self.session_dir = os.path.join(self.temp, "invalid-{0}".format(index))
+                with self.assertRaises(BridgeError) as caught:
+                    self._create(initiator=label)
+                self.assertEqual(caught.exception.failure, Failure.USAGE_ERROR)
+                self.assertFalse(os.path.exists(session.session_file(self.session_dir)))
+
+    def test_project_must_be_absolute_and_exist_when_the_session_is_created(self):
+        spaced = os.path.join(self.temp, "spaced ")
+        lined = os.path.join(self.temp, "line\nbreak")
+        os.makedirs(spaced)
+        os.makedirs(lined)
+        for index, project in enumerate((
+            "relative",
+            os.path.join(self.temp, "missing"),
+            spaced,
+            lined,
+        )):
+            with self.subTest(project=project):
+                self.session_dir = os.path.join(self.temp, "project-{0}".format(index))
+                with self.assertRaises(BridgeError) as caught:
+                    self._create(project=project)
+                self.assertEqual(caught.exception.failure, Failure.USAGE_ERROR)
+                self.assertFalse(os.path.exists(session.session_file(self.session_dir)))
+
+    def test_strict_reader_rejects_legacy_duplicate_unknown_and_malformed_sessions(self):
+        variants = {
+            "legacy": (
+                "# Session\n\nBridge-Format: 1\nLocal: codex\nPeer: claude\n"
+                "Workflow: planning\n\n## Body\n\nOld shape.\n"
+            ),
+            "duplicate": (
+                "# Session\n\nBridge-Format: 2\nInitiator: app\nInitiator: other\n"
+                "Peer: claude\n\n## Body\n\nDuplicate.\n"
+            ),
+            "unknown": (
+                "# Session\n\nBridge-Format: 2\nInitiator: app\nPeer: claude\n"
+                "Status: ready\n\n## Body\n\nUnknown.\n"
+            ),
+            "bad target": (
+                "# Session\n\nBridge-Format: 2\nInitiator: app\nPeer: other\n\n"
+                "## Body\n\nBad target.\n"
+            ),
+            "bad project": (
+                "# Session\n\nBridge-Format: 2\nInitiator: app\nPeer: claude\n"
+                "Project: relative\n\n## Body\n\nBad project.\n"
+            ),
+            "empty body": (
+                "# Session\n\nBridge-Format: 2\nInitiator: app\nPeer: claude\n\n"
+                "## Body\n\n   \n"
+            ),
+        }
+        for index, (name, text) in enumerate(variants.items()):
+            with self.subTest(case=name):
+                self.session_dir = os.path.join(self.temp, "invalid-read-{0}".format(index))
+                os.makedirs(session.messages_dir(self.session_dir))
+                with open(session.session_file(self.session_dir), "w", encoding="utf-8") as stream:
+                    stream.write(text)
+                with self.assertRaises(BridgeError) as caught:
+                    session.read_session(self.session_dir)
+                self.assertEqual(caught.exception.failure, Failure.SESSION_INVALID)
+
+    def test_invalid_utf8_session_is_reported_as_session_invalid_by_the_cli(self):
+        os.makedirs(session.messages_dir(self.session_dir))
+        with open(session.session_file(self.session_dir), "wb") as stream:
+            stream.write(b"# Session\n\nBridge-Format: 2\nInitiator: app\xff\n")
+
+        with self.assertRaises(BridgeError) as caught:
+            session.read_session(self.session_dir)
+        self.assertEqual(caught.exception.failure, Failure.SESSION_INVALID)
+
+        captured = io.StringIO()
+        with mock.patch("sys.stderr", captured):
+            with mock.patch("sys.stdin", io.StringIO("Neutral note.\n")):
+                status = cli.main(
+                    [
+                        "record",
+                        "--session",
+                        self.session_dir,
+                        "--kind",
+                        "note",
+                    ]
+                )
+
+        self.assertEqual(status, 1)
+        self.assertIn(
+            "record could not be read as a valid session", captured.getvalue()
+        )
+        self.assertIn("Next action:", captured.getvalue())
+        self.assertNotIn("Traceback", captured.getvalue())
+        self.assertEqual(self._message_names(), [])
+
+    def test_note_refuses_session_creation_arguments(self):
+        self._create()
+        for kwargs in ({"initiator": "other"}, {"peer": "codex"}, {"project": self.temp}):
+            with self.subTest(arguments=kwargs):
+                with self.assertRaises(BridgeError) as caught:
+                    record.record(self.session_dir, "note", "Neutral.\n", **kwargs)
+                self.assertEqual(caught.exception.failure, Failure.USAGE_ERROR)
+        self.assertEqual(self._message_names(), [])
 
 
 class CommandLineBody(unittest.TestCase):
@@ -1395,9 +2846,8 @@ class CommandLineBody(unittest.TestCase):
             self.session_dir,
             "session-create",
             "Prove the command-line transport without a real harness.\n",
-            local="codex",
+            initiator="sample-app",
             peer="hermes",
-            workflow="planning",
         )
 
     def tearDown(self):
@@ -1416,10 +2866,10 @@ class CommandLineBody(unittest.TestCase):
         """
         argv = (sys.executable, FAKE_PEER, "last-argument") + vector_tail
 
-        def build(deadline):
+        def build(deadline, cwd):
             return PeerCommand(
                 argv=argv,
-                cwd=self.temp,
+                cwd=cwd,
                 env=tuple(os.environ.items()),
                 body_argument=prefix,
             )
@@ -1438,16 +2888,15 @@ class CommandLineBody(unittest.TestCase):
             with self.subTest(transport=name):
                 result = runner.run_turn(
                     self.session_dir,
-                    "hermes",
                     body,
-                    self._builder(prefix, *tail),
                     30.0,
+                    self._builder(prefix, *tail),
                 )
                 with open(result.response_path, encoding="utf-8") as stream:
                     response = stream.read()
                 self.assertEqual(
                     response,
-                    "# Message {0:04d}\nFrom: hermes\nTo: codex\n\n## Body\n\n"
+                    "# Message {0:04d}\nFrom: hermes\nTo: sample-app\n\n## Body\n\n"
                     "{1}".format(result.response_sequence, prefix + body),
                 )
                 self.assertNotIn("STANDARD INPUT WAS NOT EMPTY", response)
@@ -1473,10 +2922,9 @@ class CommandLineBody(unittest.TestCase):
                 with self.assertRaises(BridgeError) as caught:
                     runner.run_turn(
                         self.session_dir,
-                        "hermes",
                         body,
-                        self._builder("", "--"),
                         30.0,
+                        self._builder("", "--"),
                     )
                 self.assertEqual(caught.exception.failure, Failure.USAGE_ERROR)
                 self.assertIn(expected, str(caught.exception))
@@ -1485,24 +2933,78 @@ class CommandLineBody(unittest.TestCase):
     def test_a_courier_only_peer_is_refused_a_project_before_anything_starts(
         self,
     ):
-        """Refused by the command line, with nothing read and nothing sent."""
-        captured = io.StringIO()
-        with mock.patch("sys.stderr", captured):
-            with mock.patch("sys.stdin", io.StringIO("A question.\n")):
-                status = cli.main(
-                    [
-                        "run",
-                        "--peer",
-                        "hermes",
-                        "--session",
-                        self.session_dir,
-                        "--project",
-                        self.temp,
-                    ]
+        """All three courier targets fail before connector import or publication."""
+        for peer_id in ("hermes", "minimax", "qwen"):
+            with self.subTest(peer=peer_id):
+                project_session = os.path.join(
+                    self.temp, "project-session-{0}".format(peer_id)
                 )
-        self.assertEqual(status, 1)
-        self.assertIn("--project is not accepted for hermes", captured.getvalue())
-        self.assertIn("Next action:", captured.getvalue())
+                record.record(
+                    project_session,
+                    "session-create",
+                    "This target cannot receive a project.\n",
+                    initiator="sample-app",
+                    peer=peer_id,
+                    project=self.temp,
+                )
+                captured = io.StringIO()
+                with mock.patch.object(
+                    runner.connectors,
+                    "resolve",
+                    side_effect=AssertionError(
+                        "courier project refusal reached connector resolution"
+                    ),
+                ):
+                    with mock.patch("sys.stderr", captured), mock.patch(
+                        "sys.stdin", io.StringIO("A question.\n")
+                    ):
+                        status = cli.main(
+                            [
+                                "run",
+                                "--session",
+                                project_session,
+                            ]
+                        )
+                self.assertEqual(status, 1)
+                self.assertIn(
+                    "project for {0}".format(peer_id), captured.getvalue()
+                )
+                self.assertIn("Next action:", captured.getvalue())
+                self.assertEqual(
+                    sorted(os.listdir(session.messages_dir(project_session))), []
+                )
+
+    def test_command_surface_rejects_removed_run_and_record_arguments(self):
+        removed = (
+            ["run", "--session", self.session_dir, "--peer", "hermes"],
+            ["run", "--session", self.session_dir, "--project", self.temp],
+            ["run", "--session", self.session_dir, "--review-base", "a"],
+            [
+                "record",
+                "--session",
+                self.session_dir,
+                "--kind",
+                "note",
+                "--local",
+                "old",
+            ],
+            [
+                "record",
+                "--session",
+                self.session_dir,
+                "--kind",
+                "note",
+                "--workflow",
+                "old",
+            ],
+        )
+        for argv in removed:
+            with self.subTest(argv=argv):
+                captured = io.StringIO()
+                with mock.patch("sys.stderr", captured):
+                    with mock.patch("sys.stdin", io.StringIO("Body.\n")):
+                        self.assertEqual(cli.main(argv), 1)
+                self.assertIn("unrecognized arguments", captured.getvalue())
         self.assertEqual(self._messages(), [])
 
 

@@ -1,7 +1,6 @@
 ---
 name: agent-bridge
-description: Use Agent Bridge from ZCode to send one Markdown message to a supported target, report readiness, or add a neutral session note.
-when_to_use: The user asks ZCode to send one courier message, continue an Agent Bridge session, check a supported target, or add a neutral note.
+description: Use Agent Bridge from Codex to send one Markdown message to a supported target, report readiness, or add a neutral session note.
 license: Unlicense
 ---
 
@@ -11,10 +10,9 @@ Agent Bridge is a local courier. It sends one complete Markdown body to one
 supported target, waits in the foreground, and records the request and final
 answer in a human-readable session folder.
 
-This skill is the ZCode adapter. Its initiator label is always `zcode`. It uses
+This skill is the Codex adapter. Its initiator label is always `codex`. It uses
 the same Agent Bridge runtime as every other caller and does not call another
-adapter. Run its commands with ZCode's terminal tool, one foreground command at
-a time.
+adapter. Run its commands with Codex's command tool in the foreground.
 
 ## Boundary
 
@@ -59,8 +57,8 @@ The root must contain `bridge/__main__.py` and `bridge/cli.py`. If none of those
 locations qualifies, ask for the checkout's absolute path. Never search other
 adapters or guess from a directory name.
 
-Run every command below with that directory as the terminal working directory.
-Start it in the foreground as the fixed argument vector beginning
+Run every command below with that directory as the command tool's working
+directory. Start it in the foreground as the fixed argument vector beginning
 `python3 -m bridge`; do not wrap it in another program or leave it running in
 the background. Every session, project, and body-file path supplied to it must
 be absolute.
@@ -87,13 +85,13 @@ Keep ordinary sessions under an absolute expansion of
 `~/.agent-bridge/sessions/<descriptive-name>`. Never write directly inside a
 session folder; only the Bridge commands may do that.
 
-When `SESSION.md` is absent, use ZCode's file-writing tool to place a short
+When `SESSION.md` is absent, use the repository editing tool to place a short
 session description in a task-owned temporary Markdown file outside the
 session. It should say what the conversation is about. Supply that file on
 standard input to:
 
 ```text
-python3 -m bridge record --session <absolute-session-directory> --kind session-create --initiator zcode --peer <target> [--project <absolute-project-directory>] < /absolute/path/to/session-body.md
+python3 -m bridge record --session <absolute-session-directory> --kind session-create --initiator codex --peer <target> [--project <absolute-project-directory>] < /absolute/path/to/session-body.md
 ```
 
 Omit `--project` unless the user wants a project-capable target to read that
@@ -101,7 +99,7 @@ directory. Never use it with `hermes`, `minimax`, or `qwen`. Delete the
 temporary body file after the command returns.
 
 When `SESSION.md` already exists, read it before reuse. It must say
-`Bridge-Format: 2` and `Initiator: zcode`, and its `Peer:` and optional
+`Bridge-Format: 2` and `Initiator: codex`, and its `Peer:` and optional
 `Project:` must match the requested call. If any immutable field differs, show
 the mismatch and create a new session only if the user wants one. Do not edit
 the existing file.
@@ -119,10 +117,10 @@ python3 -m bridge run --session <absolute-session-directory> [--timeout <seconds
 
 Before starting, tell the user which target will be called and which session
 folder will receive the record. A real call can take minutes and consume the
-target harness's quota. Keep the terminal attached and give its foreground wait
-longer than the Bridge timeout. The default Bridge timeout is 900 seconds.
-Surface each `Warning:` line from standard error as it arrives; it does not
-require an acknowledgment and must not be suppressed.
+target harness's quota. Keep the command attached and set its wait longer than
+the Bridge timeout. The default Bridge timeout is 900 seconds. Surface each
+`Warning:` line from standard error as it arrives; it does not require an
+acknowledgment and must not be suppressed.
 
 On success, standard output is the absolute path of the response record. Delete
 the temporary outgoing-body file, read the response at that path, and return

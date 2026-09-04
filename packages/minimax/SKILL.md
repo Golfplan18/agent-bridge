@@ -1,7 +1,6 @@
 ---
 name: agent-bridge
-description: Use Agent Bridge from ZCode to send one Markdown message to a supported target, report readiness, or add a neutral session note.
-when_to_use: The user asks ZCode to send one courier message, continue an Agent Bridge session, check a supported target, or add a neutral note.
+description: Use Agent Bridge from MiniMax Code to send one Markdown message to a supported target, report readiness, or add a neutral session note.
 license: Unlicense
 ---
 
@@ -11,10 +10,10 @@ Agent Bridge is a local courier. It sends one complete Markdown body to one
 supported target, waits in the foreground, and records the request and final
 answer in a human-readable session folder.
 
-This skill is the ZCode adapter. Its initiator label is always `zcode`. It uses
-the same Agent Bridge runtime as every other caller and does not call another
-adapter. Run its commands with ZCode's terminal tool, one foreground command at
-a time.
+This skill is the MiniMax Code adapter. Its initiator label is always `minimax`.
+It uses the same Agent Bridge runtime as every other caller and does not call
+another adapter. Run its commands with MiniMax Code's terminal tool, one
+foreground command at a time.
 
 ## Boundary
 
@@ -87,13 +86,13 @@ Keep ordinary sessions under an absolute expansion of
 `~/.agent-bridge/sessions/<descriptive-name>`. Never write directly inside a
 session folder; only the Bridge commands may do that.
 
-When `SESSION.md` is absent, use ZCode's file-writing tool to place a short
-session description in a task-owned temporary Markdown file outside the
+When `SESSION.md` is absent, use MiniMax Code's file-writing tool to place a
+short session description in a task-owned temporary Markdown file outside the
 session. It should say what the conversation is about. Supply that file on
 standard input to:
 
 ```text
-python3 -m bridge record --session <absolute-session-directory> --kind session-create --initiator zcode --peer <target> [--project <absolute-project-directory>] < /absolute/path/to/session-body.md
+python3 -m bridge record --session <absolute-session-directory> --kind session-create --initiator minimax --peer <target> [--project <absolute-project-directory>] < /absolute/path/to/session-body.md
 ```
 
 Omit `--project` unless the user wants a project-capable target to read that
@@ -101,7 +100,7 @@ directory. Never use it with `hermes`, `minimax`, or `qwen`. Delete the
 temporary body file after the command returns.
 
 When `SESSION.md` already exists, read it before reuse. It must say
-`Bridge-Format: 2` and `Initiator: zcode`, and its `Peer:` and optional
+`Bridge-Format: 2` and `Initiator: minimax`, and its `Peer:` and optional
 `Project:` must match the requested call. If any immutable field differs, show
 the mismatch and create a new session only if the user wants one. Do not edit
 the existing file.

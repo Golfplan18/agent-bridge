@@ -49,7 +49,6 @@ class Failure(enum.Enum):
     SESSION_NOT_FOUND = "SESSION_NOT_FOUND"
     SESSION_INVALID = "SESSION_INVALID"
     SESSION_EXISTS = "SESSION_EXISTS"
-    PLAN_SEALED = "PLAN_SEALED"
     PUBLICATION_FAILURE = "PUBLICATION_FAILURE"
     PUBLICATION_NOT_FLUSHED = "PUBLICATION_NOT_FLUSHED"
     PUBLICATION_UNCERTAIN = "PUBLICATION_UNCERTAIN"
@@ -89,13 +88,10 @@ _GUIDANCE: Dict[Failure, Tuple[str, str]] = {
         "update the connector's declaration in source.",
     ),
     Failure.RESTRICTIONS_UNAVAILABLE: (
-        "The peer harness does not offer the exact switches Agent Bridge needs "
-        "to make it unable to write project files, change Git state, or reach "
-        "a browser, the web, MCP, messaging, credentials, publication or "
-        "deployment - whether by removing those tools or by confining them in "
-        "an enforced sandbox.",
-        "Do not give this harness real project access; report the missing "
-        "restriction so the connector's declaration can be corrected.",
+        "The peer harness does not offer a switch or one-shot input/output "
+        "mechanic required by Agent Bridge's fixed invocation.",
+        "Inspect the named missing mechanic and update or correct the harness "
+        "before checking it again.",
     ),
     Failure.QUALIFICATION_UNSAFE_OR_INCONCLUSIVE: (
         "The disposable qualification run did not clearly prove the harness "
@@ -111,8 +107,8 @@ _GUIDANCE: Dict[Failure, Tuple[str, str]] = {
     ),
     Failure.TIMEOUT: (
         "The turn reached its deadline before the peer produced an answer.",
-        "Run the turn again with a longer --timeout, or check the peer harness "
-        "by hand first.",
+        "Inspect the visible session and target state before deciding whether "
+        "to retry with a longer --timeout.",
     ),
     Failure.PEER_FAILURE: (
         "The peer harness's program exited with a failure.",
@@ -135,8 +131,8 @@ _GUIDANCE: Dict[Failure, Tuple[str, str]] = {
         "input, and run it again.",
     ),
     Failure.UNKNOWN_HARNESS: (
-        "The named harness is not one of the four Agent Bridge knows about.",
-        "Name one of: codex, claude, zcode, hermes.",
+        "The named target is not one of the six Agent Bridge knows about.",
+        "Name one of: codex, claude, zcode, hermes, minimax, qwen.",
     ),
     Failure.CONNECTOR_UNAVAILABLE: (
         "That harness identifier is real, but this build ships no connector "
@@ -144,9 +140,8 @@ _GUIDANCE: Dict[Failure, Tuple[str, str]] = {
         "Use a harness whose connector ships in this build.",
     ),
     Failure.UNKNOWN_RECORD_KIND: (
-        "That record kind is not one of the five the record command accepts.",
-        "Name one of: session-create, user-correction, plan-approval, "
-        "technical-error, implementation-start.",
+        "That record kind is not one of the two the record command accepts.",
+        "Name one of: session-create, note.",
     ),
     Failure.SESSION_NOT_FOUND: (
         "There is no session record at the given directory.",
@@ -164,12 +159,6 @@ _GUIDANCE: Dict[Failure, Tuple[str, str]] = {
         "another one there would overwrite it.",
         "Continue in the existing session, or choose a new empty --session "
         "directory.",
-    ),
-    Failure.PLAN_SEALED: (
-        "This session already holds an approved PLAN.md, and sealing another "
-        "one would overwrite an approved plan.",
-        "If the user has approved a replacement plan, record it again with "
-        "--replace; otherwise leave the sealed plan alone.",
     ),
     Failure.PUBLICATION_FAILURE: (
         "The message could not be written in full and moved into place, so "
