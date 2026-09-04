@@ -110,11 +110,11 @@ agent-bridge record --session <session-directory>
 
 `check` determines whether a target can be used now. Without a model call it finds the documented CLI, reads version and platform, checks authentication as far as the CLI safely permits, and confirms that the switches needed for fixed input, output, foreground control, and the connector's strongest practical posture still exist.
 
-It runs in a task-owned neutral directory and never touches a real project, installs, signs in, selects a model or provider, or writes qualification state. Success prints one readiness sentence and any applicable warnings without changing the successful exit status. A hard failure prints one reason and next action and exits nonzero. No other connector is imported or examined.
+It runs in a task-owned neutral directory and never touches a real project, installs, signs in, selects a model or provider, or writes qualification state. Success writes one readiness sentence followed by any applicable `Warning:` lines to standard output, leaves standard error empty, and exits 0; warnings do not change that status. A hard failure writes one reason and next action to standard error and exits nonzero. No other connector is imported or examined.
 
 ### `run`
 
-`run` reads the session's initiator, target, and optional project, then reads one nonempty Markdown body from standard input. It resolves only that target, repeats cheap prerequisites, validates transport, and determines current warnings. It prints any warnings immediately before publishing the request, then starts exactly one bounded target CLI invocation, captures its final text, and atomically publishes the response.
+`run` reads the session's initiator, target, and optional project, then reads one nonempty Markdown body from standard input. It resolves only that target, repeats cheap prerequisites, validates transport, and determines current warnings. It writes any `Warning:` lines to standard error immediately before publishing the request, then starts exactly one bounded target CLI invocation, captures its final text, and atomically publishes the response.
 
 Warnings never prompt, wait for acknowledgment, read an approval flag, or persist consent. A readable version outside exercised evidence may proceed with a warning when every required switch and the fixed one-shot transport remain usable.
 
@@ -124,7 +124,7 @@ Every run starts a fresh vendor context. Bridge neither resumes a vendor session
 
 A courier-only project session cannot run: Bridge refuses before connector import or request publication and tells the application to include evidence in the body or choose a project-capable target.
 
-Success prints the response path. If a target fails after request publication, the request remains as an honest record, no response is invented, and Bridge exits nonzero with the failure and next action.
+Success writes only the response path to standard output and exits 0. If a target fails after request publication, the request remains as an honest record, no response is invented, and Bridge writes the failure and next action to standard error and exits nonzero.
 
 ### `record`
 
@@ -267,6 +267,8 @@ A connector may remove tools, use an enforced sandbox, withhold the project, or 
 
 For Codex, `--ignore-user-config` does only what its name understates: it skips `$CODEX_HOME/config.toml`. It does not suppress trusted-project `.codex/config.toml` files and project hooks or rules, system configuration, `managed_config.toml`, `requirements.toml`, cloud-delivered requirements, macOS MDM preferences, or separately sourced user/global hooks and rules. Those surviving layers can add settings the fixed vector does not override, and managed defaults or MDM can override CLI options. Hooks, MCP servers, plugins, network or telemetry settings, and other integrations from surviving configuration may therefore retain routes to external effects outside the read-only shell sandbox. Bridge names that limit in its non-blocking warning. The skipped file's model and effort defaults are also lost, and Bridge does not replace them.
 
+**Claude Code 2.1.251 managed MCP prerequisite.** The exact source `/Library/Application Support/ClaudeCode/managed-mcp.json` is incompatible with the fixed `--strict-mcp-config` invocation: the CLI exits when they are combined. If that path is present or its absence cannot be established, `check` fails and `run` fails before request publication. Bridge observes the path without opening policy contents. This is an unusable-command prerequisite, not a refusal over incomplete confinement. Other administrator-managed endpoint and remote policy may survive restricted mode; their presence or uncertainty remains a warning, not this hard failure.
+
 **Qwen Code 0.23.0 input exception.** Selected Qwen may interpret recognized leading `/` commands or unescaped `@` references before the model. It may alter or replace the effective prompt, read and append readable file or resource content, fail in preprocessing, or handle a command without a model call. Both supported headless input modes share this; safe mode cannot disable it and no lossless escape or raw switch exists. Bridge records and passes the original exactly, gives Qwen a task-owned neutral directory with no project, and requires `--max-tool-calls=0`: no model-initiated tool call can execute, and the first such attempt aborts the run. Input preprocessing happens before that budget, so the limit does not stop it. Bridge warns during `check` and before publication without blocking or acknowledgment. The other five prompts remain lossless and unselected Qwen inert. An official raw mode would make the exception removable after qualification.
 
 ### Disposable qualification
@@ -329,7 +331,7 @@ The core owns this internal list; connectors map vendor behavior into it. The na
 | `PUBLICATION_NOT_FLUSHED` | File exists but directory entry was not forced to disk; treat as unfinished. |
 | `PUBLICATION_UNCERTAIN` | Rename outcome unknown; inspect the exact path before anything else. |
 
-Every failure avoids false success, cleans what the turn owns when possible, and supplies one next action.
+Every command reports failures on standard error and exits nonzero. A failure avoids false success, cleans what the turn owns when possible, and supplies one next action.
 
 ---
 
