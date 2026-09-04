@@ -22,8 +22,7 @@ project. Include any evidence those three need in the message body.
 ## Status
 
 Release 1 has passed six harness-adapter and arbitrary-application checks and
-real calls for all six targets. Qwen's corrected stream input still needs its
-approved fresh qualification after local checks and independent review.
+real calls for all six targets, including Qwen's corrected stream input.
 The exercised platform is macOS 26 on Apple silicon (arm64):
 
 | Target | Exercised CLI version |

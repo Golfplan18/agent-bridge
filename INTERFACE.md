@@ -1,6 +1,6 @@
 # Agent Bridge — Release 1 Courier Interface
 
-**Status:** Release 1 courier contract, approved September 3, 2026. All six targets have passed real calls on macOS 26 arm64, but Qwen's corrected stream transport awaits its approved fresh qualification after local checks and independent review. The exercised CLI versions are listed in the README. Qualification does not by itself complete the release finish line in section 12.
+**Status:** Release 1 courier contract, approved September 3, 2026. All six targets have passed real calls on macOS 26 arm64, including Qwen's corrected stream transport. The exercised CLI versions are listed in the README. Qualification does not by itself complete the release finish line in section 12.
 
 This is the controlling boundary for the shared runner, six target connectors, and thin initiating adapters. It replaces the former exactly-four-target rule and the former rule that incomplete confinement stopped release.
 
@@ -386,6 +386,6 @@ python3 -m tests.release_conformance qualify --peer minimax
 python3 -m tests.release_conformance qualify --peer qwen
 ```
 
-Each qualification includes readiness and one distinctive real model call. The approved transport correction adds one Qwen-only qualification after local checks and independent review. No full suite, build, benchmark, all-pairs test, other repeated qualification, deliberate external-effect attempt, or duplicate reassurance pass is part of the ceiling. Application behavior is outside this boundary.
+Each qualification includes readiness and one distinctive real model call. The approved transport correction's one additional Qwen-only qualification passed after local checks and independent review. No full suite, build, benchmark, all-pairs test, other repeated qualification, deliberate external-effect attempt, or duplicate reassurance pass is part of the ceiling. Application behavior is outside this boundary.
 
 Release finishes only after accepted source is committed, pushed, reviewed in a pull request, merged to `main`, and the existing repository is public. The installed Claude adapter is updated from merged source, anonymous repository installation is verified, task-owned resources are removed, and the Ora task receives the actual merged commit and invocation path. Bridge itself installs no target CLI and signs no user in.
