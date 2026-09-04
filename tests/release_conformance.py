@@ -639,7 +639,10 @@ def _restriction_vector(peer: str, cwd: str) -> str:
     command = connector.build_command(vector_deadline, cwd)
     if command.body_argument is None:
         vector = command.argv
-        displayed_vector = "argv={0}; stdin=<BODY>".format(repr(command.argv))
+        displayed_vector = "argv={0}; stdin={1}".format(
+            repr(command.argv),
+            "one user JSON frame containing <BODY>" if command.stdin_encoder else "<BODY>",
+        )
     else:
         vector = command.argv + (command.body_argument + "<BODY>",)
         displayed_vector = repr(vector)
@@ -760,12 +763,13 @@ def _restriction_vector(peer: str, cwd: str) -> str:
                 "--max-tool-calls=0",
                 "--max-session-turns=1",
                 "--max-wall-time=120s",
-                "--input-format=text",
-                "--output-format=json",
+                "--input-format=stream-json",
+                "--output-format=stream-json",
                 "--openai-logging=false",
             )
             and command.body_argument is None
             and command.response_parser is qwen.parse_response
+            and command.stdin_encoder is qwen.encode_request
             and qwen_environment.get("QWEN_RUNTIME_DIR")
             == os.path.join(cwd, qwen.RUNTIME_DIRECTORY)
             and qwen_environment.get("QWEN_TELEMETRY_ENABLED") == "0"
@@ -773,12 +777,13 @@ def _restriction_vector(peer: str, cwd: str) -> str:
             and qwen_environment.get("NODE_DISABLE_COMPILE_CACHE") == "1"
             and qwen_environment.get("NO_BROWSER") == "1"
             and qwen_environment.get("SEATBELT_PROFILE") == "restrictive-open"
+            and qwen_environment.get("QWEN_SANDBOX") == "sandbox-exec"
             and all(
                 name not in qwen_environment
                 for name in (
-                    "QWEN_SANDBOX",
                     "SANDBOX",
                     "QWEN_SANDBOX_PROXY_COMMAND",
+                    "QWEN_CODE_RELAUNCH_ARGS",
                 )
             ),
             "Qwen courier vector, runtime isolation, or JSON transport changed",

@@ -158,16 +158,10 @@ def apply_transport(
 ) -> Tuple[Tuple[str, ...], str]:
     """Bind the body to standard input or one qualified final argument."""
     if command.body_argument is None:
-        if command.stdin_body_limit is not None:
-            size = len(body.encode("utf-8"))
-            if size > command.stdin_body_limit:
-                raise BridgeError(
-                    Failure.USAGE_ERROR,
-                    detail="the message is {0} bytes and this peer silently "
-                    "truncates standard input above {1} bytes; send a shorter "
-                    "message".format(size, command.stdin_body_limit),
-                )
-        return command.argv, body
+        return command.argv, (
+            command.stdin_encoder(body)
+            if command.stdin_encoder is not None else body
+        )
     if "\x00" in body:
         raise BridgeError(
             Failure.USAGE_ERROR,

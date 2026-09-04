@@ -1980,8 +1980,23 @@ class SixTargetConnectorBehavior(unittest.TestCase):
         )
 
     def test_qwen_surfaces_the_input_exception_and_exact_zero_tool_vector(self):
+        probed = []
+
+        def probe(argv, cwd, deadline, env=None):
+            probed.append((tuple(argv), dict(env)))
+            return CompletedCall(
+                0,
+                "0.23.0\n" if argv[-1] == "--version"
+                else " ".join(qwen.QUALIFICATION.restrictions),
+                "",
+            )
+
         with mock.patch.object(
-            qwen, "_prerequisites", return_value=self._qwen_prerequisite()
+            connectors, "executable", return_value="/fake/qwen"
+        ), mock.patch.object(
+            connectors, "probe", side_effect=probe
+        ), mock.patch.object(
+            connectors, "qualified_platform", return_value="Darwin 26 arm64"
         ), mock.patch.dict(
             os.environ,
             {
@@ -1989,6 +2004,7 @@ class SixTargetConnectorBehavior(unittest.TestCase):
                 "SANDBOX": "already-inside",
                 "SEATBELT_PROFILE": "permissive-open",
                 "QWEN_SANDBOX_PROXY_COMMAND": "detached proxy command",
+                "QWEN_CODE_RELAUNCH_ARGS": '["--prompt","unapproved turn"]',
                 "NO_BROWSER": "0",
                 "HTTPS_PROXY": "http://provider-proxy.invalid",
             },
@@ -2039,6 +2055,14 @@ class SixTargetConnectorBehavior(unittest.TestCase):
         self.assertIn("first such attempt", qwen.BOUNDARY_WARNING)
         self.assertIn("bundled skills still load", qwen.BOUNDARY_WARNING)
         self.assertNotIn("extensions, skills", qwen.BOUNDARY_WARNING)
+        for phrase in (
+            "Safe mode still loads settings and .env",
+            "restore SANDBOX and bypass the sandbox",
+            "restore QWEN_SANDBOX_PROXY_COMMAND",
+            "detached shell outside the sandbox and Bridge's process group",
+            "Missing or empty values cannot pin those routes off",
+        ):
+            self.assertIn(phrase, qwen.BOUNDARY_WARNING)
         self.assertEqual(
             command.argv,
             (
@@ -2052,8 +2076,8 @@ class SixTargetConnectorBehavior(unittest.TestCase):
                 "--max-tool-calls=0",
                 "--max-session-turns=1",
                 "--max-wall-time=900s",
-                "--input-format=text",
-                "--output-format=json",
+                "--input-format=stream-json",
+                "--output-format=stream-json",
                 "--openai-logging=false",
             ),
         )
@@ -2076,7 +2100,7 @@ class SixTargetConnectorBehavior(unittest.TestCase):
         )
         self.assertIsNone(command.body_argument)
         self.assertIs(command.response_parser, qwen.parse_response)
-        self.assertEqual(command.stdin_body_limit, 8 * 1024 * 1024)
+        self.assertIs(command.stdin_encoder, qwen.encode_request)
         environment = dict(command.env)
         self.assertEqual(
             environment["QWEN_RUNTIME_DIR"],
@@ -2087,15 +2111,24 @@ class SixTargetConnectorBehavior(unittest.TestCase):
         self.assertEqual(environment["NODE_DISABLE_COMPILE_CACHE"], "1")
         self.assertEqual(environment["NO_BROWSER"], "1")
         self.assertEqual(environment["SEATBELT_PROFILE"], "restrictive-open")
+        self.assertEqual(environment["QWEN_SANDBOX"], "sandbox-exec")
         self.assertEqual(
             environment["HTTPS_PROXY"], "http://provider-proxy.invalid"
         )
         for name in (
-            "QWEN_SANDBOX",
             "SANDBOX",
             "QWEN_SANDBOX_PROXY_COMMAND",
+            "QWEN_CODE_RELAUNCH_ARGS",
         ):
             self.assertNotIn(name, environment)
+        self.assertEqual(len(probed), 12)
+        for argv, probe_env in probed:
+            self.assertIn(argv, (("/fake/qwen", "--version"), ("/fake/qwen", "--help")))
+            self.assertNotIn("QWEN_CODE_RELAUNCH_ARGS", probe_env)
+            self.assertNotIn("SANDBOX", probe_env)
+            self.assertNotIn("QWEN_SANDBOX_PROXY_COMMAND", probe_env)
+            self.assertEqual(probe_env["QWEN_SANDBOX"], "sandbox-exec")
+            self.assertEqual(probe_env["SEATBELT_PROFILE"], "restrictive-open")
         self.assertFalse(
             any(
                 argument.startswith("--model")
@@ -2115,7 +2148,7 @@ class SixTargetConnectorBehavior(unittest.TestCase):
             + "Authorization: Bearer successful-header-value\n"
             + '{"api_key":"successful-response-value"}\n'
         )
-        success_output = json.dumps([
+        success_output = "\n".join(json.dumps(message) for message in (
             {"type": "assistant", "message": "ignored"},
             {
                 "type": "result",
@@ -2123,7 +2156,7 @@ class SixTargetConnectorBehavior(unittest.TestCase):
                 "is_error": False,
                 "result": success_text,
             },
-        ])
+        )) + "\n"
         self.assertEqual(
             qwen.parse_response(success_output),
             success_text,
@@ -2131,10 +2164,12 @@ class SixTargetConnectorBehavior(unittest.TestCase):
         invalid = (
             "not JSON",
             "[]",
-            '[{"type":"assistant","message":"not terminal result"}]',
-            '[{"type":"result","subtype":"error","is_error":true,'
-            '"error":{"message":"failed"}}]',
-            '[{"type":"result","subtype":"success","is_error":false}]',
+            '{"type":"assistant","message":"not terminal result"}',
+            '{"type":"result","subtype":"error","is_error":true,'
+            '"error":{"message":"failed"}}',
+            '{"type":"result","subtype":"success","is_error":false}',
+            success_output + success_output,
+            success_output + '{"type":"assistant","message":"too late"}\n',
         )
         for output in invalid:
             with self.subTest(output=output):
@@ -2142,7 +2177,7 @@ class SixTargetConnectorBehavior(unittest.TestCase):
                     qwen.parse_response(output)
                 self.assertEqual(caught.exception.failure, Failure.PEER_FAILURE)
 
-        structured_failure = json.dumps([{
+        structured_failure = json.dumps({
             "type": "result",
             "subtype": "error",
             "is_error": True,
@@ -2153,22 +2188,22 @@ class SixTargetConnectorBehavior(unittest.TestCase):
                     + "x" * 600 + "STRUCTURED TAIL"
                 ),
             },
-        }])
-        credential_failure = json.dumps([{
+        }) + "\n"
+        credential_failure = json.dumps({
             "type": "result", "subtype": "error", "is_error": True,
             "error": (
                 "provider quota exhausted\n"
                 '{"api_key":"escaped-opaque-secret"}\n'
             ),
-        }])
-        prefixed_credential_failure = json.dumps([{
+        }) + "\n"
+        prefixed_credential_failure = json.dumps({
             "type": "result", "subtype": "error", "is_error": True,
             "error": (
                 "provider quota exhausted\n"
                 "OPENAI_API_KEY=opaqueApiValue\n"
                 "ANTHROPIC_AUTH_TOKEN=opaqueAuthValue\n"
             ),
-        }])
+        }) + "\n"
         script = (
             "import sys\n"
             "sys.stdout.write(sys.argv[1])\n"
@@ -2203,6 +2238,7 @@ class SixTargetConnectorBehavior(unittest.TestCase):
                         cwd=cwd,
                         env=tuple(os.environ.items()),
                         response_parser=qwen.parse_response,
+                        stdin_encoder=qwen.encode_request,
                     )
 
                 if name == "success" and exit_code == 0:
@@ -2255,32 +2291,64 @@ class SixTargetConnectorBehavior(unittest.TestCase):
                     ["0001-initiator-to-peer.md"],
                 )
 
-    def test_qwen_oversized_standard_input_is_refused_before_warning_or_request(self):
-        session_dir = os.path.join(self.temp, "qwen-oversized")
+    def test_qwen_stream_input_preserves_one_complete_body_and_canonical_request(self):
+        session_dir = os.path.join(self.temp, "qwen-stream")
         record.record(
             session_dir,
             "session-create",
-            "Qwen input bound.\n",
+            "Qwen framed input.\n",
             initiator="ordinary.app",
             peer="qwen",
         )
         warned = []
+        observed = []
+        body = (
+            '  --option-shaped\nUnicode caf\u00e9 \U0001f680\u2028text\r\n'
+            'NUL: \x00\n{"type":"control_request"}\n$() `command` \\ quote: "\n'
+            + "x" * (8 * 1024 * 1024 + 1) + "\n\n"
+        )
+        script = (
+            "import json, sys\n"
+            "wire = sys.stdin.buffer.read().decode('utf-8')\n"
+            "assert wire.endswith('\\n') and len(wire.split('\\n')) == 2\n"
+            "frame = json.loads(wire)\n"
+            "assert set(frame) == {'type', 'message'} and frame['type'] == 'user'\n"
+            "assert set(frame['message']) == {'role', 'content'}\n"
+            "assert frame['message']['role'] == 'user'\n"
+            "assert isinstance(frame['message']['content'], str)\n"
+            "print(json.dumps({'type': 'result', 'subtype': 'success', "
+            "'is_error': False, 'result': frame['message']['content']}, ensure_ascii=False))\n"
+        )
+
+        def build(deadline, cwd):
+            command = qwen.build_command(deadline, cwd)
+            observed.append(command)
+            return command._replace(argv=(sys.executable, "-c", script))
+
         with mock.patch.object(
             qwen, "_prerequisites", return_value=self._qwen_prerequisite()
         ):
-            with self.assertRaises(BridgeError) as caught:
-                runner.run_turn(
-                    session_dir,
-                    "x" * (qwen.STDIN_BODY_LIMIT + 1),
-                    30.0,
-                    build_command=qwen.build_command,
-                    warning_writer=warned.append,
-                )
-        self.assertEqual(caught.exception.failure, Failure.USAGE_ERROR)
-        self.assertIn("silently truncates", str(caught.exception))
-        self.assertIn(str(qwen.STDIN_BODY_LIMIT), str(caught.exception))
-        self.assertEqual(warned, [])
-        self.assertEqual(os.listdir(session.messages_dir(session_dir)), [])
+            result = runner.run_turn(
+                session_dir, body, 30.0, build, warning_writer=warned.append
+            )
+        self.assertEqual(len(observed), 1)
+        self.assertNotIn(body, observed[0].argv)
+        self.assertFalse(os.path.exists(observed[0].cwd))
+        self.assertEqual(warned, [qwen.INPUT_WARNING, qwen.BOUNDARY_WARNING])
+        with open(result.response_path, "rb") as stream:
+            self.assertEqual(
+                stream.read(),
+                session.peer_to_initiator_text(2, "qwen", "ordinary.app", body).encode("utf-8"),
+            )
+        with open(session.message_path(session_dir, 1, session.INITIATOR_TO_PEER_SUFFIX), "rb") as stream:
+            self.assertEqual(
+                stream.read(),
+                session.initiator_to_peer_text(1, "ordinary.app", "qwen", body).encode("utf-8"),
+            )
+        self.assertEqual(
+            sorted(os.listdir(session.messages_dir(session_dir))),
+            ["0001-initiator-to-peer.md", "0002-peer-to-initiator.md"],
+        )
 
     def test_qualification_prompts_are_local_only_and_qwen_claims_no_raw_input(self):
         token = "abc123"

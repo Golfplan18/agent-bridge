@@ -118,9 +118,9 @@ class PeerCommand(NamedTuple):
     body holding a NUL byte, which no argument can carry. Under either
     transport prompt text never passes through a shell. `warnings` are the
     concrete limits a successful check and run must surface. `response_parser`
-    extracts final text when the fixed output is structured. A
-    `stdin_body_limit` refuses input before publication when the target would
-    otherwise truncate it.
+    extracts final text when the fixed output is structured. `stdin_encoder`
+    wraps the unchanged body in a vendor input frame before publication when
+    the selected CLI requires one; it never changes the canonical request.
     """
 
     argv: Tuple[str, ...]
@@ -129,7 +129,7 @@ class PeerCommand(NamedTuple):
     body_argument: Optional[str] = None
     warnings: Tuple[str, ...] = ()
     response_parser: Optional[Callable[[str], str]] = None
-    stdin_body_limit: Optional[int] = None
+    stdin_encoder: Optional[Callable[[str], str]] = None
 
 
 class CheckResult(NamedTuple):

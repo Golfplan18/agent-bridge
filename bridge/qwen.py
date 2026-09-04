@@ -1,7 +1,7 @@
 """The hand-written Qwen Code courier connector.
 
 Qwen Code 0.23.0 supplies a safe mode, explicit plan posture, run budgets,
-zero-model-tool-call guard, standard-input transport, and buffered JSON output.
+zero-model-tool-call guard, and stream-JSON standard input and output.
 The connector keeps the user's normal QWEN_HOME so authentication is not
 hidden, while putting transient output inside the task-owned neutral directory
 and disabling compatible usage statistics and telemetry for this child. Qwen
@@ -47,9 +47,9 @@ QUALIFICATION = connectors.Qualification(
 )
 
 RUNTIME_DIRECTORY = ".qwen-runtime"
-STDIN_BODY_LIMIT = 8 * 1024 * 1024
 MAX_NATIVE_WALL_TIME_SECONDS = 2_147_483
 CONTROLLED_ENVIRONMENT = (
+    "QWEN_CODE_RELAUNCH_ARGS",
     "QWEN_RUNTIME_DIR",
     "QWEN_TELEMETRY_ENABLED",
     "QWEN_USAGE_STATISTICS_ENABLED",
@@ -80,10 +80,15 @@ INPUT_WARNING = (
 BOUNDARY_WARNING = (
     "Qwen Code is courier-only and receives a task-owned neutral directory. "
     "--safe-mode drops ambient context, hooks, extensions, MCP servers, custom "
-    "subagents, permission rules, and memory features. Agent Bridge removes "
-    "ambient sandbox selectors and the Qwen sandbox proxy command, forces the "
-    "native macOS restrictive-open sandbox profile, and disables browser "
-    "launches. That profile still permits same-user reads, process launches, "
+    "subagents, permission rules, and memory features. Agent Bridge clears "
+    "inherited startup-argument overrides, SANDBOX, and the Qwen sandbox proxy "
+    "command, pins QWEN_SANDBOX=sandbox-exec and the restrictive-open profile, "
+    "and disables browser launches. Safe mode still loads settings and .env "
+    "values: those sources can restore SANDBOX and bypass the sandbox, or "
+    "restore QWEN_SANDBOX_PROXY_COMMAND and launch a detached shell outside "
+    "the sandbox and Bridge's process group. Missing or empty values cannot "
+    "pin those routes off. When used, the native profile still permits "
+    "same-user reads, process launches, "
     "writes to Qwen, cache, temporary, and task-owned paths, and outbound "
     "network access; Qwen's bundled skills still load and can shape the turn. "
     "Plan mode plus "
@@ -97,7 +102,7 @@ BOUNDARY_WARNING = (
 
 
 def _environment(cwd: str) -> Tuple[Tuple[str, str], ...]:
-    """Keep authentication, but make the native sandbox choice deterministic."""
+    """Keep authentication; pin compatible controls and clear inherited routes."""
     inherited = [
         (name, value)
         for name, value in connectors.environment()
@@ -110,31 +115,48 @@ def _environment(cwd: str) -> Tuple[Tuple[str, str], ...]:
             ("QWEN_USAGE_STATISTICS_ENABLED", "0"),
             ("NODE_DISABLE_COMPILE_CACHE", "1"),
             ("NO_BROWSER", "1"),
+            ("QWEN_SANDBOX", "sandbox-exec"),
             ("SEATBELT_PROFILE", "restrictive-open"),
         )
     )
     return tuple(inherited)
 
 
+def encode_request(body: str) -> str:
+    """Send one direct-mode user frame, then let the runner close stdin.
+
+    Qwen 0.23.0's stream reader has no text-mode 8 MiB truncation limit and
+    returns string content unchanged. No prompt argument or initial query is
+    supplied: either would enter its sandbox shell or create another turn.
+    """
+    return json.dumps(
+        {"type": "user", "message": {"role": "user", "content": body}},
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ) + "\n"
+
+
 def parse_response(output: str) -> str:
-    """Extract the last successful result from Qwen's buffered JSON array."""
+    """Extract the sole terminal result from Qwen's newline-delimited JSON."""
     try:
-        messages = json.loads(output)
+        messages = [json.loads(line) for line in output.split("\n") if line.strip()]
     except ValueError as exc:
         raise BridgeError(
             Failure.PEER_FAILURE,
-            detail="qwen returned no readable JSON array: {0}".format(exc),
+            detail="qwen returned no readable stream-JSON messages: {0}".format(exc),
         )
-    if not isinstance(messages, list) or not messages:
+    if not messages or any(not isinstance(message, dict) for message in messages):
         raise BridgeError(
             Failure.PEER_FAILURE,
-            detail="qwen's JSON output was not a nonempty message array",
+            detail="qwen's stream-JSON output was not a nonempty message sequence",
         )
     result = messages[-1]
-    if not isinstance(result, dict) or result.get("type") != "result":
+    if result.get("type") != "result" or sum(
+        message.get("type") == "result" for message in messages
+    ) != 1:
         raise BridgeError(
             Failure.PEER_FAILURE,
-            detail="qwen's final JSON message was not a result",
+            detail="qwen's stream-JSON output lacked one sole terminal result",
         )
     if result.get("subtype") != "success" or result.get("is_error") is not False:
         error = result.get("error")
@@ -229,13 +251,13 @@ def build_command(deadline: Deadline, cwd: str) -> connectors.PeerCommand:
         )
         + native_wall_time
         + (
-            "--input-format=text",
-            "--output-format=json",
+            "--input-format=stream-json",
+            "--output-format=stream-json",
             "--openai-logging=false",
         ),
         cwd=cwd,
         env=_environment(cwd),
         warnings=warnings,
         response_parser=parse_response,
-        stdin_body_limit=STDIN_BODY_LIMIT,
+        stdin_encoder=encode_request,
     )

@@ -1,6 +1,6 @@
 # Agent Bridge — Release 1 Courier Interface
 
-**Status:** Revised Release 1 target contract, approved September 3, 2026. The implementation is under construction and may not yet conform.
+**Status:** Release 1 courier contract, approved September 3, 2026. All six targets have passed real calls on macOS 26 arm64, but Qwen's corrected stream transport awaits its approved fresh qualification after local checks and independent review. The exercised CLI versions are listed in the README. Qualification does not by itself complete the release finish line in section 12.
 
 This is the controlling boundary for the shared runner, six target connectors, and thin initiating adapters. It replaces the former exactly-four-target rule and the former rule that incomplete confinement stopped release.
 
@@ -50,6 +50,8 @@ Every child starts from a fixed argument vector with no shell. A connector uses 
 
 The runner never creates a private prompt file. The canonical request records the original exactly and the connector passes it unchanged.
 
+Qwen's connector internally encodes that body as one stream-JSON user frame whose decoded content is the original string, then closes standard input. It supplies no initial query, prompt argument, control request, history, or additional frame. This avoids Qwen's text-input conversion into its sandbox shell arguments. The public body remains plain Markdown; only the connector translates framing. Qwen's stream reader has no text-mode 8 MiB cutoff; no unlimited-memory guarantee is implied.
+
 Adapters start Bridge as a fixed vector:
 
 ```text
@@ -89,22 +91,22 @@ One session has one initiator and one target. An application reaches several tar
 ## 4. Commands
 
 ```text
-agent-bridge check --peer <target-id>
+python3 -m bridge check --peer <target-id>
 
-agent-bridge run --session <session-directory>
+python3 -m bridge run --session <session-directory>
                  [--timeout <seconds>]
 
-agent-bridge record --session <session-directory>
+python3 -m bridge record --session <session-directory>
                     --kind session-create
                     --initiator <label>
                     --peer <target-id>
                     [--project <project-directory>]
 
-agent-bridge record --session <session-directory>
+python3 -m bridge record --session <session-directory>
                     --kind note
 ```
 
-`python3 -m bridge` may replace `agent-bridge`; behavior is identical.
+Run these commands from the absolute checkout root. Source installation creates no `agent-bridge` console executable.
 
 ### `check`
 
@@ -240,7 +242,7 @@ Each target connector is a small source-controlled translation for one official 
 
 - CLI identity and exact tested version or evidence-backed set;
 - tested operating system, major versions, and architecture when relevant;
-- a no-model-turn authentication check;
+- authentication evidence available without a model turn, including limits when live authentication cannot be confirmed;
 - fixed one-shot arguments and body transport;
 - strongest practical enforced restrictions and concrete residual warnings;
 - project-capable or courier-only posture; and
@@ -258,18 +260,22 @@ A connector may remove tools, use an enforced sandbox, withhold the project, or 
 
 | Target | Project posture | Strongest practical posture | Required warning emphasis |
 |---|---|---|---|
-| Codex | Project-capable | Skip only `$CODEX_HOME/config.toml`, use the read-only sandbox, set the working directory explicitly | Skipped file's model/effort defaults; surviving project, system, cloud/managed/MDM configuration and possible hooks, MCP, or other external effects |
+| Codex | Project-capable | Skip only `$CODEX_HOME/config.toml`, disable known high-risk routes, use the read-only sandbox, set the working directory explicitly | Skipped file's model/effort defaults; surviving project, system, cloud/managed/MDM configuration and possible hooks, MCP, or other external effects |
 | Claude Code | Project-capable | Restricted mode, empty strict MCP set, Read/Glob/Grep, planning mode | Administrator-managed or remote policy can survive and add effects |
 | ZCode | Project-capable | Planning mode, explicit directory, known dangerous tools removed | Plugin/direct-MCP limits, indirect OAuth evidence, visible body argument |
 | Hermes Agent | Courier-only | Neutral directory, safe mode, smallest harmless toolset | Read cannot be separated from write, memory remains, visible body argument |
-| MiniMax Code | Courier-only | Neutral directory and all compatible one-shot, permission, tool, and foreground limits | Surviving tools or configuration are not claimed confined |
-| Qwen Code | Courier-only | Neutral directory and all compatible one-shot, approval, sandbox, tool, extension/MCP, and foreground limits | Input preprocessing below; residual limits remain |
+| MiniMax Code | Courier-only | Neutral directory, `exec` with standard input, `--permission smart`, one assistant step, native timeout within its supported range | Smart is discretionary, not a sandbox; one step does not disable tools; no state-free authentication check |
+| Qwen Code | Courier-only | Neutral directory, safe and plan modes, pinned native macOS sandbox selection/profile, zero model tool calls, one input frame and turn, compatible time and pre-model command limits | Input preprocessing below; settings/.env may bypass sandbox or launch a detached proxy; profile permits same-user reads, some writes, process launches, and network; no safe no-turn authentication confirmation |
 
 For Codex, `--ignore-user-config` does only what its name understates: it skips `$CODEX_HOME/config.toml`. It does not suppress trusted-project `.codex/config.toml` files and project hooks or rules, system configuration, `managed_config.toml`, `requirements.toml`, cloud-delivered requirements, macOS MDM preferences, or separately sourced user/global hooks and rules. Those surviving layers can add settings the fixed vector does not override, and managed defaults or MDM can override CLI options. Hooks, MCP servers, plugins, network or telemetry settings, and other integrations from surviving configuration may therefore retain routes to external effects outside the read-only shell sandbox. Bridge names that limit in its non-blocking warning. The skipped file's model and effort defaults are also lost, and Bridge does not replace them.
 
 **Claude Code 2.1.251 managed MCP prerequisite.** The exact source `/Library/Application Support/ClaudeCode/managed-mcp.json` is incompatible with the fixed `--strict-mcp-config` invocation: the CLI exits when they are combined. If that path is present or its absence cannot be established, `check` fails and `run` fails before request publication. Bridge observes the path without opening policy contents. This is an unusable-command prerequisite, not a refusal over incomplete confinement. Other administrator-managed endpoint and remote policy may survive restricted mode; their presence or uncertainty remains a warning, not this hard failure.
 
 **Qwen Code 0.23.0 input exception.** Selected Qwen may interpret recognized leading `/` commands or unescaped `@` references before the model. It may alter or replace the effective prompt, read and append readable file or resource content, fail in preprocessing, or handle a command without a model call. Both supported headless input modes share this; safe mode cannot disable it and no lossless escape or raw switch exists. Bridge records and passes the original exactly, gives Qwen a task-owned neutral directory with no project, and requires `--max-tool-calls=0`: no model-initiated tool call can execute, and the first such attempt aborts the run. Input preprocessing happens before that budget, so the limit does not stop it. Bridge warns during `check` and before publication without blocking or acknowledgment. The other five prompts remain lossless and unselected Qwen inert. An official raw mode would make the exception removable after qualification.
+
+The Qwen vector disables `/bug`, `/config`, `/update`, `/import-config`, `/language`, `/effort`, `/model`, and `/doctor` because those pre-model command families can cause external or persistent effects. Other recognized preprocessing remains. Qwen retains the user's existing authentication and provider setup; Bridge adds no selection or credential handling.
+
+For both readiness and runs, Bridge clears inherited `QWEN_CODE_RELAUNCH_ARGS` so it cannot replace the fixed startup arguments. It pins nonempty `QWEN_SANDBOX=sandbox-exec` and `SEATBELT_PROFILE=restrictive-open`, and removes inherited `SANDBOX` and `QWEN_SANDBOX_PROXY_COMMAND`. Safe mode still loads settings and `.env` values, which can refill missing or empty variables: restored `SANDBOX` can bypass the sandbox, and a restored proxy command can launch a detached shell outside both the sandbox and Bridge's process group. Empty strings cannot disable those routes reliably. Bridge names these surviving routes as non-blocking warnings; it does not inspect or alter the user's configuration or add a confinement gate.
 
 ### Disposable qualification
 
@@ -311,10 +317,10 @@ The core owns this internal list; connectors map vendor behavior into it. The na
 | `MISSING_CLI` | Target CLI absent; install its official program and check again. |
 | `AUTHENTICATION_REQUIRED` | Supported sign-in not observed; sign in through the harness. |
 | `UNREPORTABLE_VERSION` | Version unreadable; inspect the vendor command. |
-| `UNQUALIFIED_VERSION` | Construction diagnostic to migrate into a warning when required mechanics remain usable. |
-| `UNQUALIFIED_PLATFORM` | Construction diagnostic to migrate into a warning when required mechanics remain usable. |
+| `UNQUALIFIED_VERSION` | Retained internal diagnostic; current connectors warn on readable version drift when required mechanics remain usable. |
+| `UNQUALIFIED_PLATFORM` | Retained internal diagnostic; current connectors warn on platform drift when required mechanics remain usable. |
 | `RESTRICTIONS_UNAVAILABLE` | A required fixed-vector, input, output, or foreground switch is absent; the promised call cannot be made. |
-| `QUALIFICATION_UNSAFE_OR_INCONCLUSIVE` | Construction diagnostic; incomplete confinement becomes a warning rather than a runtime consent gate. |
+| `QUALIFICATION_UNSAFE_OR_INCONCLUSIVE` | Retained internal diagnostic, not a current runtime confinement gate; residual limits are warnings. |
 | `BUSY_SESSION` | Another turn owns the lock; wait. |
 | `TIMEOUT` | Deadline expired; inspect visible state before deciding whether to retry. |
 | `PEER_FAILURE` | Vendor CLI failed; correct the harness-side problem. |
@@ -322,7 +328,7 @@ The core owns this internal list; connectors map vendor behavior into it. The na
 | `CLEANUP_FAILURE` | A task-owned process or path remains; remove the named item. |
 | `USAGE_ERROR` | Argument, label, body, target/project combination, or transport invalid; correct it. |
 | `UNKNOWN_HARNESS` | Target is not one of the six fixed identifiers; name one. |
-| `CONNECTOR_UNAVAILABLE` | Fixed target lacks a connector in this construction build; complete it or use another. |
+| `CONNECTOR_UNAVAILABLE` | Incomplete build lacks a fixed target's connector; use complete source. All six ship in Release 1. |
 | `UNKNOWN_RECORD_KIND` | Kind is not `session-create` or `note`; use one of them. |
 | `SESSION_NOT_FOUND` | Session absent; create it or correct the path. |
 | `SESSION_INVALID` | Session unreadable, inconsistent, or unsupported; inspect it or start again. |
@@ -380,6 +386,6 @@ python3 -m tests.release_conformance qualify --peer minimax
 python3 -m tests.release_conformance qualify --peer qwen
 ```
 
-Each qualification includes readiness and one distinctive real model call. No full suite, build, benchmark, all-pairs test, repeated qualification, deliberate external-effect attempt, or duplicate reassurance pass is part of the ceiling. Application behavior is outside this boundary.
+Each qualification includes readiness and one distinctive real model call. The approved transport correction adds one Qwen-only qualification after local checks and independent review. No full suite, build, benchmark, all-pairs test, other repeated qualification, deliberate external-effect attempt, or duplicate reassurance pass is part of the ceiling. Application behavior is outside this boundary.
 
 Release finishes only after accepted source is committed, pushed, reviewed in a pull request, merged to `main`, and the existing repository is public. The installed Claude adapter is updated from merged source, anonymous repository installation is verified, task-owned resources are removed, and the Ora task receives the actual merged commit and invocation path. Bridge itself installs no target CLI and signs no user in.

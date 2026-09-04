@@ -21,16 +21,23 @@ project. Include any evidence those three need in the message body.
 
 ## Status
 
-This is an unreleased Release 1 candidate on `task/release-1-courier`. The shared
-runtime and six harness adapter sources have passed focused review and checks.
-Real qualification has passed for Codex, Claude, ZCode, Hermes, and MiniMax;
-Qwen qualification remains pending. The declared platform is macOS 26 on Apple
-silicon (arm64). Source version declarations are not proof of a completed
-six-target release, and no other platform qualification is claimed.
+Release 1 has passed six harness-adapter and arbitrary-application checks and
+real calls for all six targets. Qwen's corrected stream input still needs its
+approved fresh qualification after local checks and independent review.
+The exercised platform is macOS 26 on Apple silicon (arm64):
 
-This candidate has not been pushed or merged. Public availability and anonymous
-installation remain unverified, and no installed adapter has been updated from
-this branch. There is no support, maintenance, or future compatibility promise.
+| Target | Exercised CLI version |
+|---|---|
+| Codex | 0.147.0 |
+| Claude Code | 2.1.251 |
+| ZCode | 0.16.5 |
+| Hermes Agent | 0.18.2 |
+| MiniMax Code | 0.2.7 |
+| Qwen Code | 0.23.0 |
+
+No other platform qualification is claimed. There is no support, maintenance,
+or future compatibility promise. Qualification describes the source and CLI
+combination; it does not install or update anything on a user's machine.
 
 ## Requirements and source setup
 
@@ -49,12 +56,11 @@ git clone https://github.com/Golfplan18/agent-bridge.git
 cd /absolute/path/to/agent-bridge
 ```
 
-Replace the second line with your checkout's actual absolute path. Cloning the
-remote does not fetch this still-unpublished task branch. These commands show
-the repository-only distribution route, not an available public release. With
-the candidate source present locally, run `python3 -m bridge` from its checkout
-root. No console command or adapter is installed; do not assume an installed
-`agent-bridge` executable.
+Replace the second line with your checkout's actual absolute path. Run
+`python3 -m bridge` from that checkout root. This repository-only source route
+does not install a console command or adapter; do not assume an installed
+`agent-bridge` executable. The commands below require the Release 1 source
+described here, not an earlier checkout.
 
 ## First call from a checkout
 
@@ -181,6 +187,16 @@ visible to other same-user processes or potentially to system and vendor logs.
 NUL and oversize argument bodies are refused before publication, never split
 or truncated. The other four connectors use standard input. Bridge never
 creates a private prompt file or treats a body as shell text.
+Qwen receives one internal JSON user frame containing the unchanged body, then
+end-of-input. Its stream reader avoids the text-input cutoff and the vendor's
+text-to-command-line conversion; Bridge adds no prompt argument or file.
+
+Bridge clears Qwen's inherited startup-argument overrides and pins its native macOS
+sandbox selection and restrictive-open profile. Safe mode still loads settings
+and `.env` values: they can restore `SANDBOX` and bypass that sandbox, or restore
+`QWEN_SANDBOX_PROXY_COMMAND` and start a detached shell outside the sandbox and
+Bridge's process group. Empty values cannot pin those routes off. These are
+non-blocking warnings, not a claim of complete confinement.
 
 Qwen Code 0.23.0 alone may preprocess recognized leading `/` commands or
 unescaped `@` references: it may alter the effective prompt, append readable
