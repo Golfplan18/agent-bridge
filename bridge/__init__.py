@@ -1,9 +1,9 @@
 """Agent Bridge core package.
 
 Agent Bridge connects coding-agent harnesses through their official callable
-command-line interfaces. This module holds only the two constants every other
-module and every native package needs to agree on. It imports nothing, spawns
-nothing, and does no work when it is imported.
+command-line interfaces. This module exposes the source release and on-disk
+session-format versions. It imports nothing, spawns nothing, and does no work
+when it is imported.
 
 SPDX-License-Identifier: Unlicense
 """
@@ -12,8 +12,8 @@ SPDX-License-Identifier: Unlicense
 #: `Bridge-Format:` so a later reader can tell which layout it is looking at.
 BRIDGE_FORMAT = 2
 
-#: Version of this source tree. Nothing has been released, so this is 0.0.0.
-VERSION = "0.0.0"
+#: Release version of this source tree. Release 1 is version 1.0.0.
+VERSION = "1.0.0"
 
 __version__ = VERSION
 
